@@ -1,0 +1,589 @@
+XBOXCTL                                                        Design Note
+binding model                                            buttons and layers
+
+
+                  THE MAPPING ENGINE AND ITS CONFIGURATION
+
+
+Abstract
+
+   What replaces the Adaptoid's compiled bytecode: a flat table of
+   bindings, each one a fixed-size record saying which control on the pad
+   drives which key, mouse button, wheel detent or gamepad control, under
+   what conditions, and how it repeats.
+
+   No interpreter, no scheduler, no threads. A binding is evaluated by
+   comparing one number against two thresholds and consulting a handful
+   of flags, and the whole engine is a loop over the table once per
+   controller packet.
+
+   This note specifies the source enumeration, the action set, the record
+   layout, the activation and repeat semantics, the layer model, the
+   output state machines, and the evaluation order. The stick-to-mouse
+   half of the configuration is specified separately in
+   analog-to-mouse.txt; this note covers everything else and the blob
+   that carries both.
+
+   It also states the boundary: what this model deliberately cannot
+   express, and what it would take to extend it if that ever matters.
+
+Table of Contents
+
+   1.  The Model In One Paragraph
+   2.  Sources
+   2.1.  Why Bindings Are A List, Not An Array
+   2.2.  Chords
+   3.  Actions
+   4.  The Binding Record
+   5.  Activation
+   5.1.  Threshold And Hysteresis
+   5.2.  Toggle
+   6.  Repeat, Also Known As Autofire
+   6.1.  The Trap: HID Reports Are State, Not Events
+   6.2.  Semantics
+   7.  Layers
+   8.  The Output State Machines
+   8.1.  Keyboard
+   8.2.  Mouse Buttons And Wheel
+   8.3.  Gamepad
+   9.  Evaluation Order
+   10. The Configuration Blob
+   11. A Worked Example
+   12. The Boundary
+
+1.  The Model In One Paragraph
+
+   The pad produces 25 numbers. The configuration is a list of BINDINGS;
+   each names one of those numbers as its SOURCE, an ACTION to perform,
+   and the parameters that decide when. Once per packet the driver walks
+   the list, decides for each binding whether it is active, and folds the
+   results into three output states - a keyboard, a mouse and a gamepad.
+   Whichever of those three changed is submitted as a HID report.
+
+   That is the whole engine. The interesting parts are the details of
+   "decides whether it is active" and "folds", and both are small.
+
+2.  Sources
+
+   The source enumeration is XBCD's semiaxis array, unchanged. It is
+   already the right abstraction: 25 unipolar magnitudes in 0..MAX_VALUE,
+   with the differences between an Xbox 1 pad, a 360 pad and a wheel
+   absorbed below it. See xbcd-architecture.txt section 7.1 for how each
+   is derived.
+
+   +-------+--------------------------+--------------------------------+
+   | Index | Control                  | Nature                         |
+   +=======+==========================+================================+
+   | 0-3   | D-pad up/down/left/right | digital                        |
+   | 4     | Start                    | digital                        |
+   | 5     | Back                     | digital                        |
+   | 6-7   | Left, right thumb click  | digital                        |
+   | 8-11  | A, B, X, Y               | ANALOG on Xbox 1, digital 360  |
+   | 12-13 | Black, White / LB, RB    | analog on Xbox 1, digital 360  |
+   | 14-15 | Left, right trigger      | analog on both                 |
+   | 16-17 | Left stick X- , X+       | analog, deadzoned radially     |
+   | 18-19 | Left stick Y- , Y+       | analog                         |
+   | 20-21 | Right stick X- , X+      | analog                         |
+   | 22-23 | Right stick Y- , Y+      | analog                         |
+   | 24    | Guide                    | digital, 360 only              |
+   +-------+--------------------------+--------------------------------+
+
+   TWO SOURCES ARE ADDED THAT XBCD DOES NOT HAVE, because a 2D stick
+   cannot be expressed as two independent semiaxes once it drives a
+   mouse (analog-to-mouse.txt section 6):
+
+       32   left stick, as a vector
+       33   right stick, as a vector
+
+   A vector source is not bound through the binding table. It has its own
+   record, specified in analog-to-mouse.txt section 7, and a layout
+   carries exactly two of them.
+
+   SLOT 24 BECOMES MAPPABLE. XBCD reads the Guide button directly for
+   layout cycling and never consults the map matrix for it. With layer
+   switching expressed as an ordinary action (section 7) that special
+   case disappears and Guide is just another source.
+
+2.1.  Why Bindings Are A List, Not An Array
+
+   XBCD stores one destination code per source, so a source drives
+   exactly one thing. A list of bindings lets a source drive several -
+   a right trigger that is simultaneously mouse button 1 and gamepad
+   button 6, or a trigger that fires a key at 30 per cent travel and a
+   different one at 90.
+
+   That flexibility carries one obligation. XBCD's threshold test writes
+   zero back into SemiAxes[index] when a value fails (xbcd-architecture
+   section 7.3), which is invisible while each source has one consumer
+   and is a bug the moment it has two. THE ENGINE MUST NOT MUTATE THE
+   SOURCE ARRAY. Read it; never write to it.
+
+2.2.  Chords
+
+   A chord - two or three controls held together - is the first thing
+   anyone asks for after a plain binding, and XBCD already uses one
+   internally: Start plus Back cycles the layout on an Xbox 1 pad.
+
+   Add it as a second small table rather than as a binding field, so a
+   chord is itself a source:
+
+       struct CHORD {           /* 4 bytes */
+           u8  member[3];       /* source indices, 0xFF = unused */
+           u8  flags;
+       };
+
+   Chord N appears to the binding table as source index 64 + N, with a
+   value of MAX_VALUE when every named member is above its own
+   activation threshold and 0 otherwise.
+
+   ONE RULE MAKES OR BREAKS IT: WHILE A CHORD IS ACTIVE, SUPPRESS THE
+   BINDINGS OF ITS MEMBERS. Otherwise pressing Start then Back fires
+   Start's own binding on the way in, and every chord is preceded by a
+   spurious keystroke. Suppression must also be retroactive within the
+   packet - a member that went active in the same packet that completed
+   the chord must not have emitted - which is why chords are evaluated
+   before ordinary bindings in section 9.
+
+   Chords are a phase-two item. The rule is recorded now because a design
+   that does not anticipate the suppression pass has to be rearranged to
+   accept it later.
+
+3.  Actions
+
+   +------+------------------+------------------------------------------------+
+   | Code | Action           | code field means                               |
+   +======+==================+================================================+
+   |    0 | NONE             | unused slot                                    |
+   |    1 | KEY              | HID usage 0x04..0xA4, or a modifier 0xE0..0xE7 |
+   |    2 | MOUSE_BUTTON     | 1..5                                           |
+   |    3 | MOUSE_WHEEL      | signed detents per activation or repeat        |
+   |    4 | JOY_BUTTON       | 1..24, the gamepad collection                  |
+   |    5 | JOY_AXIS         | axis 0..6 in the low bits, sign in the high    |
+   |    6 | JOY_POV          | direction 0..3                                 |
+   |    7 | MOUSE_PULSE      | signed dx in the low byte, dy in the high;     |
+   |      |                  | emitted per activation or per repeat           |
+   |    8 | LAYER_HOLD       | layer index, live while the source is active   |
+   |    9 | LAYER_SET        | layer index, latched on activation             |
+   |   10 | LAYER_CYCLE      | step, signed; advance on activation            |
+   +------+------------------+------------------------------------------------+
+
+   Actions 4, 5 and 6 are XBCD's existing three destinations, so an
+   imported XBCD map matrix converts row by row with no loss.
+
+   ACTION 1 TAKES A HID USAGE, NOT A CHARACTER. 'w' is usage 0x1A, not
+   ASCII 0x77. The Adaptoid's compiler resolves this in user mode and
+   the driver only ever sees usages; the sibling project records a
+   hardware capture confirming it (ADAPTOID/docs/hid-descriptor.txt
+   section 5.3). Keep that split: the CONFIGURATOR owns the keyboard
+   layout and the name-to-usage table, and the driver knows only usages.
+   Putting layout awareness in the driver is a mistake that is hard to
+   walk back.
+
+   ACTION 3 IS A CAPABILITY THE ADAPTOID ADVERTISED AND NEVER HAD. Its
+   descriptor declares a wheel byte and its driver keeps a running total
+   for it, but the value passed is hard-wired to zero and the
+   _mouse_relative builtin takes only two arguments, so nothing can ever
+   drive it. A trigger bound to weapon-wheel scroll is free here.
+
+   ACTION 7 IS FOR DIGITAL SOURCES DRIVING THE POINTER - a D-pad that
+   nudges the cursor, which is what menu and emulator profiles want and
+   what the stick vector path is the wrong tool for. With REPEAT set it
+   becomes a steady crawl at the repeat rate.
+
+4.  The Binding Record
+
+   Twelve bytes, naturally aligned, no padding, identical on x86 and x64:
+
+       struct BINDING {
+           u8  source;           /* 0..24, 32..33, 64+N chord, 0xFF end */
+           u8  action;           /* the table in section 3 */
+           u16 code;             /* per action */
+           u16 on_at;            /* activation, MAX_VALUE units */
+           u16 off_at;           /* release, <= on_at */
+           u8  flags;            /* section 5 and 6 */
+           u8  repeat_hz;        /* 0 = no repeat */
+           u16 repeat_delay_ms;  /* before the first repeat */
+       };
+
+       flags:
+           0x01  REPEAT      autofire while active
+           0x02  TOGGLE      activation flips a latch
+           0x04  ANALOG      pass the magnitude through rather than
+                             thresholding it; only meaningful for
+                             JOY_AXIS and MOUSE_PULSE
+           0x08  NO_REPEAT_FIRST  the first repeat interval is the only
+                             one; used to make a delayed single shot
+
+   FIXED WIDTH TYPES, NOT int. The sibling project's notes call this out
+   for the Adaptoid's IOCTL payloads and it applies with more force here,
+   because this structure is written by a 32-bit configurator and read by
+   a 64-bit driver. u8, u16 and explicit padding; never a bitfield,
+   never an enum, never a pointer.
+
+   A layout is a fixed array of 32 bindings, terminated early by a
+   source of 0xFF. 32 slots against 25 sources leaves room for a source
+   bound twice and for a few chords.
+
+5.  Activation
+
+5.1.  Threshold And Hysteresis
+
+   A binding is active when its source rises above on_at, and stays
+   active until the source falls below off_at:
+
+       if (!was_active && value >= on_at)  active = 1
+       if ( was_active && value <  off_at) active = 0
+
+   PER BINDING, NOT PER SOURCE KIND. XBCD has three global thresholds -
+   BThreshold, TThreshold, AThreshold - so two triggers cannot have two
+   trigger points. Here every binding carries its own, and XBCD's values
+   become the defaults the configurator seeds:
+
+       digital sources               on_at = 1
+       analog face buttons           on_at = MAX_VALUE * 10/255  = 1372
+       triggers                      on_at = MAX_VALUE * 10/255  = 1372
+       stick semiaxes                on_at = MAX_VALUE * 100/255 = 13725
+
+   Those are tuned numbers with twenty years of use behind them. There
+   is no reason to rediscover them.
+
+   off_at IS WHAT XBCD DOES NOT HAVE and it matters more than the
+   threshold does. With a single threshold, a trigger resting exactly at
+   the trip point chatters: press, release, press, release, several
+   times a packet-rate second, each transition a real keystroke. A
+   default off_at of about 80 per cent of on_at costs nothing and removes
+   the failure mode entirely. Reject a configuration with off_at above
+   on_at rather than trying to interpret it.
+
+5.2.  Toggle
+
+   With TOGGLE set, the RISING EDGE of activation flips a latch and the
+   latch is what drives the action; the falling edge does nothing. A
+   crouch bound with TOGGLE stays crouched.
+
+   Clear every latch on a layer change and on device start, or a layer
+   swap strands a key down with nothing left holding it. The same
+   applies to every output state: see section 7.
+
+6.  Repeat, Also Known As Autofire
+
+6.1.  The Trap: HID Reports Are State, Not Events
+
+   A HID keyboard report carries the set of keys CURRENTLY HELD. A HID
+   gamepad report carries the buttons currently down. Neither carries
+   "this key was pressed". So a press and a release inside one report is
+   INVISIBLE - the host sees the before state and the after state and
+   they are identical.
+
+   Autofire therefore cannot be implemented by toggling a bit and
+   emitting one report. Every down and every up must be its OWN
+   SUBMITTED REPORT, in order.
+
+   Two consequences:
+
+   -  THE MAXIMUM AUTOFIRE RATE IS HALF THE TICK RATE. At a 250 Hz tick
+      that is 125 Hz, which is far beyond anything useful; the point is
+      that the relationship exists and a configurator must clamp against
+      it rather than accepting 200.
+
+   -  TWO BINDINGS REPEATING OUT OF PHASE PRODUCE INTERLEAVED REPORTS,
+      which is correct but means a tick can emit several reports.
+      The report path must be a queue, not a single slot. The sibling
+      project's replacement already does this and drops the NEWEST
+      report when the queue is full, which is the original's policy and
+      the right one for input: old keystrokes are already committed,
+      the new one can be re-sent by the next tick.
+
+   The Adaptoid's key event path has exactly this shape - a state array
+   plus a "report only on change" test - and the sibling project
+   confirms that pressing an already-held key produces no report at all
+   (ADAPTOID/docs/hid-descriptor.txt section 5.1). Carry the rule over.
+
+6.2.  Semantics
+
+   On activation the action is asserted immediately. If REPEAT is set, a
+   deadline is armed at repeat_delay_ms; when it expires the action is
+   de-asserted and re-asserted at repeat_hz, alternating on each half
+   period, until the binding deactivates.
+
+       t = 0                 assert
+       t = repeat_delay_ms   release, then assert, then alternate every
+                             1000 / (2 * repeat_hz) ms
+       deactivation          release, disarm, reset the phase
+
+   repeat_delay_ms defaulting to 0 gives plain autofire from the first
+   instant; a non-zero value gives the familiar keyboard behaviour where
+   a held key types once, pauses, then repeats.
+
+   ALWAYS EMIT A RELEASE ON DEACTIVATION, whatever phase the repeat was
+   in. A binding that deactivates during the asserted half and does not
+   release leaves a key held forever. This is the single most likely bug
+   in the whole engine and it is worth a harness test per action type.
+
+   REPEAT ON A MODIFIER IS MEANINGLESS AND SHOULD BE REFUSED by the
+   configurator: a flickering Shift produces nothing useful and confuses
+   the host's modifier tracking.
+
+   REPEAT ON MOUSE_WHEEL AND MOUSE_PULSE MEANS SOMETHING DIFFERENT and
+   better - those actions have no held state, so a repeat emits the
+   detent or the nudge once per period. That is exactly the behaviour
+   wanted from a D-pad driving a cursor or a trigger driving a scroll.
+
+7.  Layers
+
+   XBCD has eight layouts and one way to change them: hold Start and
+   Back, or the Guide button on a 360 pad, and the edge latch in
+   LayoutSwitch advances one step per press. The 360 LED ring shows
+   which is live. All of that is worth keeping and none of it needs to
+   be special-cased in the engine once layer changes are ordinary
+   actions.
+
+   Three actions cover every case:
+
+       LAYER_CYCLE   advance by code, signed, on the rising edge.
+                     Reproduces XBCD exactly when bound to a chord of
+                     Start and Back, or to Guide.
+       LAYER_SET     latch to a specific layer on the rising edge.
+       LAYER_HOLD    while active, the effective layer is code; on
+                     release it reverts.
+
+   LAYER_HOLD IS THE ONE THAT IS ACTUALLY NEW and it is what a keyboard
+   user expects. Hold the left trigger and the face buttons become a
+   different set: the shift key of a gamepad. Without it, eight layouts
+   are eight modes you cycle through blind.
+
+   THE HOLD BINDING MUST LIVE IN EVERY LAYER IT CAN RETURN FROM, or the
+   layer it switches to has no binding holding it and it releases
+   immediately. The configurator should place it automatically and warn
+   if it is missing; the driver should not try to be clever about it.
+
+   ON EVERY LAYER CHANGE, RELEASE EVERYTHING THE OLD LAYER ASSERTED.
+   Walk the output state and clear it, emitting the reports that
+   implies, before evaluating the new layer. A layer change that leaves
+   W held because the new layer has nothing bound to that source is the
+   classic failure of every layered remapper, and the fix is this one
+   line of policy.
+
+   The base layer is restored when no LAYER_HOLD is active. Nested holds
+   resolve to the highest-numbered active hold, which is arbitrary but
+   deterministic, and is simpler to explain than a stack.
+
+8.  The Output State Machines
+
+   Three small pieces of state, folded from the bindings and compared
+   against what was last submitted. The keyboard one has more rules than
+   it looks like it should, and every one of them is load-bearing; the
+   sibling project established them against a running driver and they
+   are reproduced here rather than rediscovered.
+
+8.1.  Keyboard
+
+       modifier byte    bit = usage - 0xE0, for usages 0xE0..0xE7
+       key array        usages 0x04..0xA4, DENSE AND ORDERED BY PRESS
+                        TIME - a press appends, a release shifts the
+                        tail down over the gap
+       report           modifiers, one reserved byte, then the first
+                        ten entries of the array
+
+   SIZE THE ARRAY TO THE KEYCODE RANGE, NOT TO THE REPORT. The Adaptoid
+   reserves 0xA5 bytes for 0xA1 possible usages and never appends a
+   usage already present, so the count cannot exceed the number of
+   distinct codes and the array cannot overflow. A port that sizes it to
+   the ten report slots is wrong.
+
+   ORDER BY PRESS TIME IS NOT COSMETIC. It is what makes the ten
+   reported slots the ten OLDEST keys held, rather than an arbitrary
+   ten. Releasing by swapping the last entry into the gap is the obvious
+   implementation and it is the wrong one.
+
+   ABOVE TEN KEYS, FILL ALL TEN SLOTS WITH 0x01 - the HID ErrorRollOver
+   usage - while continuing to track every key internally. Releasing back
+   to ten restores the real list with no fresh press needed.
+
+   EMIT ONLY ON CHANGE. A press of a held key, a release of one not
+   held, a modifier already set: no report.
+
+8.2.  Mouse Buttons And Wheel
+
+       button bits      1..5
+       dx, dy           from the stick vector path, signed 16-bit
+       wheel            signed, from MOUSE_WHEEL actions this tick
+
+   One report carries all of it, so a tick that has both a click and
+   movement emits one report, not two. Button changes emit on change;
+   movement emits when a delta is non-zero.
+
+   DO NOT EMIT ALL-ZERO MOVE REPORTS. The Adaptoid's move path has no
+   change test and sends one on every call. At 250 Hz that is 250
+   pointless reports a second through mouclass for as long as the driver
+   is loaded.
+
+8.3.  Gamepad
+
+   Unchanged from XBCD: 24 button bits, 7 axes accumulated with its
+   larger-magnitude-wins rule, and the POV truth table over four
+   direction bits. See xbcd-architecture.txt sections 7.2 to 7.4.
+
+   The one addition is that a JOY_AXIS binding with ANALOG set passes
+   the source magnitude through instead of thresholding it, which is
+   what XBCD already does implicitly for axis destinations. The flag
+   exists so the same action can also be used digitally.
+
+9.  Evaluation Order
+
+   Once per controller packet, at DISPATCH_LEVEL in the USB completion
+   path:
+
+       1  validate the packet: status, URB status, and a transfer length
+          of exactly 20. XBCD checks only the first of the three.
+       2  decode into the 25 semiaxes; apply the radial deadzone and the
+          crop to each stick pair
+       3  evaluate chord sources and build the member suppression set
+       4  resolve the effective layer from LAYER_HOLD bindings evaluated
+          against the BASE layer, then apply any pending LAYER_SET or
+          LAYER_CYCLE from the previous packet
+       5  if the layer changed, release every asserted output and emit
+          the resulting reports
+       6  walk the binding list of the effective layer: activation,
+          toggle, repeat deadlines, and fold each active binding into
+          the three output states
+       7  run the stick vector path for each stick, producing mouse
+          deltas or joystick axes per its mode
+       8  compare each output state against the last submitted; queue a
+          report for each that changed
+       9  drain the queue into pending HID reads
+
+   STEP 4 IS ORDERED THAT WAY ON PURPOSE. Resolving holds against the
+   base layer means a hold binding cannot be shadowed by the layer it
+   switches to, which removes a whole class of "stuck in layer 3"
+   reports. Deferring SET and CYCLE by one packet means a binding that
+   changes the layer is not itself re-evaluated under the new layer in
+   the same pass.
+
+   THE TIMER TICK RUNS THE SAME LOOP with a stale packet. Repeat
+   deadlines and the mouse accumulator both need a clock independent of
+   packet arrival, so the periodic DPC of analog-to-mouse.txt section
+   3.3 re-enters at step 6 with the last decoded state. One tick, two
+   customers.
+
+10. The Configuration Blob
+
+   One versioned structure, written by the configurator, read by the
+   driver. Carried both ways - persisted in the registry and pushed live
+   over a feature report. See replacement-plan.txt section 6 for the
+   transport.
+
+       struct CONFIG_HEADER {       /* 32 bytes */
+           u32 signature;           /* 'XBSU', as XBCD */
+           u16 version;             /* bump on any layout change */
+           u16 header_bytes;
+           u16 layout_bytes;        /* stride of one layout */
+           u8  layout_count;        /* 1..8 */
+           u8  binding_count;       /* per layout, <= 32 */
+           u8  chord_count;
+           u8  collections;         /* bit 0 gamepad, 1 keyboard,
+                                       2 mouse - see section 11 of
+                                       replacement-plan.txt */
+           u16 tick_hz;
+           u8  reserved[14];
+       };
+
+       then layout_count copies of
+
+       struct LAYOUT {
+           BINDING  binding[32];    /* 384 bytes */
+           CHORD    chord[8];       /*  32 bytes */
+           STICK    stick[2];       /* 156 bytes, analog-to-mouse s7  */
+           u8       led;            /* 360 LED pattern for this layer */
+           u8       reserved[3];
+       };
+
+   Around 4.6 KB in total for eight full layouts.
+
+   VALIDATE EVERY FIELD AND FALL BACK TO A DEFAULT, which is what
+   XBCDReadConfig already does value by value and is why a fresh install
+   with no registry data works. Extend the discipline to the blob:
+   reject on a bad signature or an unknown version, clamp every count,
+   reject off_at above on_at, reject a source index that is not in the
+   enumeration, and repair a non-monotone curve table rather than
+   trusting it. THE BLOB ARRIVES FROM USER MODE AND IS PARSED AT
+   DISPATCH_LEVEL; there is no second chance.
+
+   THE STRIDE IS IN THE HEADER SO THE DRIVER NEVER COMPUTES IT. A
+   configurator built against a newer version can grow a layout, and an
+   older driver walks it correctly by stride and ignores the tail, which
+   is the cheapest possible forward compatibility and costs two bytes.
+
+11. A Worked Example
+
+   The FPS profile from the Adaptoid library, expressed in this model.
+   Sources are the section 2 indices, thresholds in MAX_VALUE units.
+
+   +--------+------------------+--------------+-------+--------+----------+
+   | Source | Control          | Action       | code  | on_at  | flags    |
+   +========+==================+==============+=======+========+==========+
+   |     15 | Right trigger    | MOUSE_BUTTON |     1 |   1372 | -        |
+   |     14 | Left trigger     | MOUSE_BUTTON |     3 |   1372 | -        |
+   |      8 | A                | KEY space    |  0x2C |   1372 | -        |
+   |      9 | B                | KEY c        |  0x06 |   1372 | -        |
+   |     10 | X                | KEY enter    |  0x28 |   1372 | -        |
+   |     11 | Y                | KEY slash    |  0x38 |   1372 | -        |
+   |     12 | Black            | KEY tab      |  0x2B |   1372 | -        |
+   |      0 | D-up             | KEY space    |  0x2C |      1 | -        |
+   |      1 | D-down           | KEY c        |  0x06 |      1 | -        |
+   |     18 | Left stick Y-    | KEY w        |  0x1A |  13725 | -        |
+   |     19 | Left stick Y+    | KEY s        |  0x16 |  13725 | -        |
+   |     16 | Left stick X-    | KEY a        |  0x04 |  13725 | -        |
+   |     17 | Left stick X+    | KEY d        |  0x07 |  13725 | -        |
+   +--------+------------------+--------------+-------+--------+----------+
+
+   plus one stick record: right stick in relative-mouse mode, quadratic
+   curve, max_speed 2812, gain_y 55, invert_y set.
+
+   THE LEFT STICK BECOMING WASD IS SOMETHING THE ADAPTOID PROFILE DOES
+   NOT DO, because the N64 has one stick and it was spent on mouselook.
+   The Xbox pad has two, so the shipped FPS profile's use of the C
+   buttons for movement becomes the left stick here and the C buttons
+   have nowhere to be. That is the Xbox pad being the better source, and
+   it is the shape almost every profile will take.
+
+   Autofire is the obvious demonstration of the new fields: set REPEAT
+   and repeat_hz on the right trigger and it becomes a 12-shot-a-second
+   mouse button, which the Adaptoid needed a forked thread with a sleep
+   loop to achieve.
+
+12. The Boundary
+
+   What this model deliberately cannot do, stated plainly so nobody
+   discovers it by surprise.
+
+   NO CONDITIONALS. A binding cannot depend on anything but its own
+   source's value and its own state. "Fire only while zoomed" is not
+   expressible except by making zoom a layer.
+
+   NO SEQUENCES. "Press A, wait 50 ms, press B" has no home here.
+   A repeat is one action alternating; it is not a program.
+
+   NO ARITHMETIC. A source cannot be scaled, combined or compared with
+   another source. Chords are a conjunction, not an expression.
+
+   NO STATE BEYOND ONE LATCH PER BINDING. There are no variables.
+
+   ALL FOUR ARE THE POINT. Together they are what removes a bytecode
+   interpreter, a thread scheduler, a fork primitive and a post-mortem
+   crash dump from kernel mode, and what makes the whole engine a loop
+   over a table that a user-mode harness can step deterministically.
+
+   IF A SEQUENCE IS EVER GENUINELY NEEDED, the smallest honest extension
+   is a MACRO action: a step list of at most sixteen entries, each a
+   {delay_ms, action, code, down} record, played by the existing tick.
+   That is a data structure and a cursor, not a language, and it stays
+   inside the properties above. Adding it is a contained change; adding
+   expressions is not.
+
+   THE ONE CASE THAT WOULD JUSTIFY REOPENING THIS is a title needing
+   input shaped by something the driver cannot see - game state, a
+   screen region, a timer synchronised to an animation. Nothing in the
+   Adaptoid's shipped script library does any of that. Every one of the
+   24 scripts is bindings plus the stick handler taken apart in
+   analog-to-mouse.txt, and both halves are covered here.

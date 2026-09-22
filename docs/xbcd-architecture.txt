@@ -1,0 +1,894 @@
+XBOXCTL                                                      Analysis Note
+src_drv/orig (XBCD 0.2.6 / 1.0.8)                            2005 driver
+
+
+                      HOW THE XBCD DRIVER WORKS
+
+
+Abstract
+
+   src_drv/orig is the GPL source of XBCD, Helder Acevedo's Xbox
+   controller driver, in the "all digital buttons" 1.07/1.08 line with
+   the 0.2.6 x64 patches applied. It is a HID minidriver that owns the
+   pad over USB and manufactures a gamepad HID report descriptor for it,
+   because the Xbox pad ships no report descriptor of its own.
+
+   This note records what that code does, file by file and data path by
+   data path, so the replacement can be specified against it rather than
+   against a reading of it. It also compares the shape of the data
+   arriving from an Xbox pad with the shape arriving from an Adaptoid,
+   which is the question that decides how much of the sibling project's
+   design carries over.
+
+   Everything here is read out of the source in src_drv/orig. Line
+   references are to those files as committed. Statements that are not
+   directly supported by a line of that source are marked INFERENCE.
+
+Table of Contents
+
+   1.  What It Is, Architecturally
+   2.  File Map
+   3.  The Device Extension
+   4.  Lifecycle
+   4.1.  DriverEntry
+   4.2.  AddDevice
+   4.3.  StartDevice
+   5.  The USB Transport
+   5.1.  The Read Path
+   5.2.  The Five Second Timer
+   5.3.  The Write Path
+   6.  The Raw Packet Formats
+   6.1.  Xbox 1 Input, 20 Bytes
+   6.2.  Xbox 360 Input, 20 Bytes
+   6.3.  Output, Rumble And LEDs
+   7.  The Mapping Engine
+   7.1.  Semiaxes: The Input Side
+   7.2.  The Map Matrix: The Output Side
+   7.3.  Thresholds And Axis Accumulation
+   7.4.  The POV Truth Table
+   7.5.  Deadzone And Vector Cropping
+   8.  Configuration
+   8.1.  The Registry Values
+   8.2.  The Reload Handshake
+   9.  The Report Descriptor
+   9.1.  It Is Assembled, Not Static
+   9.2.  The Output Report Layout
+   10. How This Compares To The Adaptoid
+   11. What Is Wrong With It For Our Purposes
+   12. What Is Worth Keeping
+
+1.  What It Is, Architecturally
+
+   XBCD is the FUNCTION DRIVER for the Xbox pad, not a filter. XBCD.inf
+   matches hardware IDs such as USB\VID_045E&PID_0289, and a hardware-ID
+   match outranks the generic compatible-ID match, so PnP loads XBCD
+   instead of the inbox path.
+
+   DriverEntry then calls HidRegisterMinidriver, which stacks
+   hidclass.sys above it. From that point:
+
+       1. hidclass asks for a report descriptor
+       2. XBCD answers with one it assembles at runtime, describing a
+          gamepad or joystick with up to 24 buttons, 7 axes and a hat
+       3. hidclass creates one child PDO for that single collection
+       4. the DirectInput and Raw Input stacks attach to it
+
+   Below the driver there is no HID layer at all. XBCD submits URBs to
+   the USB bus driver and receives 20 raw bytes off an interrupt IN
+   endpoint. Those bytes are a vendor format; nothing forces them to be
+   read as HID, and they are not.
+
+   This is exactly the position wishk201.sys occupies for the Adaptoid.
+   The two drivers are the same architecture applied to different
+   hardware, which is why the sibling project's analysis transfers.
+
+       DirectInput / Raw Input / joy.cpl
+       -------------------------------------
+       gamepad PDO                             one collection
+       hidclass.sys                            linked into the same FDO
+       XBCD                                    the function driver, FDO
+       ========== IRP / URB boundary ==========
+       USB PDO (usbhub)
+       usbport / usbehci / usbxhci
+
+2.  File Map
+
+   +-----------------+-------+-----------------------------------------------+
+   | File            | Lines | Holds                                         |
+   +=================+=======+===============================================+
+   | XBCD_driver.c   |  1378 | DriverEntry, AddDevice, PnP, power, Start and |
+   |                 |       | Stop, registry read, default map matrix, 360  |
+   |                 |       | LED command                                   |
+   +-----------------+-------+-----------------------------------------------+
+   | XBCD_control.c  |  1267 | the HID minidriver IOCTL surface, the whole   |
+   |                 |       | mapping engine, deadzone and crop math        |
+   +-----------------+-------+-----------------------------------------------+
+   | XBCD_report.c   |   492 | the report descriptor fragments and the       |
+   |                 |       | routine that assembles them                   |
+   +-----------------+-------+-----------------------------------------------+
+   | XBCD_usb.c      |   440 | URB build and submit, read and write          |
+   |                 |       | completion, interrupt IRP allocation          |
+   +-----------------+-------+-----------------------------------------------+
+   | XBCD_driver.h   |   338 | constants, the feature report structs, the    |
+   |                 |       | device extension                              |
+   +-----------------+-------+-----------------------------------------------+
+   | XBCD_hid.h      |   102 | local copies of hidclass declarations the     |
+   |                 |       | 2005 DDK did not export                       |
+   +-----------------+-------+-----------------------------------------------+
+   | RemoveLock.c    |    54 | hand-rolled remove lock for Windows 98        |
+   +-----------------+-------+-----------------------------------------------+
+   | SemiAxis.h      |    35 | one struct, one LONG field                    |
+   +-----------------+-------+-----------------------------------------------+
+   | sources         |    15 | WDK build description, TARGETNAME xbcd        |
+   +-----------------+-------+-----------------------------------------------+
+
+   XBCD_hid.h declaring HID_MINIDRIVER_REGISTRATION and
+   HID_DEVICE_EXTENSION by hand is not a modernisation opportunity. It
+   was necessary in 2005 and is wrong now: hidport.h in a current WDK
+   declares all of it, and keeping the local copies risks a layout
+   mismatch with the hidclass the machine actually runs.
+
+3.  The Device Extension
+
+   One DEVICE_EXTENSION per pad, declared in XBCD_driver.h. hidclass
+   allocates it, sized by DeviceExtensionSize, and it is reached from an
+   FDO through GET_MINIDRIVER_DEVICE_EXTENSION.
+
+   The fields that matter to the replacement:
+
+   +-------------------------+------------------------------------------------+
+   | Field                   | Meaning                                        |
+   +=========================+================================================+
+   | hwInData[20]            | the last raw packet read off the pad           |
+   | hwOutData[20]           | the packet staged for the pad (rumble, LED)    |
+   | SemiAxes[25]            | decoded input, each 0..35000, unipolar         |
+   | MapMatrix[8][24]        | 8 layouts, 24 source slots, one destination    |
+   |                         | code each                                      |
+   | NrOfLayouts, LayoutNr   | how many layouts and which is live             |
+   | LayoutSwitch            | edge latch for the layout cycle combination    |
+   | BThreshold, TThreshold, | activation thresholds for analog buttons,      |
+   | AThreshold              | triggers and stick semiaxes                    |
+   | LStickDZ, RStickDZ      | radial deadzone per stick, in MAX_VALUE units  |
+   | AxesScale[7]            | per-output-axis sensitivity, MAX_VALUE units   |
+   | bFullRange[2]           | rescale the stick to reach the square corners  |
+   | nButtons, AxesOn,       | shape of the report descriptor to advertise    |
+   | DevUsage                |                                                |
+   | LaFactor, RaFactor      | rumble actuator scale, 0..255                  |
+   | is360, isWheel          | which raw packet layout to decode              |
+   | ReadInfo, WriteInfo     | the one read IRP and URB, and the one write    |
+   | bReadPending,           | single-outstanding-request flags               |
+   | bWritePending           |                                                |
+   | timer, timeDPC,         | the five second read keep-alive, section 5.2   |
+   | timerEnabled            |                                                |
+   +-------------------------+------------------------------------------------+
+
+   MAX_VALUE is 35000. Every decoded input value and every threshold is
+   expressed in those units, so the engine needs no floating point to
+   express fractions: a percentage is value * pct / 100 and a 0..255
+   control panel slider is MAX_VALUE * slider / 255. The output axis
+   scale OUT_AXIS_SCALE is 32767, applied only at the very end.
+
+   35000 RATHER THAN 32767 IS DELIBERATE and is worth understanding
+   before changing it. A stick at full deflection on one axis still
+   reads well under full scale on the other, so a value pair on the
+   physical circle never reaches the corner of the logical square. The
+   driver decodes into a range about 6.8 per cent wider than the output
+   range and clamps at the end, which lets a real full deflection reach
+   real full scale. The source comment notes Microsoft's own 360 driver
+   does the same thing with an even larger figure.
+
+4.  Lifecycle
+
+4.1.  DriverEntry
+
+   XBCD_driver.c:25. Installs seven major functions, then registers the
+   minidriver:
+
+       MajorFunction[IRP_MJ_CREATE]                  XBCDCreate
+       MajorFunction[IRP_MJ_CLOSE]                   XBCDClose
+       MajorFunction[IRP_MJ_INTERNAL_DEVICE_CONTROL] XBCDDispatchIntDevice
+       MajorFunction[IRP_MJ_DEVICE_CONTROL]          XBCDDispatchDevice
+       MajorFunction[IRP_MJ_SYSTEM_CONTROL]          XBCDDispatchSystem
+       MajorFunction[IRP_MJ_POWER]                   XBCDDispatchPower
+       MajorFunction[IRP_MJ_PNP]                     XBCDDispatchPnp
+       DriverUnload                                  XBCDUnload
+       DriverExtension->AddDevice                    XBCDAddDevice
+
+       hidMinidriverRegistration.DevicesArePolled = TRUE
+
+   THAT LAST LINE IS THE MOST CONSEQUENTIAL LINE IN THE DRIVER and it is
+   one word. DevicesArePolled TRUE tells hidclass that the device cannot
+   push: hidclass calls IOCTL_HID_READ_REPORT in a loop and expects each
+   one to be completed promptly with whatever the current state is. The
+   minidriver never originates a report.
+
+   A driver that must deliver keyboard and mouse reports on its own
+   schedule cannot work that way. See section 11.
+
+   Unlike the Adaptoid, XBCD does NOT save and re-wrap the dispatch
+   pointers hidclass installs over its own. It has no private control
+   device and no user-mode channel; all configuration arrives through the
+   registry and a HID feature report. That is a simpler and better
+   behaved arrangement than the Adaptoid's, and section 8 records it.
+
+4.2.  AddDevice
+
+   XBCD_driver.c:96. Caches the PDO and the lower device object,
+   initialises the two spin locks and the remove lock, sets
+   DO_POWER_PAGABLE and DO_DIRECT_IO, clears DO_DEVICE_INITIALIZING.
+
+   On pre-WDM-1.5 systems it also registers a device interface under
+   GUID_DEVINTERFACE_USB_DEVICE so the Windows 98 setup utility can find
+   the pad. That is dead weight on any system the replacement will run
+   on.
+
+4.3.  StartDevice
+
+   XBCD_driver.c:413, called from the PnP dispatcher on
+   IRP_MN_START_DEVICE. In order:
+
+       1  GET_DESCRIPTOR(Device) into DevExt->dd, for VID, PID and
+          bcdDevice. A failure here is logged and IGNORED - the return
+          is commented out - so a pad that will not answer still
+          proceeds with a zeroed descriptor.
+       2  GET_DESCRIPTOR(Configuration) twice, the fixed part first to
+          learn wTotalLength, then the whole thing.
+       3  reject more than MAX_INTERFACES (4) interfaces.
+       4  USBD_ParseConfigurationDescriptorEx per interface.
+       5  detect a 360 pad by interface 0 having class 0xFF, subclass
+          0x5D, protocol 0x01.
+       6  USBD_CreateConfigurationRequestEx, then branch on
+          bNumEndpoints: 1 endpoint means no motors, 2 means motors,
+          anything else is STATUS_DEVICE_CONFIGURATION_ERROR.
+       7  SELECT_CONFIGURATION, then save the configuration handle and
+          Pipes[0] as the IN pipe and Pipes[1] as the OUT pipe.
+       8  CreateInterruptUrb allocates ONE read IRP and URB and ONE
+          write IRP and URB.
+       9  initialise the timer and DPC.
+      10  seed every configurable field with a default, then call
+          XBCDReadConfig to overwrite from the registry.
+
+   TWO ASSUMPTIONS IN STEP 7 SHOULD NOT BE COPIED. Pipes[0] is taken as
+   the interrupt IN pipe and Pipes[1] as OUT without examining
+   EndpointAddress or PipeType, and only interface 0 is ever used. The
+   Adaptoid makes the identical assumption and the sibling project's
+   notes flag it for the same reason. On the pads XBCD targets it happens
+   to hold; it is not a property of USB.
+
+   THE ENDPOINT INTERVAL IS NEVER SET, only logged. Commented-out lines
+   show an attempt to force MaximumTransferSize, MaximumPacketSize,
+   PipeType and Interval, abandoned. So the packet rate is whatever the
+   pad's endpoint descriptor declares, and the driver does not know it.
+   The replacement needs that number - it is the time base for velocity
+   integration - and should read it out of Pipes[0].Interval rather than
+   assume one.
+
+5.  The USB Transport
+
+5.1.  The Read Path
+
+   ONE read is outstanding at a time, guarded by bReadPending under
+   ReadLock. DeviceRead builds a bulk-or-interrupt transfer request for
+   exactly 20 bytes into DevExt->hwInData with
+   USBD_TRANSFER_DIRECTION_IN | USBD_SHORT_TRANSFER_OK, sets
+   ReadCompletion, clears Irp->Cancel and calls down.
+
+   ReadCompletion clears bReadPending, releases the remove lock, and
+   resubmits by calling DeviceRead again - but ONLY IF timerEnabled is
+   set. It returns STATUS_MORE_PROCESSING_REQUIRED, which is correct for
+   a driver-allocated IRP it means to reuse.
+
+   THE COMPLETION DOES NOT VALIDATE THE TRANSFER. It tests
+   IoStatus.Status and nothing else: not the URB status, not
+   TransferBufferLength. A short read leaves stale bytes in hwInData from
+   the previous packet and the decoder cannot tell. The Adaptoid's poll
+   completion checks all three, and the replacement should.
+
+5.2.  The Five Second Timer
+
+   This is the mechanism that makes XBCD unsuitable as-is and it is easy
+   to miss, so it gets its own section.
+
+   Reading does not run continuously. It is started and kept alive by HID
+   reads coming DOWN from hidclass. In XBCD_control.c, the
+   IOCTL_HID_READ_REPORT case does:
+
+       Status = XBCDReadData(pFdo, pIrp);    answer from current state
+
+       timeout.QuadPart = -50000000;         5 seconds, relative
+       KeSetTimer(&pDevExt->timer, timeout, &pDevExt->timeDPC);
+       pDevExt->timerEnabled = TRUE;
+
+       Status = DeviceRead(pDevExt);         start or refresh the read
+
+   timerDPCProc does one thing: clear timerEnabled. ReadCompletion only
+   resubmits while timerEnabled is set. So USB polling continues for five
+   seconds after the last HID read and then stops dead.
+
+   The comment says this exists to fix "problems with button
+   configuration in games", INFERENCE being that some titles stop reading
+   while a configuration dialog is open and the driver must keep
+   answering. Whatever the reason, the consequence is structural: with
+   nothing reading the gamepad collection, the pad is not polled.
+
+   A driver whose job is to emit keystrokes must poll whenever the device
+   is started, full stop. There is no reader to keep it alive: kbdclass
+   does not poll, it waits.
+
+5.3.  The Write Path
+
+   Symmetric and equally single-outstanding, guarded by bWritePending.
+   DeviceWrite sends DevExt->hwOutData of a caller-supplied length out
+   Pipes[1]. Used for rumble, from IOCTL_HID_WRITE_REPORT, and for the
+   360 LED command from XBCDUpdate360Leds.
+
+   A write that arrives while one is pending returns STATUS_DEVICE_BUSY
+   and is DROPPED, not queued. For rumble that is acceptable - the next
+   update supersedes it. For the LED command it means a layout change can
+   fail to show, which is why XBCDReadData retries the LED write on every
+   packet until LightStatus matches.
+
+6.  The Raw Packet Formats
+
+6.1.  Xbox 1 Input, 20 Bytes
+
+   Off the interrupt IN endpoint. Offsets are into hwInData.
+
+   +-------+----------------------------------------------------------------+
+   | Byte  | Contents                                                       |
+   +=======+================================================================+
+   | 0     | 0x00, report type                                              |
+   | 1     | 0x14, the length of this report, 20                            |
+   | 2     | digital buttons, bitmask:                                      |
+   |       |   0x01 D-up   0x02 D-down  0x04 D-left  0x08 D-right           |
+   |       |   0x10 Start  0x20 Back    0x40 L-thumb 0x80 R-thumb           |
+   | 3     | 0x00, unused                                                   |
+   | 4     | A, ANALOG 0..255                                               |
+   | 5     | B, analog                                                      |
+   | 6     | X, analog                                                      |
+   | 7     | Y, analog                                                      |
+   | 8     | Black, analog                                                  |
+   | 9     | White, analog                                                  |
+   | 10    | Left trigger, analog                                           |
+   | 11    | Right trigger, analog                                          |
+   | 12-13 | Left stick X, signed 16-bit little endian                      |
+   | 14-15 | Left stick Y, signed 16-bit little endian                      |
+   | 16-17 | Right stick X, signed 16-bit little endian                     |
+   | 18-19 | Right stick Y, signed 16-bit little endian                     |
+   +-------+----------------------------------------------------------------+
+
+   Y IS UP-POSITIVE, the opposite of the HID convention, and XBCD does
+   not negate it. It splits the value into two unipolar semiaxes and lets
+   the map matrix decide which output half each one drives, so the sign
+   convention is expressed in the default map rather than in the decoder.
+   A replacement that emits mouse movement must negate Y somewhere, and
+   should do it once, explicitly, at the point of conversion.
+
+   EIGHT OF THE TWELVE BUTTONS ARE ANALOG on this pad. A, B, X, Y, Black,
+   White and both triggers all report 0..255 pressure. The Adaptoid has
+   nothing comparable; every N64 button is a single bit.
+
+6.2.  Xbox 360 Input, 20 Bytes
+
+   Same endpoint, different meaning. Byte 0 of 0x01 marks an LED status
+   message instead, which XBCDReadData handles separately.
+
+   +-------+-----------------------------------------------------------------+
+   | Byte  | Contents                                                        |
+   +=======+=================================================================+
+   | 0     | 0x00 for input, 0x01 for an LED status message                  |
+   | 1     | length                                                          |
+   | 2     | as Xbox 1 byte 2: D-pad, Start, Back, thumb clicks              |
+   | 3     | 0x01 LB  0x02 RB  0x04 Guide  0x08 unused                       |
+   |       | 0x10 A   0x20 B   0x40 X      0x80 Y                            |
+   | 4     | Left trigger, analog                                            |
+   | 5     | Right trigger, analog                                           |
+   | 6-7   | Left stick X, signed 16-bit                                     |
+   | 8-9   | Left stick Y, signed 16-bit                                     |
+   | 10-11 | Right stick X, signed 16-bit                                    |
+   | 12-13 | Right stick Y, signed 16-bit                                    |
+   +-------+-----------------------------------------------------------------+
+
+   The Thrustmaster Modena 360 wheel, VID 0x044F PID 0x0F03, is detected
+   in XBCDDispatchIntDevice and handled by XOR-ing the left stick X word
+   with 0x8000, converting an unsigned wheel position into a signed one.
+
+6.3.  Output, Rumble And LEDs
+
+   Xbox 1, 6 bytes:
+
+       [0] 0x00   [1] 0x06 length   [2] 0x00
+       [3] left actuator, 0..255
+       [4] 0x00
+       [5] right actuator, 0..255
+
+   Xbox 360, 8 bytes:
+
+       [0] 0x00   [1] 0x08 length   [2] 0x00
+       [3] left actuator
+       [4] right actuator
+       [5..7] 0x00
+
+   Both are scaled by the configured factor as
+   ((1 + Factor) * In) >> 8, so a factor of 255 is unity and 0 is off.
+
+   The 360 LED command is a separate 3-byte write, built in
+   XBCDUpdate360Leds, whose payload byte is the value in LedSetting.
+   XBCDReadData drives it from a per-layout table so the LED ring shows
+   which layout is active.
+
+7.  The Mapping Engine
+
+   All of it is in XBCDReadData, XBCD_control.c:747 onward, called from
+   the IOCTL_HID_READ_REPORT case. It runs once per HID READ, not once
+   per USB packet, and it reads whatever is currently in hwInData.
+
+7.1.  Semiaxes: The Input Side
+
+   The decoder fills SemiAxes[25], each a LONG in 0..MAX_VALUE. A
+   semiaxis is UNIPOLAR: a bidirectional stick axis becomes two of them,
+   one per direction, each carrying the magnitude in that direction and
+   zero otherwise.
+
+   +-------+--------------------------+---------------------------------+
+   | Index | Source                   | Derivation                      |
+   +=======+==========================+=================================+
+   | 0-3   | D-pad up/down/left/right | bit test, 0 or MAX_VALUE        |
+   | 4     | Start                    | bit test                        |
+   | 5     | Back                     | bit test                        |
+   | 6     | Left thumb click         | bit test                        |
+   | 7     | Right thumb click        | bit test                        |
+   | 8-11  | A, B, X, Y               | MAX_VALUE * byte / 255 (Xbox 1) |
+   |       |                          | bit test (360)                  |
+   | 12-13 | Black, White / LB, RB    | as above                        |
+   | 14-15 | Left, right trigger      | MAX_VALUE * byte / 255          |
+   | 16-17 | Left stick X neg, pos    | split of the scaled 16-bit word |
+   | 18-19 | Left stick Y neg, pos    | split                           |
+   | 20-21 | Right stick X neg, pos   | split                           |
+   | 22-23 | Right stick Y neg, pos   | split                           |
+   | 24    | Guide button (360 only)  | bit test                        |
+   +-------+--------------------------+---------------------------------+
+
+   The stick words are scaled asymmetrically, which is easy to misread:
+
+       Stick = raw < 0 ? MAX_VALUE * raw / 32768
+                       : MAX_VALUE * raw / 32767
+
+   so both extremes land on MAX_VALUE in magnitude despite the signed
+   range being asymmetric. Then deadzone and crop run on the PAIR
+   (section 7.5), and only afterwards is the result split into two
+   semiaxes.
+
+   THE SEMIAXIS ARRAY IS THE RIGHT SUBSTRATE TO BUILD ON. It is already a
+   flat, uniform, hardware-independent list of 25 unipolar magnitudes in
+   one fixed-point range, with pad differences absorbed above it.
+   Anything the replacement maps from should map from this, not from
+   hwInData.
+
+7.2.  The Map Matrix: The Output Side
+
+   MapMatrix[layout][source] holds ONE unsigned code per source slot, and
+   that code names a Windows-side destination. 24 sources are consulted -
+   slot 24, the Guide button, is read directly for layout switching and
+   is not mappable.
+
+   +---------+--------------------------------------------------------+
+   | Code    | Destination                                            |
+   +=========+========================================================+
+   | 0       | unassigned                                             |
+   | 1..24   | HID button 1..24                                       |
+   | 25..38  | one half of one of the 7 output axes; (code-25)/2      |
+   |         | selects the axis, the low bit selects the sign, even   |
+   |         | is negative                                            |
+   | 39..42  | one of the 4 POV directions                            |
+   +---------+--------------------------------------------------------+
+
+   NR_WINCONTROLS is 42 and XBCDReadConfig rejects anything above it. The
+   order of the 7 output axes is fixed by the report descriptor as X, Y,
+   Z, RX, RY, RZ, Slider.
+
+   So the whole configuration model is ONE BYTE PER SOURCE PER LAYOUT.
+   Eight layouts of 24 bytes is the entire mapping state: 192 bytes. That
+   is the thing the replacement replaces, and it is worth noting how
+   little there is of it - the model has no room for a key code, a repeat
+   rate, or anything else, which is precisely why key mapping cannot be
+   bolted onto it.
+
+7.3.  Thresholds And Axis Accumulation
+
+   For a source mapped to a BUTTON or a POV direction, an analog value
+   must clear a threshold chosen by which kind of source it is:
+
+       slots 8..13    BThreshold   analog face buttons
+       slots 14,15    TThreshold   triggers
+       slots 16..23   AThreshold   stick semiaxes
+       slots 0..7                  digital, no threshold
+
+   Below the threshold the semiaxis is ZEROED IN PLACE, which matters:
+   the write is to DevExt->SemiAxes[index].Value, so a source that fails
+   its button threshold is also zero for any later use in the same pass.
+   With one destination per source that cannot be observed, but it is a
+   trap for a replacement that allows a source to drive more than one
+   thing.
+
+   Thresholds are global per kind, not per binding. Two buttons mapped
+   from two triggers cannot have different trigger points.
+
+   For a source mapped to an AXIS HALF, the contributions accumulate into
+   PreOutAxes[7] with a rule that is not a plain sum:
+
+       same sign as what is already there   take the larger magnitude
+       opposite sign                        add, so they cancel
+
+   That gives the behaviour you want when two sources drive opposite
+   halves of one axis (left and right cancel) and when two drive the same
+   half (the further one wins, rather than summing past full scale).
+
+   Finally each axis is scaled and converted to the output range:
+
+       PreOutAxes[i] = PreOutAxes[i] * AxesScale[i] / MAX_VALUE
+       out16         = OUT_AXIS_SCALE * PreOutAxes[i] / MAX_VALUE
+
+7.4.  The POV Truth Table
+
+   The four POV direction bits index a 16-entry table, OutPovValue, that
+   maps them to the HID hat encoding 0..7 with 8 meaning centred. Seven
+   of the sixteen combinations are impossible or contradictory - up and
+   down together, three directions at once - and every one of them maps
+   to 8. The comment notes that a smarter resolution could be dropped in
+   by editing the table, for example resolving up-plus-left-plus-right to
+   plain up.
+
+   A lookup table over the four bits is the right shape for this and
+   should be kept.
+
+7.5.  Deadzone And Vector Cropping
+
+   Two routines operate on a stick as a 2D VECTOR, before the split into
+   semiaxes. Both are in XBCD_control.c and both exist twice, once with
+   x87 floating point for the 32-bit build and once in integer arithmetic
+   for x64.
+
+   applyDeadzone2D. Computes the vector length; if it is below the
+   deadzone, both axes go to zero. Otherwise the remaining travel is
+   rescaled so that just outside the deadzone maps to zero and full
+   deflection still maps to full scale:
+
+       VectorLength -= DZ
+       VectorLength /= 35000 - DZ
+       axis         *= VectorLength
+
+   DZ is clamped to 33250, which is 0.95 of MAX_VALUE, to avoid dividing
+   by something near zero. The comment is candid that this rescaling
+   costs accuracy and that deadzone should be left at zero unless
+   actually needed. With bFullAxes set, both axes are additionally
+   multiplied by 1.4142136 before the rescale, which is what "full range"
+   means: it lets the circular stick reach the corners of the square
+   logical range, at the cost of a large flat region of maximum output.
+
+   NOTE THE x64 VERSION OF bFullAxes IS NOT IMPLEMENTED. The multiply is
+   commented out and src_readme.txt says so outright. On x64, full range
+   only has the side effect of forcing applyDeadzone2D to run.
+
+   cropVector. Runs only when full range is OFF. It allows the vector
+   length to exceed MAX_VALUE by a 2500 unit margin and squeezes anything
+   past that back in:
+
+       mpc = MAX_VALUE + 2500
+       if length > mpc:
+           axis = axis / (mpc / (mpc - (length - mpc)))
+
+   The effect is to turn the noisy, slightly-out-of-round envelope a real
+   stick produces into a clean circle. The changelog calls it "a routine
+   to crop wacky analog stick values so you can have a perfect circle",
+   which is the honest description; the expression is a reflection about
+   mpc, not a clamp, and it is applied to each axis separately after a
+   shared length test so the direction is preserved.
+
+   THE x64 INTEGER PATHS OVERFLOW AND THIS IS A REAL BUG. Both routines
+   compute lAxis1 * lAxis1 + lAxis2 * lAxis2 in LONG. With each axis up
+   to 35000 the sum reaches about 2.45e9, which does not fit a signed
+   32-bit integer; it wraps negative and mcrowne_isqrt, which takes an
+   unsigned long, then reads it as roughly 1.84e9 and returns a length
+   near 42900 instead of the true 49497. The threshold tests that follow
+   are therefore wrong near full diagonal deflection. The replacement
+   must compute that sum in 64 bits.
+
+   THE FLOATING POINT COMMENT IS OUT OF DATE, and it shaped the whole x64
+   half of this file. "Can't use floating point math in the 64-bit
+   kernel" reflected the guidance of the time; current WDK documentation
+   permits SSE2 floating point in x64 kernel-mode drivers and
+   KeSaveFloatingPointState is a no-op there. VERIFY THAT AGAINST THE
+   CURRENT WDK BEFORE RELYING ON IT. The replacement should stay in
+   integer arithmetic regardless - not because floating point is
+   forbidden, but because a fixed-point pipeline with a precomputed curve
+   table is faster, bit-exact across builds, and testable in a user-mode
+   harness.
+
+8.  Configuration
+
+8.1.  The Registry Values
+
+   XBCDReadConfig, XBCD_driver.c:812, opens the device's own hardware key
+   with
+
+       IoOpenDeviceRegistryKey(pdo, PLUGPLAY_REGKEY_DEVICE,
+                               KEY_ALL_ACCESS, &hKey)
+
+   and reads named values through ReadRegistry, a helper that does the
+   usual two-pass ZwQueryValueKey and returns the raw payload length.
+   EVERY VALUE IS VALIDATED AND EVERY FAILURE FALLS BACK TO A DEFAULT,
+   which is why a fresh install with no values works.
+
+   +--------------+-------+--------------------------------------------------+
+   | Value        | Bytes | Meaning                                          |
+   +==============+=======+==================================================+
+   | DevType      |     4 | 0x04 joystick or 0x05 gamepad HID usage          |
+   | NrOfLayouts  |     4 | 1..8                                             |
+   | MapMatrix0-7 |    24 | one layout each, one destination code per source |
+   | ALFactor     |     4 | left rumble scale 0..255                         |
+   | ARFactor     |     4 | right rumble scale                               |
+   | AxesOn       |     4 | bitmask of which of the 5 optional axes exist    |
+   | BThreshold   |     4 | 0..255, scaled to MAX_VALUE units                |
+   | TThreshold   |     4 | 0..255                                           |
+   | AThreshold   |     4 | 0..255                                           |
+   | LStickDZ     |     4 | 0..100 per cent                                  |
+   | RStickDZ     |     4 | 0..100 per cent                                  |
+   | AxesScale    |     7 | one byte per output axis, per cent               |
+   | LFullRange   |     4 | boolean                                          |
+   | RFullRange   |     4 | boolean                                          |
+   | NButtons     |     4 | 1..24, how many to advertise                     |
+   | LedSetting   |     4 | 0x01..0x0D, 360 LED pattern                      |
+   +--------------+-------+--------------------------------------------------+
+
+   Note the inconsistency in how a length is used: a four byte value is
+   read as a DWORD but only TempRegData[0] is consulted, while MapMatrix
+   and AxesScale are read as byte arrays of their exact length and the
+   length is the validity check. The replacement should carry one config
+   BLOB with a version and a length rather than nineteen values, but the
+   pattern of "exact expected length or use the default" is sound and
+   should survive.
+
+   THIS KEY IS NOT SUBJECT TO WOW64 REDIRECTION, which matters and is the
+   reason to prefer it over the Adaptoid's approach.
+   PLUGPLAY_REGKEY_DEVICE resolves to the device's Device Parameters
+   subkey under Enum, not under Software, so a 32-bit configurator and a
+   64-bit driver see the same values. The Adaptoid reads its settings
+   from Software\Wish Technologies\Adaptoid and the sibling project
+   records that a 32-bit configurator writing there lands in Wow6432Node
+   and the driver never sees it. XBCD's choice avoids that trap entirely.
+
+8.2.  The Reload Handshake
+
+   Configuration is not re-read on a timer or watched for change. The
+   setup utility writes the registry and then tells the driver to reload
+   by sending a HID FEATURE report:
+
+       report ID 3, FEATURE_CODE_SET_CONFIG
+       payload    ULONG Signature == 0x58425355, "XBSU"
+
+   On a signature match XBCDDispatchIntDevice calls XBCDReadConfig. A
+   mismatch is STATUS_NOT_SUPPORTED. Two more feature reports read back:
+
+       report ID 4, FEATURE_CODE_GET_VERSION   signature, major/minor/rel
+       report ID 5, FEATURE_CODE_GET_IS360     signature, is360 flag
+
+   USING A HID FEATURE REPORT AS THE CONFIGURATION CHANNEL IS THE SINGLE
+   BEST IDEA IN THIS DRIVER. HidD_SetFeature from user mode reaches it
+   with no private device object, no symbolic link, no IOCTL codes and no
+   dispatch-table games. The Adaptoid needed a whole private control
+   device and eighteen vendor IOCTLs to do less.
+
+   THE GET_FEATURE SWITCH HAS NO BREAKS AND THAT IS A BUG. In
+   XBCD_control.c the FEATURE_CODE_GET_IS360 case falls through into
+   FEATURE_CODE_GET_VERSION and then into default. A GET on report 5 with
+   a correctly sized buffer writes the is360 byte and sets Information,
+   then re-enters the version case, fails ITS size check with
+   STATUS_INVALID_PARAMETER, and returns that. So the data is written and
+   the call reports failure. Do not reproduce it.
+
+9.  The Report Descriptor
+
+9.1.  It Is Assembled, Not Static
+
+   GetRepDesc in XBCD_report.c builds the descriptor by concatenating
+   fragments, and three of them depend on configuration:
+
+       RDU     usage page and Usage(DevUsage), gamepad or joystick
+       RD1     application and logical collections, report ID 1, the
+               Button usage page and the 0..1 logical range
+       RDB     Usage Minimum 1, Usage Maximum nButtons, report size 1,
+               report count nButtons
+       RDBCB   present only when nButtons < 24: a Counted Buffer field
+               of (24 - nButtons) bits to pad the byte count back up
+       RD2     report size 16, logical -32767..32767, seven 16-bit
+               fields, Usage(X) and Usage(Y)
+       RDA[5]  Usage(Z), (Rx), (Ry), (Rz), (Slider) - each emitted only
+               if its bit in AxesOn is set
+       RDACB   substituted for any axis that is off: Usage(Counted
+               Buffer), so the FIELD still exists and the report layout
+               does not move
+       RD3     the hat switch, four pad bits, the 21-byte diagnostic
+               field, then the output and feature collections
+
+   Called with a NULL buffer it returns the size only, which is how the
+   HID_DESCRIPTOR's wReportLength is answered.
+
+   THE SUBSTITUTION TRICK IS THE INTERESTING PART. Turning an axis off
+   does not remove the field, it renames the usage to Counted Buffer. The
+   report stays 40 bytes and every other field keeps its offset, so
+   XBCDReadData needs no knowledge of which axes are enabled. Any
+   replacement that makes collections optional should use the same
+   discipline: change what a field MEANS, never where it is.
+
+   The 360-specific descriptor RDX360, taken from the free60 project, is
+   present in the source but compiled out behind #if 0.
+
+9.2.  The Output Report Layout
+
+   OUT_BUFFER_LEN is 40 bytes, and only the first 20 describe controls.
+
+       [0]     report ID, always 1
+       [1]     buttons 1..8
+       [2]     buttons 9..16
+       [3]     buttons 17..24
+       [4-5]   X          [6-7]   Y
+       [8-9]   Z          [10-11] RX
+       [12-13] RY         [14-15] RZ
+       [16-17] Slider
+       [18]    POV in the low nibble, 4 pad bits
+       [19]    the active layout number, plus one
+       [20-39] THE RAW 20 BYTE PACKET, copied verbatim
+
+   Bytes 19 to 39 are the 21-byte Counted Buffer field declared in RD3
+   with REPORT_SIZE 168. They exist so the setup utility can display the
+   physical pad state while the user configures a mapping. It is a
+   diagnostic tap carried inside the input report, and it is a neat
+   trick: one HID read gets you both the mapped output and the raw truth,
+   with no second channel.
+
+   A byte-level diagram of all 40 bytes is in the header comment of
+   XBCD_report.c and is accurate.
+
+10. How This Compares To The Adaptoid
+
+   The question that decides how much of the sibling project transfers.
+   The answer is that the ARCHITECTURE is the same and the DATA is not.
+
+   +----------------------+----------------------------+-------------------------------+
+   | Property             | Adaptoid (N64)             | Xbox pad                      |
+   +======================+============================+===============================+
+   | Driver position      | HID minidriver, owns the   | identical                     |
+   |                      | device, USB function       |                               |
+   |                      | driver                     |                               |
+   | What arrives         | raw vendor bytes off an    | identical in kind             |
+   |                      | interrupt IN endpoint      |                               |
+   | Is it HID?           | no                         | no                            |
+   | Packet size          | 5 bytes                    | 20 bytes                      |
+   | Reads in flight      | 2, double buffered         | 1                             |
+   | Polling condition    | always, while started      | 5s after the last HID read    |
+   | DevicesArePolled     | FALSE, driver pushes       | TRUE, hidclass pulls          |
+   | Stick resolution     | 8-bit signed, ~+/-80 real  | 16-bit signed, two sticks     |
+   | Buttons              | 14, all single bits        | 12 plus 8 ANALOG 0..255       |
+   |                      |                            | (A B X Y Black White, and     |
+   |                      |                            | both triggers)                |
+   | Y convention         | up-positive, negated in    | up-positive, NOT negated;     |
+   |                      | the report builder         | handled by the map instead    |
+   | Status/handshake     | status byte gates the      | byte 0 selects input vs LED   |
+   |                      | packet, accessory state     | status (360 only)            |
+   | Output to device     | vendor commands, effect    | 6 or 8 byte rumble packet,    |
+   |                      | slot engine, Pak I/O       | 3 byte LED command            |
+   | Descriptor served    | composite: mouse +         | single gamepad collection     |
+   |                      | keyboard + joystick        |                               |
+   | Config channel       | private control device,    | registry + one HID FEATURE    |
+   |                      | 18 vendor IOCTLs, dispatch | report as the reload trigger  |
+   |                      | table overwrite            |                               |
+   | Config model         | compiled bytecode, a       | one byte per source per       |
+   |                      | concurrent VM in kernel    | layout, 192 bytes total       |
+   | Layouts/profiles     | one script at a time       | 8, cycled from the pad        |
+   +----------------------+----------------------------+-------------------------------+
+
+   Read that table as good news. The three rows that differ in kind - the
+   descriptor served, the config channel and the config model - are
+   exactly the three things this project intends to change anyway. Every
+   row that describes how bytes get from the hardware into the driver is
+   the same problem with different constants.
+
+   The Xbox pad is also the RICHER source. Two 16-bit sticks against one
+   8-bit stick, and eight pressure-sensitive buttons against none, means
+   every mapping the Adaptoid could express has a home here and several
+   it could not: pressure as a mouse speed, pressure as an autofire rate,
+   a trigger as a graduated axis and a button at the same time.
+
+11. What Is Wrong With It For Our Purposes
+
+   Not defects in XBCD - it does its job - but the specific places where
+   its design blocks what we want. These are the work items.
+
+   +---+----------------------------+----------------------------------------+
+   | # | Property                   | Why it blocks us                       |
+   +===+============================+========================================+
+   | 1 | DevicesArePolled = TRUE    | the driver can only ANSWER reads. A    |
+   |   |                            | keyboard report must be PUSHED when a  |
+   |   |                            | button changes, not when somebody asks |
+   +---+----------------------------+----------------------------------------+
+   | 2 | polling dies 5s after the  | with only a keyboard mapped, nothing   |
+   |   | last HID read              | reads the gamepad collection and the   |
+   |   |                            | pad stops being polled                 |
+   +---+----------------------------+----------------------------------------+
+   | 3 | one report descriptor, one | there is nowhere for a key or a mouse  |
+   |   | gamepad collection         | delta to go                            |
+   +---+----------------------------+----------------------------------------+
+   | 4 | mapping runs in the READ   | mapping must run once per USB packet,  |
+   |   | path, once per HID read    | on a known time base, or velocity      |
+   |   |                            | integration and autofire have no clock |
+   +---+----------------------------+----------------------------------------+
+   | 5 | one destination byte per   | no room for a key code, a repeat rate, |
+   |   | source                     | a per-binding threshold or hysteresis  |
+   +---+----------------------------+----------------------------------------+
+   | 6 | thresholds are global per  | two triggers cannot have two different |
+   |   | source KIND                | trigger points                         |
+   +---+----------------------------+----------------------------------------+
+   | 7 | no timer in the input path | autofire and mouse velocity both need  |
+   |   |                            | a periodic tick                        |
+   +---+----------------------------+----------------------------------------+
+   | 8 | x64 vector length          | wrong deadzone and crop behaviour near |
+   |   | overflows 32 bits          | full diagonal                          |
+   +---+----------------------------+----------------------------------------+
+   | 9 | read completion validates  | a short or failed transfer is decoded  |
+   |   | only IoStatus.Status       | as if it were data                     |
+   +---+----------------------------+----------------------------------------+
+   |10 | GET_FEATURE cases fall     | reports success as failure             |
+   |   | through                    |                                        |
+   +---+----------------------------+----------------------------------------+
+   |11 | local hidclass declarations| layout risk against a modern hidclass; |
+   |   | in XBCD_hid.h              | hidport.h declares all of it now       |
+   +---+----------------------------+----------------------------------------+
+
+   Items 1, 2 and 4 are one change, not three: move the engine out of the
+   read path and into the USB completion path, poll continuously, and
+   push reports into a queue that pending reads drain. That is precisely
+   the arrangement wishk201.sys uses and the sibling project's
+   replacement already implements.
+
+12. What Is Worth Keeping
+
+   -  THE SEMIAXIS ABSTRACTION. 25 unipolar magnitudes in a fixed
+      0..35000 range, with every pad difference absorbed below it. This
+      is the right input model and the new binding table should address
+      it.
+
+   -  MAX_VALUE = 35000 AND THE WHOLE INTEGER FIXED-POINT DISCIPLINE.
+      Headroom above the output range so a real full deflection reaches
+      real full scale, no floating point anywhere, percentages and 0..255
+      slider values converted on the way in.
+
+   -  THE FEATURE-REPORT RELOAD HANDSHAKE, signature and all. Extend the
+      payload; keep the mechanism.
+
+   -  IoOpenDeviceRegistryKey(PLUGPLAY_REGKEY_DEVICE) as the config
+      store. Per-device by construction, and immune to WOW64
+      redirection.
+
+   -  MULTIPLE LAYOUTS SWITCHED FROM THE PAD ITSELF, with the edge latch
+      in LayoutSwitch so holding the combination advances once, and the
+      360 LED ring showing which one is live.
+
+   -  THE COUNTED-BUFFER SUBSTITUTION in GetRepDesc. Optional fields
+      change meaning, never position.
+
+   -  THE RAW PACKET CARRIED IN THE INPUT REPORT at bytes 20..39. A
+      configurator gets the mapped output and the physical truth from one
+      read.
+
+   -  THE POV LOOKUP TABLE over four direction bits, including that
+      impossible combinations resolve in the table rather than in code.
+
+   -  applyDeadzone2D AND cropVector AS RADIAL, 2D operations on the
+      stick pair rather than per-axis. Fix the 32-bit overflow; keep the
+      shape.
+
+   -  THE PER-KIND DEFAULT THRESHOLDS as the defaults for the new
+      per-binding ones: 10/255 for analog buttons and triggers, 100/255
+      for stick semiaxes. Those are tuned numbers and there is no reason
+      to rediscover them.

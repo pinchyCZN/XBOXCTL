@@ -1,0 +1,769 @@
+XBOXCTL                                                        Design Note
+stick to mouse                                               curve and rate
+
+
+               MAPPING AN ANALOG STICK TO MOUSE MOVEMENT
+
+
+Abstract
+
+   The hard part of replacing the Adaptoid's scripting with a table of
+   parameters is the stick. Everything else the shipped scripts do is a
+   button mapping with an if statement; the stick handlers are the only
+   place real computation happens, and they are why the product needed a
+   language at all.
+
+   This note takes those handlers apart, establishes what they actually
+   compute, and specifies a parameter set that reproduces all of them and
+   covers the cases they do not reach.
+
+   The finding is that the stick handler decomposes into two independent
+   stages that were never separated in the original. One of them - the
+   shaping curve - is where all the configurability is, and two numbers
+   express it exactly. The other - turning a velocity into a stream of
+   integer mouse deltas - has ONE correct implementation, needs no
+   configuration at all, and the Adaptoid's version of it is the weakest
+   part of the design.
+
+   Script quotations are from the installed script library at
+   C:\Program Files (x86)\Adaptoid\scripts. Claims about Adaptoid
+   internals cite ../../ADAPTOID/docs.
+
+Table of Contents
+
+   1.  What The Scripts Actually Do
+   1.1.  The Handler And Its Arguments
+   1.2.  The Emitter
+   1.3.  The Census
+   2.  The Two Stages
+   3.  Stage B: Velocity To Deltas
+   3.1.  What The Adaptoid's Quantiser Costs
+   3.2.  The Residual Accumulator
+   3.3.  Choosing The Tick Rate
+   3.4.  Timebase And Hitches
+   4.  Stage A: Deflection To Velocity
+   4.1.  Is A Bezier Enough? Yes, And Two Numbers Is Enough
+   4.2.  What The Two Numbers Buy
+   4.3.  Ship A Table, Not Control Points
+   5.  What No Curve Can Express
+   5.1.  Acceleration Over Time
+   5.2.  Smoothing
+   6.  Radial, Not Per-Axis
+   6.1.  The Defect In The Shipped Profiles
+   6.2.  The Rule
+   7.  The Parameter Set
+   8.  The Fixed-Point Pipeline
+   9.  Reproducing The Shipped Profiles
+   10. Absolute Mouse Mode
+   11. Descriptor Consequences
+   12. Things That Will Bite During Tuning
+
+1.  What The Scripts Actually Do
+
+1.1.  The Handler And Its Arguments
+
+   A script binds one function to the stick:
+
+       int on_stick(p) = stick_mouselook;
+
+   and the driver calls it with the RAW axes. They are 8-bit signed, and
+   a physical stick reaches roughly +/-80 of the +/-127 the encoding
+   allows. The Adaptoid SDK's default "clipping range" of 75 says the
+   same thing from the other side: raw 75 is treated as full deflection.
+
+   The proof that the arguments are raw and not pre-scaled is in the
+   absolute-mouse scripts, which do the scaling themselves:
+
+       stick_Joystick_And_Mouse(x,y)
+       {
+           x *= 16;
+           y *= -16;
+           ...
+           _stick( x,y);
+
+   16 is the factor drv_BuildJoystickReport applies natively, and +/-80
+   times 16 is +/-1280, which is the +/-1200 range the joystick
+   collection declares. See ADAPTOID/docs/ioctl-surface.txt section 7.1.
+
+   The FPS script is the canonical one:
+
+       stick_mouselook(x,y)
+       {
+           if (x < -1) x += 1;    // left deadzone of 1
+           if (x >  1) x -= 1;    // right deadzone of 1
+           if (y < -1) y += 1;    // up deadzone of 1
+           if (y >  1) y -= 1;    // down deadzone of 1
+
+           spin_x(x < 0 ? -x*x/2 : x*x/2);   // exponential left/right
+           spin_y(-y*16);                    // linear up/down
+
+           _stick(x,y);
+       }
+
+   Three things happen. A deadzone of one raw unit, applied per axis by
+   SHRINKING rather than by zeroing, so there is no step at the edge of
+   it. A shaping expression per axis. And a call to spin_x or spin_y with
+   the result.
+
+   NOTE THAT _stick(x,y) IS PASSED THE RAW VALUES, not the scaled ones,
+   so the joystick collection this script also feeds only ever reaches
+   about 80 of 1200 - under 7 per cent of full deflection. The comment
+   says "enable joystick output as well"; what it enables is a stick that
+   twitches. INFERENCE: it exists so the collection is not perfectly
+   still, and a title that watches for a live gamepad still sees one. It
+   is not a usable joystick output and should not be copied as one.
+
+1.2.  The Emitter
+
+   spin_x and spin_y are BYTE-FOR-BYTE IDENTICAL IN EVERY SCRIPT THAT
+   HAS THEM. Seven of the shipped scripts carry them; the text differs
+   only in whether the r == 0 case sets new_delay to 100000 or to 0. They
+   are boilerplate, pasted from one script to the next, and nobody ever
+   edited them. That alone says they are not a configuration surface.
+
+   The body, with the thread machinery removed:
+
+       new_amt   = r/200 + 1              (r/200 - 1 when r is negative)
+       new_delay = 1000*new_amt / r
+
+       forever:
+           _sleep(new_delay);
+           _mouse_relative(new_amt, 0);
+
+   All arithmetic is integer. Read that as a velocity identity:
+
+       realised velocity = new_amt / (new_delay/1000)
+                         = 1000 * new_amt / new_delay
+
+   and with exact arithmetic new_delay = 1000*new_amt/r makes that
+   exactly r. SO r IS A VELOCITY IN PIXELS PER SECOND, and the whole of
+   spin_x is a quantiser that turns a pixels-per-second figure into an
+   integer step and an integer millisecond delay.
+
+   The +1 is what bounds the event rate. It makes new_amt at least
+   r/200, so new_delay is at most 1000/200 = 5 ms, so the thread never
+   wakes more than 200 times a second however fast the stick is pushed.
+
+   The rest of spin_x - the static locals, the _fork, the _wake, the
+   tid_running bookkeeping - exists only to keep one timer thread alive
+   per axis and retarget it when the rate changes. It is scaffolding
+   around a sleep loop. This is the entire reason the driver needs a
+   concurrent scheduler with fork, sleep, wake and kill in kernel mode
+   (ADAPTOID/docs/script-bytecode.txt section 9.9).
+
+1.3.  The Census
+
+   Every stick-to-mouse expression in the shipped library, with the
+   velocity at full deflection computed at raw 75:
+
+   +-----------------------------+---------------+-------+---------------+-------+
+   | Script                      | X expression  | X max | Y expression  | Y max |
+   +=============================+===============+=======+===============+=======+
+   | Relative Mouse Fast         | x*x           |  5625 | -y*16         |  1200 |
+   | Relative Mouse Flipped Fast | x*x           |  5625 | y*16          |  1200 |
+   | Relative Mouse for FPS      | x*x/2         |  2812 | -y*16         |  1200 |
+   | Relative Mouse Flipped      | x*x/2         |  2812 | y*16          |  1200 |
+   | Relative Mouse Slow         | x*x/4         |  1406 | -y*16         |  1200 |
+   | PORTAL                      | x*x/4         |  1406 | -y*16         |  1200 |
+   | MAX PAYNE 2                 | x*10          |   750 | -y*12         |   900 |
+   | TRON 2.0                    | x*12          |   900 | -y*8          |   600 |
+   | serious sam                 | x*12          |   900 | -y*8          |   600 |
+   | test                        | x*2           |   150 | -y*2          |   150 |
+   +-----------------------------+---------------+-------+---------------+-------+
+
+   TEN PROFILES, TWO SHAPES. Every one is either v = k*u or v = k*u^2,
+   where u is normalised deflection. Nothing else was ever needed, or at
+   any rate nothing else was ever written. Note also that MAX PAYNE 2
+   keeps the ternary from the quadratic form and puts the same linear
+   expression in both branches, with the original commented out beside
+   it - somebody edited a quadratic profile into a linear one and left
+   the evidence.
+
+   Every Y axis is linear. Only X was ever given a curve.
+
+   So the question "can three numbers cover the curves people actually
+   use" has a stronger answer than expected: TWO SHAPES AND A GAIN cover
+   the entire shipped library, and the parameter set below is a strict
+   superset of it.
+
+2.  The Two Stages
+
+   The handler and the emitter are independent and should be separated,
+   which the original never does:
+
+       stage A    deflection  ->  velocity        CONFIGURABLE
+                  u in [0,1]      px/s           this is the whole
+                                                 tuning surface
+
+       stage B    velocity    ->  integer deltas  NOT CONFIGURABLE
+                  px/s            on the wire    one correct answer
+
+   Everything a user wants to change lives in stage A. Stage B has no
+   parameters worth exposing and one implementation that is better than
+   the Adaptoid's on every axis. Taking B away from the script author is
+   most of why the scripting language can go.
+
+3.  Stage B: Velocity To Deltas
+
+3.1.  What The Adaptoid's Quantiser Costs
+
+   Work the integer arithmetic through and the realised velocity is not
+   r; it is 1000*amt/floor(1000*amt/r), and only certain values are
+   reachable.
+
+   ABOVE ABOUT 1000 px/s THE DELAY PINS AT 5 ms and the realised speed
+   becomes 200 * (floor(r/200) + 1) - that is, r ROUNDED UP TO THE NEXT
+   MULTIPLE OF 200. A 200 px/s staircase:
+
+   +--------+--------+----------+---------+
+   | r      | amt    | delay ms | realised|
+   +========+========+==========+=========+
+   |   1406 |      8 |        5 |    1600 |
+   |   2812 |     15 |        5 |    3000 |
+   |   5625 |     29 |        5 |    5800 |
+   +--------+--------+----------+---------+
+
+   BELOW 200 px/s AMT IS ALWAYS 1 and the delay carries the whole
+   velocity, so only the values 1000/d for integer d are reachable.
+   Between 100 and 200 px/s that is six speeds in total:
+
+       100, 111, 125, 143, 167, 200
+
+   and nothing in between. A request for 150 px/s is served as 167, an
+   11 per cent error, at exactly the deflection where a player is
+   trying to settle a crosshair.
+
+   And the event rate is capped at 200 Hz, so at 5625 px/s the mouse
+   moves in 29-pixel jumps.
+
+   None of this is a criticism of the author. In a scripting language
+   whose only timing primitive is an integer-millisecond sleep, this is
+   about the best available. It is a criticism of doing it in the script
+   at all.
+
+3.2.  The Residual Accumulator
+
+   The driver already has something the script did not: a periodic event
+   with a known interval, namely the arrival of a controller packet. Use
+   it, and the problem disappears.
+
+       accum += velocity * dt          /* dt in seconds, fixed point */
+       step   = trunc(accum)           /* toward zero */
+       accum -= step
+       emit(step)
+
+   Carry the fractional remainder from one tick to the next and never
+   throw it away. Properties, all of them better than section 3.1:
+
+   +--------------------------+-----------------------+---------------------+
+   | Property                 | Adaptoid quantiser    | Accumulator         |
+   +==========================+=======================+=====================+
+   | Long-term velocity error | up to 20 per cent     | exactly zero        |
+   | Reachable velocities     | a sparse set          | every value         |
+   | Monotone in v            | as a coarse staircase | strictly            |
+   | Event rate               | capped at 200 Hz      | the packet rate     |
+   | Step size at 5600 px/s   | 29 px                 | v/tick              |
+   | Timers needed            | one thread per axis   | none                |
+   | Code                     | fork/sleep/wake/kill  | three lines         |
+   +--------------------------+-----------------------+---------------------+
+
+   This is the standard sub-pixel residual technique and there is no
+   reason to do anything else. It removes the single largest justification
+   for a scripting engine inside the driver: the reason the Adaptoid
+   needed _fork, _sleep and _wake was to run this loop, and the loop is
+   not needed.
+
+   ONE RULE: RESET THE ACCUMULATORS WHEN THE STICK CENTRES. Otherwise a
+   fraction of a pixel left over from the last motion is emitted the
+   moment the stick moves again, in the OLD direction. It is one pixel
+   and it is the kind of thing that gets reported as "the crosshair
+   drifts".
+
+3.3.  Choosing The Tick Rate
+
+   The step granularity is velocity divided by tick rate. What matters is
+   not the step itself but how evenly the steps distribute across a
+   rendered frame, because a game integrates deltas per frame:
+
+   +-----------+--------------+---------------------+-------------------------+
+   | Tick rate | Steps/frame  | Per-frame delta at  | Feel                    |
+   |           | at 60 fps    | 3000 px/s           |                         |
+   +===========+==============+=====================+=========================+
+   |    60 Hz  | 1            | 50 px, even         | fine if phase-locked,   |
+   |           |              |                     | it never is             |
+   |   100 Hz  | 1.67         | alternates 33/67 px | visible stutter         |
+   |   250 Hz  | 4.17         | 50 px +/- 1         | smooth                  |
+   |   500 Hz  | 8.33         | 50 px +/- 1         | smooth                  |
+   +-----------+--------------+---------------------+-------------------------+
+
+   250 Hz IS THE TARGET and it is probably free. The commented-out pipe
+   setup in XBCDStartDevice assumes Interval 4, which is 4 ms on a full
+   speed endpoint - 250 Hz - so the pad's own packet rate may be exactly
+   what is wanted with no timer at all. That is an assumption, not a
+   measurement: read Pipes[0].Interval at StartDevice and record it.
+
+   IF THE MEASURED PACKET RATE IS BELOW THE CONFIGURED EMISSION RATE,
+   interpolate. Run a periodic DPC at the emission rate that advances the
+   accumulator from the LAST KNOWN velocity, and let a packet arrival
+   update that velocity and advance the accumulator by the time since the
+   previous advance. A stick held still is the common case and
+   interpolating it is exactly right; a stick in motion is served one
+   packet late, which is already true.
+
+   THAT SAME TICK IS THE AUTOFIRE CLOCK. One periodic DPC serves both,
+   which is a reason to have it even when the packet rate is adequate.
+   See mapping-engine.txt section 6.
+
+3.4.  Timebase And Hitches
+
+   Advance the accumulator by MEASURED elapsed time, from
+   KeQueryInterruptTime, not by the nominal tick period. A dropped or
+   late packet then costs nothing, because the next one carries the
+   missing interval.
+
+   CLAMP THE ELAPSED TIME. A resume from sleep, a long DPC starvation or
+   a debugger break can hand you an interval of seconds, and multiplying
+   it by 5000 px/s flings the cursor across the desktop. Clamp to
+   something like 50 ms and treat anything longer as a discontinuity:
+   clamp the step and reset the residual.
+
+4.  Stage A: Deflection To Velocity
+
+4.1.  Is A Bezier Enough? Yes, And Two Numbers Is Enough
+
+   The answer to the question as posed is yes. It is better than that.
+
+   A curve here is a function g on [0,1] with g(0) = 0 and g(1) = 1; the
+   gain is separate. Take a cubic Bezier in the unit square with the
+   endpoints pinned at (0,0) and (1,1). That is the familiar
+   cubic-bezier(x1,y1,x2,y2) of CSS, four numbers. But for this job the
+   x control points should be PINNED TO THE IDENTITY:
+
+       x1 = 1/3,  x2 = 2/3
+
+   because those are exactly the Bernstein control values for x(t) = t.
+   Pinning them has two consequences, both good:
+
+   -  the curve is a plain polynomial in u, so there is no parametric
+      inversion to do and no root to solve for at evaluation time;
+   -  it cannot fold back on itself, so monotonicity is a simple
+      condition rather than something to validate numerically.
+
+   What is left is TWO NUMBERS, y1 and y2, each in [0,1], and the curve
+   is the closed form
+
+       g(u) = 3*y1*(1-u)^2*u  +  3*y2*(1-u)*u^2  +  u^3
+
+   Check it against the shapes that matter:
+
+   +---------------+------------+------------------------------------------+
+   | (y1, y2)      | g(u)       | Shape                                    |
+   +===============+============+==========================================+
+   | (1/3, 2/3)    | u          | linear - EXACT                           |
+   | (0,   1/3)    | u^2        | quadratic - EXACT                        |
+   | (0,   0)      | u^3        | cubic - EXACT                            |
+   | (0,   1)      | 3u^2-2u^3  | smoothstep, the classic S curve          |
+   | (2/3, 1)      |            | fast off centre, plateaus at the edge    |
+   | (1,   1)      |            | most aggressive early response           |
+   +---------------+------------+------------------------------------------+
+
+   THE FIRST TWO ROWS ARE THE ENTIRE ADAPTOID SCRIPT LIBRARY, reproduced
+   exactly, not approximated. Section 1.3 found ten profiles and two
+   shapes; those two shapes are two points in this two-parameter family.
+
+   The slopes fall out in closed form and are worth knowing:
+
+       g'(0) = 3*y1          gain at centre, relative to linear
+       g'(1) = 3*(1 - y2)    gain at full deflection
+
+   So y1 near 0 is a precision curve - almost no response until the stick
+   is pushed - and y2 near 0 is a curve that is still accelerating hard
+   at the edge of travel. The family spans a 3:1 gain ratio at either
+   end against linear, which covers the whole gamma 1 to gamma 3 range
+   that console sensitivity sliders use, and covers it exactly at 1, 2
+   and 3.
+
+   The two numbers are also DIRECTLY EDITABLE IN A UI as what they are:
+   two handles on a curve, dragged vertically. Nothing about the
+   underlying polynomial needs explaining to the user.
+
+4.2.  What The Two Numbers Buy
+
+   Beyond the two shapes the original had:
+
+   -  S-CURVE. Flat near centre for precision, steep in the middle for
+      traverse, flattening again at the edge so full deflection is not a
+      cliff. This is the shape most modern shooters converged on and the
+      Adaptoid library contains none.
+
+   -  INVERSE S. Quick off centre then plateau. Useful for menu-driven
+      and strategy titles where you want the pointer to start moving at
+      once but never to run away.
+
+   -  A CONTINUUM BETWEEN THEM, which means a sensitivity page can offer
+      a single "curve" slider that walks (y1,y2) along a path from
+      precision through linear to aggressive, and a two-handle editor
+      underneath for anyone who wants it.
+
+   Keep the FOUR-number form in reserve. If a curve ever needs a near-
+   vertical segment the pinned form cannot produce, unpinning x1 and x2
+   gives it - at the cost of a root solve per evaluation, which is
+   exactly why the next section says not to evaluate it at run time at
+   all.
+
+4.3.  Ship A Table, Not Control Points
+
+   THE DRIVER SHOULD NOT KNOW WHAT A BEZIER IS.
+
+   Send it a 33-entry lookup table: g sampled at u = 0, 1/32, ... 1, each
+   entry a u16 in 0..65535. Evaluate with a table index and a linear
+   interpolation between neighbours. 66 bytes.
+
+   Why this is the right seam:
+
+   -  ACCURACY IS A NON-ISSUE. The worst case is the steepest curve,
+      u^3, where the chord error between samples is bounded by
+      |g''| * h^2 / 8 = 6 * (1/32)^2 / 8, under 0.08 per cent of full
+      scale. At a top speed of 5000 px/s that is under 4 px/s.
+
+   -  NO CURVE MATH IN KERNEL MODE. No cubic evaluation, no root
+      solving, no floating point, no question about whether SSE is
+      allowed at DISPATCH_LEVEL. Two loads, a subtract, a multiply and a
+      shift.
+
+   -  THE CURVE MODEL CAN CHANGE WITHOUT TOUCHING THE DRIVER. A gamma
+      slider, a two-handle Bezier, a four-handle Bezier, a freehand
+      spline, or a table pasted from somebody else's configuration all
+      produce the same 66 bytes. The driver contract is fixed on the
+      first release and never needs a version bump for a new curve
+      editor.
+
+   -  IT IS VALIDATABLE. The driver checks one property - non-decreasing
+      - and can reject or repair a table that is not, which is cheaper
+      and more reliable than validating four control points.
+
+   The configurator stores the control points in its own profile format
+   so a curve remains editable; the driver stores only the table.
+
+5.  What No Curve Can Express
+
+5.1.  Acceleration Over Time
+
+   THIS IS THE REAL GAP AND IT IS WORTH MORE THAN THE CURVE.
+
+   Every mapping discussed so far is a function of deflection alone:
+   stick here, mouse moves at this speed, always. The behaviour most
+   requested for stick-driven aiming is not that. It is: hold the stick
+   at the edge and the turn speed KEEPS BUILDING, so a small correction
+   is slow and precise while a 180-degree turn takes a beat and then
+   whips round. Console shooters ship it as "turn acceleration", "aim
+   ramp" or "boost". No position-to-velocity curve of any shape can
+   produce it, because it is a function of TIME HELD, not of position.
+
+   Four numbers add it:
+
+       accel_threshold   deflection above which boost accrues, 0..1
+       accel_rate        boost gained per second held, as a multiplier
+       accel_max         ceiling on the multiplier
+       accel_decay       how fast it bleeds off below the threshold
+
+   and the rule is multiplicative so it composes with the curve instead
+   of fighting it:
+
+       if u >= accel_threshold:  boost += accel_rate * dt
+       else:                     boost -= accel_decay * dt
+       clamp boost to [0, accel_max]
+       speed = max_speed * g(u) * (1 + boost)
+
+   Defaults of accel_rate 0 leave it off, and a profile that never sets
+   it behaves exactly as sections 3 and 4 describe.
+
+   BLEED IT OFF FAST. A decay slower than about half a second makes the
+   next small correction inherit the last turn's boost, which feels
+   broken in a way that is hard to diagnose. Decaying to zero the moment
+   the stick drops below the threshold is a defensible default.
+
+5.2.  Smoothing
+
+   A stick at rest is not still. The Xbox pad reports 16 bits and the
+   bottom few of them move. At a top speed of 5000 px/s and a small
+   deadzone, that noise is visible as a crawling cursor.
+
+   The usual answer is a bigger deadzone, which costs precision
+   everywhere to fix a problem that only exists near centre. A one-pole
+   filter on the deflection costs nothing and fixes it properly:
+
+       u_filtered += (u - u_filtered) * alpha        alpha from dt and
+                                                     a time constant
+
+   MAKE IT ASYMMETRIC. Filter only while the magnitude is RISING; when
+   the stick is released or pulled back, follow immediately. A
+   symmetric filter adds its time constant to the stop, and a crosshair
+   that keeps moving after the thumb comes off the stick is far worse
+   than one that starts a few milliseconds late. One parameter,
+   smooth_ms, default something small like 8 ms.
+
+6.  Radial, Not Per-Axis
+
+6.1.  The Defect In The Shipped Profiles
+
+   Every Adaptoid mouselook profile shapes X and Y with DIFFERENT
+   FUNCTIONS - X quadratic, Y linear. Work out where the pointer
+   actually goes with the FPS profile and the stick on the 45 degree
+   diagonal at full deflection, x = y = 53:
+
+       X rate = 53*53/2 = 1404 px/s
+       Y rate = 16*53   =  848 px/s
+       direction = atan(848/1404) = 31 degrees, not 45
+
+   THE ERROR IS NOT THE ANISOTROPY. Wanting vertical slower than
+   horizontal is normal and deliberate. The error is that the amount of
+   bend CHANGES WITH HOW HARD THE STICK IS PUSHED, because the two axes
+   are on different curves. At half deflection the same stick direction
+   gives a different pointer direction:
+
+       x = y = 26:  X = 338, Y = 416  ->  51 degrees
+       x = y = 53:  X = 1404, Y = 848 ->  31 degrees
+
+   A 20 degree swing in pointer direction for one stick direction, purely
+   as a function of push. That is felt as the pointer "pulling toward
+   horizontal when you push harder", and it cannot be compensated for by
+   the player because it is not consistent.
+
+6.2.  The Rule
+
+   Apply the deadzone, the curve and the acceleration to the RADIUS. Then
+   project onto the stick's direction. Apply per-axis gain last:
+
+       r   = |(x, y)|                        radial
+       u   = normalise(r) after deadzone and outer limit
+       s   = max_speed * g(u) * (1 + boost)  one speed, radially
+       vx  = s * (x/r) * gain_x
+       vy  = s * (y/r) * gain_y
+
+   Now the pointer direction is a fixed function of the stick direction -
+   bent by gain_y/gain_x, which is the anisotropy the user asked for, and
+   bent by the SAME amount at every deflection.
+
+   XBCD already works this way for the joystick path: applyDeadzone2D and
+   cropVector both operate on the pair, not on the axes. Section 7.5 of
+   xbcd-architecture.txt has the detail, including the 32-bit overflow in
+   the x64 integer version that must be fixed before reusing it.
+
+   THE OCTAGON PROBLEM DOES NOT ARISE HERE. The Adaptoid needs a corner
+   stretch because the N64 gate is octagonal and a diagonal only reaches
+   about 65 of 80. The Xbox stick gate is round, and working radially
+   makes the question moot in any case: a round gate is exactly what a
+   radial pipeline wants. Corner stretch stays a joystick-path concern.
+
+7.  The Parameter Set
+
+   Per stick, per layout. Every field is an integer; nothing here needs
+   floating point at run time.
+
+   +-------------------+-------+----------+------------------------------------+
+   | Field             | Type  | Default  | Meaning                            |
+   +===================+=======+==========+====================================+
+   | mode              | u8    | off      | off / relative mouse / absolute /  |
+   |                   |       |          | joystick axes / wheel              |
+   | deadzone          | u16   | 2000     | radial, in MAX_VALUE units         |
+   | outer             | u16   | 33000    | deflection treated as full, ditto  |
+   | curve[33]         | u16[] | linear   | g sampled at 33 points, 0..65535   |
+   | max_speed         | u16   | 2800     | px/s at full deflection            |
+   | gain_x            | u8    | 128      | per-axis trim, 128 = 1.0           |
+   | gain_y            | u8    | 54       | 54/128 = 0.42, the shipped ratio   |
+   | invert_x, invert_y| u8    | 0, 1     | Y inverted by default, HID down-   |
+   |                   |       |          | positive against pad up-positive   |
+   | smooth_ms         | u8    | 8        | rise-only one-pole time constant   |
+   | accel_threshold   | u16   | 58000    | u above which boost accrues, Q16   |
+   | accel_rate        | u16   | 0        | boost per second, Q8; 0 = off      |
+   | accel_max         | u16   | 512      | boost ceiling, Q8; 512 = +2.0x     |
+   | accel_decay       | u16   | 1024     | boost lost per second, Q8          |
+   +-------------------+-------+----------+------------------------------------+
+
+   That is 78 bytes per stick with the table, or 12 without it. Two
+   sticks and eight layouts is 1.2 KB - a rounding error next to a
+   bytecode image.
+
+   The defaults reproduce the FPS profile: quadratic X at 2812 px/s,
+   linear-equivalent Y at 42 per cent of it, small deadzone, no
+   acceleration.
+
+8.  The Fixed-Point Pipeline
+
+   Per stick, per tick. MAX_VALUE is 35000, as XBCD.
+
+       1  raw16 x, y from the packet, Y up-positive
+
+       2  y = -y, but CLAMP FIRST: negating -32768 in 16 bits gives
+          -32768 back. Clamp both axes to -32767..32767 before the
+          negate. XBCD does not, because it never negates.
+
+       3  scale to MAX_VALUE units, asymmetric as XBCD does:
+              X = x < 0 ? MAX_VALUE*x/32768 : MAX_VALUE*x/32767
+
+       4  r = isqrt(X*X + Y*Y)
+          COMPUTE THE SUM IN 64 BITS. Two axes at 35000 sum to 2.45e9,
+          which overflows a signed 32-bit integer; this is the live bug
+          in XBCD's x64 build.
+
+       5  if r <= deadzone:
+                 u = 0; reset accum_x, accum_y, boost; emit nothing
+             else:
+                 rc = min(r, outer)
+                 u  = (rc - deadzone) * 65535 / (outer - deadzone)
+
+       6  smoothing, rise only:
+              if u > u_prev: u = u_prev + ((u - u_prev) * alpha >> 16)
+              u_prev = u
+
+       7  curve, table plus lerp:
+              i = u >> 11                  0..31
+              f = u & 0x7FF                fraction, 11 bits
+              g = curve[i] + (((curve[i+1] - curve[i]) * f) >> 11)
+
+       8  speed = max_speed * g >> 16                       px/s
+          speed = speed * (256 + boost) >> 8                accel
+
+       9  project, IN 64 BITS - speed * X can reach 6e10:
+              vx = (s64)speed * X / r
+              vy = (s64)speed * Y / r
+
+      10  per-axis gain and inversion:
+              vx = vx * gain_x >> 7;   if invert_x, negate
+              vy = vy * gain_y >> 7;   if invert_y, negate
+
+      11  accumulate with measured, clamped elapsed microseconds:
+              accum_x += vx * dt_us
+              step_x   = accum_x / 1000000       truncation toward zero
+              accum_x -= step_x * 1000000
+
+      12  if step_x or step_y is non-zero, emit a mouse report
+
+   TRUNCATE TOWARD ZERO IN STEP 11, not floor. C integer division
+   already does this; the point is not to substitute a shift, which
+   floors and therefore biases negative motion by one count per tick.
+
+9.  Reproducing The Shipped Profiles
+
+   Each Adaptoid profile in the parameters of section 7, with deadzone
+   1/75 of full scale, which is 467 MAX_VALUE units.
+
+   +-----------------------------+------------+-----------+--------+--------+
+   | Script                      | curve      | max_speed | gain_x | gain_y |
+   +=============================+============+===========+========+========+
+   | Relative Mouse Fast         | u^2        |      5625 |    128 |     27 |
+   | Relative Mouse for FPS      | u^2        |      2812 |    128 |     55 |
+   | Relative Mouse Slow         | u^2        |      1406 |    128 |    109 |
+   | PORTAL                      | u^2        |      1406 |    128 |    109 |
+   | MAX PAYNE 2                 | linear     |       900 |    107 |    128 |
+   | TRON 2.0, serious sam       | linear     |       900 |    128 |     85 |
+   | test                        | linear     |       150 |    128 |    128 |
+   +-----------------------------+------------+-----------+--------+--------+
+
+   max_speed is the larger of the two axis speeds and the gains are the
+   ratio to it. The flipped variants are the same rows with invert_y
+   cleared.
+
+   READ THIS TABLE AS THE ACCEPTANCE TEST. A configurator that can
+   express all seven rows, and a driver that reproduces the feel of the
+   originals from them, has replaced the scripting language for every
+   purpose the shipped library served.
+
+   ONE CAVEAT ON FIDELITY: these reproduce the INTENT, not the
+   arithmetic. The originals deliver section 3.1's staircase, and a
+   player who tuned against it is tuned against its errors - a profile
+   asking for 1406 px/s was actually getting 1600. If a side-by-side
+   comparison matters, compare against the realised figure, not the
+   requested one.
+
+10. Absolute Mouse Mode
+
+   Six of the shipped scripts drive an absolute pointer instead, and they
+   are a different thing entirely, not a variant of mouselook. The body,
+   from Sample Absolute Mouse:
+
+       if (x > ox) mx += (mx-67536) * (x-ox) / (ox-1200) * 100 / decel;
+       else if (x < ox) mx += (mx+2000) * (x-ox) / (ox+1200) * 100 / decel;
+
+   The cursor position mx is pushed toward a screen edge at a rate
+   proportional to how far the stick has moved SINCE THE LAST PACKET,
+   scaled by the distance remaining to that edge, with a deceleration
+   term that grows as the stick becomes still. It is a spring-loaded
+   pointer: flick the stick and the cursor accelerates toward that edge
+   and eases in.
+
+   It exists for emulator front-ends, menus and light-gun-style titles,
+   where a pointer that maps to a SCREEN POSITION is wanted rather than
+   one that integrates velocity.
+
+   RECOMMENDATION: BUILD IT SECOND, AS A SEPARATE MODE. It shares the
+   deadzone, the curve and the smoothing, then diverges completely: no
+   accumulator, no velocity, a position that is clamped to 0..65535 and
+   reported absolutely. Two extra parameters, an ease factor and a
+   travel rate, reproduce the shipped behaviour. It is not on the
+   critical path and the relative mode is what the FPS use case needs.
+
+11. Descriptor Consequences
+
+   Two things the mouse collection must get right, both of which the
+   Adaptoid gets wrong or works around.
+
+   USE 16-BIT RELATIVE AXES, NOT 8-BIT. The Adaptoid declares Logical
+   Minimum -127, Logical Maximum 127, Report Size 8. At 5625 px/s and a
+   100 Hz emission rate a single tick owes 56 px, which fits - but at 60
+   Hz it owes 94, and any hitch that extends a tick past the clamp
+   saturates. 16-bit axes cost two bytes and remove the failure mode:
+
+       16 01 80     Logical Minimum (-32767)
+       26 ff 7f     Logical Maximum (32767)
+       75 10        Report Size (16)
+       95 02        Report Count (2)
+
+   THE WHEEL MUST BE DRIVABLE. The Adaptoid declares a wheel byte, keeps
+   a running total for it in the device extension, and NOTHING CAN EVER
+   WRITE A NON-ZERO VALUE TO IT - drv_DispatchEvents passes the wheel
+   delta as a hard-wired zero and _mouse_relative takes only two
+   arguments (ADAPTOID/docs/hid-descriptor.txt section 5). Declare the
+   wheel, and make a stick direction or a button able to drive it; a
+   trigger mapped to weapon-wheel scroll is an obvious win the original
+   could not deliver.
+
+   AND CHECK THE OTHER DIRECTION: if absolute mode ships, it needs
+   Input(Data,Var,Abs) fields, which is a DIFFERENT field from the
+   relative one. A descriptor is fixed once hidclass reads it, so a
+   field cannot switch between relative and absolute at run time. Either
+   declare a second pointer collection, or select which mouse collection
+   is published at AddDevice from configuration - the pattern XBCD
+   already uses for optional axes and the Adaptoid uses for its
+   VirtualDevices mask.
+
+12. Things That Will Bite During Tuning
+
+   -  WINDOWS POINTER ACCELERATION IS APPLIED ON TOP. "Enhance pointer
+      precision" and the pointer speed slider transform HID mouse deltas
+      on the way to the CURSOR. A game reading Raw Input does not see
+      that transform. So a curve tuned by watching the desktop cursor
+      will not feel the same in the game it was tuned for. Tune against
+      a raw-input target, or turn enhance-pointer-precision off first,
+      and say so in the configurator.
+
+   -  THE GAME HAS ITS OWN SENSITIVITY, and it multiplies. max_speed is
+      in pixels per second, not degrees per second, so the same profile
+      turns at different rates in two games. This is unavoidable without
+      per-title configuration - which is exactly what the Adaptoid's
+      per-game script files were for. The equivalent here is per-game
+      profiles in the configurator selecting a layout.
+
+   -  A STICK IS NOT CENTRED. Drift, mechanical offset and wear mean
+      the resting position is not zero and is not the same on both axes.
+      The radial deadzone hides it; a centre-offset calibration would
+      hide it better, and the raw packet is already carried in the input
+      report (xbcd-architecture.txt section 9.2) so the configurator can
+      measure it. Worth considering; not required for a first release.
+
+   -  DO NOT EMIT A MOUSE REPORT WITH ZERO DELTAS. The Adaptoid's move
+      path has no change test and sends one on every call, all-zero
+      reports included. At 250 Hz that is 250 pointless reports a second
+      through mouclass whenever the driver is loaded. Test the step
+      before emitting.

@@ -1,0 +1,129 @@
+;
+; xboxctl.inf - install xboxctl.sys as a HID minidriver for the original
+; Xbox controller.
+;
+; THE DEVICE IS CLAIMED AS HIDClass, NOT AS A RAW USB DEVICE. That is the
+; whole arrangement: hidclass.sys owns the device object and this driver
+; sits under it as a minidriver, which is what lets one USB endpoint appear
+; as a gamepad, a keyboard and a mouse at once. Installing it as anything
+; else loses the property the driver exists for.
+;
+; A hardware-ID match outranks the generic compatible-ID match, so PnP loads
+; this rather than the inbox path.
+;
+; UNSIGNED. 64-bit Windows will not load this without test signing enabled:
+;
+;     bcdedit /set testsigning on        (then reboot)
+;
+; and the driver must carry a test certificate. See README.txt section 6.
+;
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = HIDClass
+ClassGuid   = {745A17A0-74D3-11D0-B6FE-00A0C90F57DA}
+Provider    = %ProviderName%
+DriverVer   = 09/22/2026,0.1.0922.0300
+CatalogFile = xboxctl.cat
+PnpLockdown = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+xboxctl.sys = 1,,
+
+[DestinationDirs]
+DefaultDestDir = 12          ; %windir%\system32\drivers
+
+[Manufacturer]
+%ProviderName% = XboxCtl, NTamd64, NTx86
+
+; ---------------------------------------------------------------------
+; The devices. These are the original Xbox controller and the licensed
+; third-party pads that speak the same 20-byte protocol.
+; ---------------------------------------------------------------------
+
+[XboxCtl.NTamd64]
+%PadName%   = XboxCtl_Install, USB\VID_045E&PID_0202
+%PadName%   = XboxCtl_Install, USB\VID_045E&PID_0285
+%PadName%   = XboxCtl_Install, USB\VID_045E&PID_0287
+%PadName%   = XboxCtl_Install, USB\VID_045E&PID_0288
+%PadName%   = XboxCtl_Install, USB\VID_045E&PID_0289
+
+[XboxCtl.NTx86]
+%PadName%   = XboxCtl_Install, USB\VID_045E&PID_0202
+%PadName%   = XboxCtl_Install, USB\VID_045E&PID_0285
+%PadName%   = XboxCtl_Install, USB\VID_045E&PID_0287
+%PadName%   = XboxCtl_Install, USB\VID_045E&PID_0288
+%PadName%   = XboxCtl_Install, USB\VID_045E&PID_0289
+
+[XboxCtl_Install.NT]
+CopyFiles = XboxCtl_CopyFiles
+; HIDCLASS.CopyFiles brings in hidclass.sys and hidparse.sys, which this
+; driver registers with and cannot work without.
+Include   = input.inf
+Needs     = HIDCLASS.CopyFiles
+
+[XboxCtl_CopyFiles]
+xboxctl.sys
+
+[XboxCtl_Install.NT.Services]
+AddService = xboxctl, 0x00000002, XboxCtl_Service
+Include    = input.inf
+Needs      = HIDCLASS.Services
+
+[XboxCtl_Service]
+DisplayName    = %ServiceName%
+ServiceType    = 1                    ; SERVICE_KERNEL_DRIVER
+StartType      = 3                    ; SERVICE_DEMAND_START
+ErrorControl   = 1                    ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\xboxctl.sys
+LoadOrderGroup = Base
+
+[XboxCtl_Install.NT.HW]
+AddReg = XboxCtl_Joystick
+
+; ---------------------------------------------------------------------
+; The DirectInput presentation.
+;
+; WITHOUT THIS THE BUTTONS ARE NUMBERED, NOT NAMED. DirectInput and the
+; Game Controllers control panel read per-device names from here; with the
+; key absent an application shows "Button 1" where it could show "A".
+;
+; The numbers are DESTINATION HID buttons, zero based, and they follow the
+; default map in core.c - CORE_DEFAULT_BUTTONS. Change one and the other
+; must change with it.
+;
+; Only VID_045E&PID_0289 is registered here. The key is per VID and PID, so
+; a second pad model needs its own copy of this block.
+; ---------------------------------------------------------------------
+
+[XboxCtl_Joystick]
+HKLM,%OEMKEY%\%VIDPID%,OEMName,,%PadName%
+
+HKLM,%OEMKEY%\%VIDPID%\Axes\0,,,"Left stick X"
+HKLM,%OEMKEY%\%VIDPID%\Axes\1,,,"Left stick Y"
+HKLM,%OEMKEY%\%VIDPID%\Axes\0,Attributes,1,01,01,00,00,01,00,30,00
+HKLM,%OEMKEY%\%VIDPID%\Axes\1,Attributes,1,01,01,00,00,01,00,31,00
+
+HKLM,%OEMKEY%\%VIDPID%\Buttons\0,,,"A"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\1,,,"B"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\2,,,"X"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\3,,,"Y"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\4,,,"Black"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\5,,,"White"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\6,,,"Left trigger"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\7,,,"Right trigger"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\8,,,"Start"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\9,,,"Back"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\10,,,"Left stick click"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\11,,,"Right stick click"
+
+[Strings]
+ProviderName = "XBOXCTL"
+VIDPID       = "VID_045E&PID_0289"
+OEMKEY       = "System\CurrentControlSet\Control\MediaProperties\PrivateProperties\Joystick\OEM"
+DiskName     = "XBOXCTL Driver Disk"
+PadName      = "Xbox Controller (XBOXCTL)"
+ServiceName  = "XBOXCTL HID minidriver"

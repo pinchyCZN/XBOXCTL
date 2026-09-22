@@ -1,0 +1,566 @@
+XBOXCTL                                                        Design Note
+the driver                                             architecture and plan
+
+
+                  ARCHITECTURE AND PLAN FOR THE DRIVER
+
+
+Abstract
+
+   XBOXCTL is a HID minidriver that owns the original Xbox controller and
+   presents it to Windows as a COMPOSITE DEVICE - a gamepad, a keyboard
+   and a mouse from one USB endpoint. Any control can be remapped to a
+   real keystroke or mouse event that every application sees as genuine
+   hardware.
+
+   The architecture is the Adaptoid's, minus its bytecode scripting
+   engine. Remapping is a table of fixed-size parameter records pushed to
+   the driver, not a program.
+
+   This note records the architecture decision, the composite descriptor
+   as built, the report layouts, the polling and report-queue design, the
+   configuration transport, and the work order. It is the plan; what is
+   actually built at any moment is section 9.
+
+   The binding model is in mapping-engine.txt and the stick parameters in
+   analog-to-mouse.txt. The packet format, which is the one thing taken
+   from XBCD, is in xbcd-architecture.txt section 6.
+
+Table of Contents
+
+   1.  The Property Worth Preserving
+   2.  Architecture
+   3.  What Is Taken From Each Original
+   4.  The Composite Descriptor
+   4.1.  Collection Order And Report IDs
+   4.2.  Report Layouts
+   4.3.  Why All Three Are Always Published
+   5.  The Push Model
+   5.1.  Two Poll Slots
+   5.2.  The Report Queue
+   5.3.  Coalescing
+   6.  The Tick
+   7.  The Configuration Transport
+   8.  The Configurator
+   9.  State
+   10. Work Order
+   11. Risks And Open Decisions
+
+1.  The Property Worth Preserving
+
+   Stated once, because everything below follows from it.
+
+   The Adaptoid's distinguishing feature is not that it remaps buttons.
+   It is that the remapped output is INDISTINGUISHABLE FROM REAL
+   HARDWARE to every application, including ones that ignore injected
+   input.
+
+   User-mode remappers call SendInput or post messages. Games that read
+   through DirectInput, Raw Input or a polling loop on GetAsyncKeyState
+   frequently do not see that input at all. A composite HID device's
+   keystrokes arrive through kbdclass exactly as a real keyboard's do,
+   because they are real HID keyboard reports from a device that declares
+   a keyboard collection.
+
+   That is the property. Everything else - the curve, the autofire, the
+   configurator - is valuable and secondary.
+
+2.  Architecture
+
+   A PER-DEVICE HID MINIDRIVER THAT OWNS THE PAD. The INF matches the
+   controller's hardware IDs, and a hardware-ID match outranks the
+   generic compatible-ID match, so PnP loads this instead of the inbox
+   path. DriverEntry calls HidRegisterMinidriver, hidclass.sys stacks on
+   top, and the driver serves its own descriptor and its own reports.
+
+   Below it there is no HID layer at all. The driver submits URBs to the
+   USB bus driver and receives 20 raw bytes off an interrupt IN endpoint.
+   Those bytes are a vendor format; nothing forces them to be read as HID
+   and they are not.
+
+       DirectInput / Raw Input        kbdclass        mouclass
+       gamepad PDO                    keyboard PDO    mouse PDO
+       ----------------------------------------------------------
+                         hidclass.sys
+                         XBOXCTL                      the FDO
+       ================ IRP / URB boundary ================
+                         USB PDO (usbhub)
+
+   The alternative - a virtual HID device fed by a user-mode service - is
+   the right answer for supporting arbitrary controllers and the wrong one
+   here. Its costs do not apply to a driver that owns one known device:
+
+   +-------------------------+--------------------------------------------+
+   | Cost of virtual HID     | Why it does not apply                      |
+   +=========================+============================================+
+   | Double visibility - the | we REPLACE the pad's driver, so exactly    |
+   | real pad enumerates too | one device exists and it is ours           |
+   | Needs a hiding filter   | not needed, so one kernel component        |
+   | Latency of two boundary | the whole path is a USB completion routine |
+   | crossings               |                                            |
+   | Dies if the service     | there is no service                        |
+   | dies                    |                                            |
+   | Anti-cheat attention on | the device presents as real hardware       |
+   | a known virtual bus     |                                            |
+   +-------------------------+--------------------------------------------+
+
+   The sibling project weighed the same choice at length and reached the
+   same conclusion; see ADAPTOID/docs/replacement-architecture.txt.
+
+3.  What Is Taken From Each Original
+
+   THIS IS A CLEAN-SLATE DRIVER. Neither original is a base.
+
+   +-------------------+-------------------------------------------------+
+   | From the Adaptoid | the architecture: own the device, composite     |
+   |                   | descriptor, DevicesArePolled FALSE, continuous  |
+   |                   | double-buffered polling, a report queue against |
+   |                   | pending reads, a private configuration channel. |
+   |                   | NOT the bytecode engine, the thread scheduler   |
+   |                   | or the dispatch-table interception.             |
+   +-------------------+-------------------------------------------------+
+   | From XBCD         | the 20-byte packet layout, and the semiaxis     |
+   |                   | abstraction it decodes into. Facts about the    |
+   |                   | hardware, not code. NOT its source: see         |
+   |                   | ../CLAUDE.md on why.                            |
+   +-------------------+-------------------------------------------------+
+
+   Two constants come across from XBCD and are worth naming because they
+   are tuned rather than obvious:
+
+   -  CORE_MAX_VALUE = 35000, the fixed-point scale every decoded value
+      and every threshold is expressed in. Deliberately about 7 per cent
+      wider than the 32767 output range, so a real full deflection can
+      reach real full scale. See xbcd-architecture.txt section 3.
+
+   -  The per-kind activation thresholds - 10/255 for analog buttons and
+      triggers, 100/255 for stick semiaxes - as the defaults a
+      configurator seeds per binding.
+
+4.  The Composite Descriptor
+
+4.1.  Collection Order And Report IDs
+
+   Three top-level application collections, 279 bytes, built as one array
+   in core.c. hidclass creates one child devnode per collection and
+   numbers them in descriptor order.
+
+   +-------+----------+-----------+------------------------------------+
+   | Child | Usage    | Report ID | Contents                           |
+   +=======+==========+===========+====================================+
+   | Col01 | Gamepad  |         1 | 24 buttons, 7 axes, a hat, and a   |
+   |       |          |           | 21-byte diagnostic tail            |
+   | Col02 | Keyboard |         2 | 8 modifiers, 6 key slots, 5 LEDs   |
+   | Col03 | Mouse    |         3 | 5 buttons, 16-bit X/Y, wheel, pan  |
+   +-------+----------+-----------+------------------------------------+
+
+   THE GAMEPAD GOES FIRST because it is the collection a user re-binds
+   inside a game, and Col01 is the obvious one to pick.
+
+   The output and feature reports live INSIDE the gamepad's application
+   collection rather than in a fourth top-level one, which would make
+   hidclass create a fourth devnode for something that is not an input
+   device:
+
+   +-----------+---------+--------+------------------------------------+
+   | Report ID | Kind    | Bytes  | Contents                           |
+   +===========+=========+========+====================================+
+   |         4 | Output  |      2 | left and right rumble actuator     |
+   |         5 | Feature |   4096 | the configuration blob             |
+   |         6 | Feature |      7 | signature and driver version       |
+   +-----------+---------+--------+------------------------------------+
+
+   Report ID 2 also carries an Output report, the five keyboard LEDs.
+   Windows really does send Num Lock and Caps Lock changes down; they are
+   accepted and discarded, which matches the hardware. Refusing them makes
+   Windows decide the keyboard is broken.
+
+   THE DESCRIPTOR IS THE CONTRACT. Changing an item changes the device's
+   identity to every application and invalidates saved bindings. Treat it
+   as frozen once released.
+
+4.2.  Report Layouts
+
+   Input report 1, gamepad, 40 bytes:
+
+       byte 0      report ID = 1
+       byte 1..3   buttons 1..24
+       byte 4..17  X Y Z Rx Ry Rz Slider, signed 16-bit little endian
+       byte 18     hat in the low nibble, four pad bits
+       byte 19     active layout, 1-based
+       byte 20..39 the raw 20-byte packet, verbatim
+
+   THE HAT USES THE NULL STATE BIT, Input(Data,Var,Abs,Null). The logical
+   range is 0..7 and Null is what makes an out-of-range value mean
+   "centred", so 8 is a legal way to say no direction. Without Null the
+   same byte is simply invalid.
+
+   THE RAW PACKET RIDES ALONG ON PURPOSE. A configurator asking "press the
+   control you want to bind" gets the mapped output and the physical truth
+   from one HID read, with no second channel to open.
+
+   Input report 2, keyboard, 9 bytes:
+
+       byte 0      report ID = 2
+       byte 1      modifier bits, LeftControl..RightGUI
+       byte 2      reserved, constant zero
+       byte 3..8   six key usage slots, 0 = empty
+
+   SIX KEY SLOTS, NOT THE ADAPTOID'S TEN. Six is the boot-protocol size,
+   it is what every host handles without question, and with 25 sources
+   more than six simultaneous keys is not a case worth designing for.
+   Above six, every slot carries 0x01 - HID ErrorRollOver - while the real
+   list keeps being tracked internally, so releasing back to six restores
+   it with no fresh press.
+
+   Input report 3, mouse, 8 bytes:
+
+       byte 0      report ID = 3
+       byte 1      bits 0..4 buttons 1..5, bits 5..7 padding
+       byte 2..3   X, signed 16-bit, relative
+       byte 4..5   Y, signed 16-bit, relative
+       byte 6      vertical wheel, signed 8-bit
+       byte 7      horizontal pan, signed 8-bit
+
+   16-BIT AXES, NOT THE USUAL 8. At high pointer speeds and a low
+   emission rate a single tick can owe more than 127 pixels; an 8-bit axis
+   saturates and the motion is silently lost. Two extra bytes removes the
+   failure mode. See analog-to-mouse.txt section 11.
+
+   THE WHEEL IS REALLY DRIVABLE. The Adaptoid declares one and nothing in
+   that driver can ever write a non-zero value to it. Binding a trigger or
+   a stick direction to scroll is a capability the original advertised and
+   did not have.
+
+4.3.  Why All Three Are Always Published
+
+   A descriptor is consumed when hidclass starts the device, so which
+   collections exist cannot change without a device restart. Making the
+   keyboard conditional on a key binding existing would mean the pad
+   disappears and comes back the first time a user binds a key - which
+   reads as a bug however it is explained.
+
+   The cost is honest and small: a pad with nothing bound still presents a
+   keyboard and a mouse that never say anything. The Adaptoid has done
+   exactly this since 2001.
+
+5.  The Push Model
+
+   reg.DevicesArePolled = FALSE, and it is the single most consequential
+   line in the driver.
+
+   TRUE would mean hidclass polls with IOCTL_HID_READ_REPORT and expects
+   each one answered from current state; the minidriver never originates
+   anything. A driver that must deliver a keystroke the instant a button
+   goes down cannot work that way, and neither can one that emits mouse
+   deltas on its own schedule.
+
+   FALSE is also the ordinary case. hidusb itself works this way; TRUE is
+   the exotic setting, for devices that genuinely cannot push.
+
+   Three things follow, and they are one change rather than three.
+
+5.1.  Two Poll Slots
+
+   An interrupt endpoint is in the host controller's periodic schedule
+   only while a transfer is queued on it. A single-IRP design leaves the
+   endpoint unqueued for the whole window between completion and resubmit
+   - and that window is where this driver does its work. Two slots, each
+   with its own IRP, URB and buffer, mean the second is already armed when
+   the first completes and the processing overlaps the next transfer.
+
+   TWO BUFFERS ARE NOT HISTORY. They exist because two in-flight URBs
+   cannot share one DMA target. Edge detection is a separate concern and
+   needs no packet history at all: each binding carries its own activation
+   latch, which hysteresis and toggle require anyway, and the edge is the
+   change in that latch. See mapping-engine.txt section 5.
+
+   WHAT THE SECOND SLOT BUYS IS LATENCY CONSISTENCY, NOT CORRECTNESS. The
+   pad reports full state on every poll, so a missed poll costs one
+   interval of staleness, not an event: a press that starts and ends
+   inside a 4ms window does not exist. The second slot is cheap insurance
+   against DPC delay, not a fix for a defect.
+
+   Polling runs whenever the device is started, gated by a stop-reason
+   BITMASK rather than a flag - the reasons are independent, and a
+   power-down and a pending removal can both be outstanding without either
+   clearing the other's.
+
+   THE COMPLETION VALIDATES THREE THINGS: the IRP status, the URB status,
+   and a transfer length of exactly 20. A short transfer with a successful
+   status leaves stale bytes from the previous packet in the buffer and
+   the decode cannot tell.
+
+5.2.  The Report Queue
+
+   A report produced with no read waiting is queued; a read arriving with
+   reports queued takes the oldest.
+
+   ORDER MATTERS ON BOTH SIDES. A read finds a queued report first,
+   because anything already queued is older than the request. A report
+   finds a waiting read first, for the same reason.
+
+   ONE QUEUE SERVES ALL THREE COLLECTIONS. Every report carries its ID as
+   its first byte and hidclass demultiplexes to the right collection's
+   clients, so a single pending-read list and a single report queue are
+   the whole arrangement.
+
+   A FULL QUEUE DROPS THE NEWEST, not the oldest. Older transitions are
+   already committed and dropping one desynchronises the host's idea of
+   what is held; the newest state can be re-derived on the next packet.
+
+   PENDING READS NEED A CANCEL ROUTINE, and this is the one real
+   complexity FALSE adds over TRUE. A client closing its handle, or
+   hidclass cancelling on teardown, must be able to pull a read off the
+   list; and device stop must complete every parked read or the stack
+   teardown hangs and the IRPs leak with it.
+
+5.3.  Coalescing
+
+   A property of the data, not a tuning choice:
+
+   +-----------+--------------------------+----------------------------+
+   | Report    | Nature                   | Queue policy               |
+   +===========+==========================+============================+
+   | Gamepad   | pure state               | REPLACE the queued one -   |
+   |           |                          | only the newest matters    |
+   | Keyboard  | a transition; a down and | never merge, preserve      |
+   |           | its up mean something    | order                      |
+   |           | only in sequence         |                            |
+   | Mouse     | buttons, as keyboard     | never merge, preserve      |
+   |           |                          | order                      |
+   +-----------+--------------------------+----------------------------+
+
+   COALESCING THE GAMEPAD IS WHAT STOPS AN APPLICATION BEING HANDED A
+   BURST OF HISTORY when it opens the collection after a quiet period.
+   Without it, the first thing a game reads is a queue of stale states
+   before it ever sees the present.
+
+   Mouse motion could in principle be summed into a queued report, but not
+   across a button change, so it is not merged.
+
+6.  The Tick
+
+   Autofire deadlines and the mouse velocity accumulator both need a clock
+   independent of their caller. The natural one is PACKET ARRIVAL: the pad
+   delivers at its endpoint interval whether or not anything changed, so
+   the transfer path runs the tick on every accepted packet and that is
+   the rate the engine sees.
+
+   A KTIMER CANNOT SUPPLY THAT RATE. Its resolution is the system clock
+   tick, nominally 15.6ms, so asking for 4ms gets 15.6ms. The periodic
+   timer in the driver is a FLOOR, not the clock: it exists to keep time
+   advancing if packets stop arriving - a stalled pipe, a pad unplugged
+   mid-autofire - so that whatever is held gets released.
+
+   THE PACKET RATE IS ASSUMED, NOT MEASURED. Everything in the stick
+   pipeline scales by elapsed time, so a wrong assumption degrades feel
+   rather than breaking anything, but the emission-rate reasoning in
+   analog-to-mouse.txt section 3.3 depends on the real number. The driver
+   records Pipes[].Interval at StartDevice; read it off a live device and
+   record it here.
+
+   THE ELAPSED INTERVAL IS CLAMPED at 50ms. A resume from sleep, a
+   debugger break or DPC starvation can hand the engine a gap of seconds,
+   and multiplying that by a pointer velocity flings the cursor across the
+   desktop. Anything longer is a discontinuity, not motion.
+
+7.  The Configuration Transport
+
+   Persistence and delivery are separate and both hand the same bytes to
+   the same validator.
+
+       DELIVER   the configurator sends the blob as FEATURE REPORT 5.
+                 HidD_SetFeature on an ordinary handle to the device
+                 interface reaches it - no private device object, no
+                 symbolic link, no IOCTL codes, no dispatch-table games,
+                 and no pointer-width problem.
+
+       PERSIST   the configurator writes the same blob as one REG_BINARY
+                 value under the device's own hardware key, reached with
+                 IoOpenDeviceRegistryKey and PLUGPLAY_REGKEY_DEVICE. Read
+                 at StartDevice.
+
+   ONE FUNCTION PARSES AND VALIDATES. StartDevice calls it with the
+   registry bytes and the feature handler calls it with the report bytes.
+   There is no second implementation to drift.
+
+   THE HARDWARE KEY IS THE RIGHT STORE. It is per-device by construction,
+   so two pads have two configurations, and PLUGPLAY_REGKEY_DEVICE
+   resolves under Enum rather than under Software - so it is IMMUNE TO
+   WOW64 REDIRECTION. The Adaptoid reads its settings from
+   Software\Wish Technologies\Adaptoid, where a 32-bit configurator's
+   writes land in Wow6432Node and the driver never sees them.
+
+   VALIDATE EVERY FIELD AND FALL BACK TO A DEFAULT. Reject on a bad
+   signature or an unknown version, clamp every count, reject a release
+   threshold above its activation threshold, reject a source index outside
+   the enumeration, and repair a non-monotone curve table rather than
+   trusting it. THE BLOB ARRIVES FROM USER MODE; there is no second
+   chance.
+
+   TWO RULES MAKE LIVE TUNING SAFE. Swap the whole blob atomically under
+   the device lock rather than editing fields in place, so a packet never
+   sees half of two configurations. And on a swap, RELEASE EVERY ASSERTED
+   OUTPUT first - the same rule a layer change follows - or a key held by
+   a binding that no longer exists stays held forever.
+
+   Avoid the Adaptoid's arrangement entirely: saving the dispatch pointers
+   hidclass installs, wrapping them, and triaging every IRP three ways is
+   undocumented behaviour that a modern driver should not reproduce.
+
+8.  The Configurator
+
+   A user-mode application. What matters is the division of
+   responsibility.
+
+   +--------------------------------+---------------------------------------+
+   | The configurator owns          | The driver owns                       |
+   +================================+=======================================+
+   | curve control points and every | a 33-entry monotone table             |
+   | other curve model              |                                       |
+   | key names, keyboard layouts,   | HID usages, and only usages           |
+   | and the name-to-usage table    |                                       |
+   | profiles, per-game selection,  | 1..8 layouts of bindings              |
+   | import and export              |                                       |
+   | defaults and warnings          | validation again, because the blob    |
+   |                                | arrives from user mode                |
+   +--------------------------------+---------------------------------------+
+
+   KEEP KEYBOARD-LAYOUT AWARENESS OUT OF THE DRIVER. 'w' is HID usage
+   0x1A, not ASCII 0x77, and resolving that is a user-mode job. Putting
+   layout awareness below is a mistake that is hard to walk back.
+
+   Two things make the UI good rather than adequate, and the driver
+   already supplies both:
+
+   -  THE RAW PACKET IS IN THE INPUT REPORT, at bytes 20..39 of report 1.
+      "Press the control you want to bind" needs no second channel.
+
+   -  A LIVE CURVE PAGE. Push the blob on every drag through feature
+      report 5, draw the curve, show the resulting velocity in pixels per
+      second beside it. Curve tuning by numbers alone is miserable; by
+      feel it takes a minute. Persist only when the user says so - a page
+      that writes a 4.6 KB registry value on every mouse-move is not a
+      tuning page.
+
+9.  State
+
+   What exists in src_drv now. The file plan and the build are in
+   src_drv/README.txt.
+
+   +-----------------------------------+-----------------------------------+
+   | Built and covered by the harness  | Not yet built                     |
+   +===================================+===================================+
+   | the 279-byte composite descriptor | the binding table and its         |
+   | and its structural self-check     | evaluation                        |
+   | packet decode into 25 semiaxes    | layers, autofire, toggle, chords  |
+   | the 64-bit radial math and the    | the stick curve, the accumulator  |
+   | vector crop                       | and the acceleration ramp         |
+   | the keyboard state machine, dense | the configuration blob, its       |
+   | ordered array and rollover        | parser and both transports        |
+   | the mouse button and motion state | rumble and the LED output report  |
+   | the report queue and coalescing   | the configurator                  |
+   | the two-slot poll engine          |                                   |
+   | DriverEntry and the minidriver    |                                   |
+   | IOCTL surface                     |                                   |
+   | a fixed default gamepad map       |                                   |
+   +-----------------------------------+-----------------------------------+
+
+   A PASSING HARNESS SAYS NOTHING ABOUT ENUMERATION, PnP OR TEARDOWN.
+   Those paths are stubbed in the harness build because they have no logic
+   in them, and they are verified on hardware with a kernel debugger and
+   nowhere else.
+
+10. Work Order
+
+   Ordered so each phase is independently testable and nothing is built on
+   something unverified.
+
+   +---+--------------------------------+----------------------------------+
+   | # | Phase                          | Done when                        |
+   +===+================================+==================================+
+   | 1 | Skeleton: descriptor, decode,  | the harness passes and both      |
+   |   | queue, poll engine, harness    | projects build on both           |
+   |   |                                | platforms. DONE                  |
+   +---+--------------------------------+----------------------------------+
+   | 2 | Bring-up on hardware           | three child devnodes appear,     |
+   |   |                                | the gamepad works in joy.cpl     |
+   |   |                                | and in a game, Device Manager    |
+   |   |                                | shows no errors, and the         |
+   |   |                                | keyboard and mouse are silent    |
+   +---+--------------------------------+----------------------------------+
+   | 3 | Record the measured endpoint   | section 6 names a number rather  |
+   |   | interval                       | than an assumption               |
+   +---+--------------------------------+----------------------------------+
+   | 4 | The config blob: parse,        | a hand-built blob delivered by   |
+   |   | validate, feature report 5,    | feature report changes a         |
+   |   | registry, harness tests for    | binding with no replug           |
+   |   | every malformed case           |                                  |
+   +---+--------------------------------+----------------------------------+
+   | 5 | The binding engine: activation,| one binding types into Notepad,  |
+   |   | hysteresis, the keyboard and    | and into a game that reads Raw  |
+   |   | mouse paths                    | Input                            |
+   +---+--------------------------------+----------------------------------+
+   | 6 | The stick: curve table,        | the FPS profile of               |
+   |   | accumulator, radial pipeline    | analog-to-mouse.txt section 9   |
+   |   |                                | is reproduced and feels right    |
+   +---+--------------------------------+----------------------------------+
+   | 7 | Repeat, toggle, layers, wheel, | the acceptance table in          |
+   |   | mouse pulse                    | analog-to-mouse.txt section 9    |
+   |   |                                | passes end to end                |
+   +---+--------------------------------+----------------------------------+
+   | 8 | Rumble and the LED report      | force feedback works in a game   |
+   +---+--------------------------------+----------------------------------+
+   | 9 | The configurator               | a profile can be built, felt,    |
+   |   |                                | saved and reloaded without       |
+   |   |                                | editing a blob by hand           |
+   +---+--------------------------------+----------------------------------+
+   |10 | Chords, absolute mouse mode,   | optional; none of it is on the   |
+   |   | per-game profile selection     | critical path                    |
+   +---+--------------------------------+----------------------------------+
+
+   PHASE 2 IS THE RISKY ONE AND IT IS EARLY ON PURPOSE. Everything after
+   it assumes a driver that enumerates and pushes reports on its own
+   schedule. Getting there with the keyboard and mouse collections
+   DECLARED BUT SILENT is also deliberate: a silent keyboard is a much
+   easier thing to debug than one that types the wrong thing, and it
+   proves the descriptor parses and that hidclass builds the children
+   before any of the engine exists.
+
+11. Risks And Open Decisions
+
+   RISK: A KEYBOARD COLLECTION ON A GAME CONTROLLER IS UNUSUAL and some
+   software will react to it. The Adaptoid has done this since 2001
+   without apparent trouble, which is good evidence, but it is 2001
+   evidence. Section 4.3 records why it is unconditional anyway.
+
+   RISK: ANTI-CHEAT. A driver that presents as real hardware attracts less
+   attention than a recognised virtual bus, which is a point in this
+   architecture's favour, but a pad that types is a pad that types and
+   some titles will treat it as an input-automation device. Nothing in the
+   design can fix that; it is worth being honest about in the product
+   rather than discovering it in a support thread.
+
+   RISK: SIGNING. Windows 10 and 11 on x64 will not load an unsigned
+   driver. Test signing works for development and weakens other
+   protections; attestation signing through Partner Center is the route
+   for anything shared.
+
+   OPEN: 360 PAD SUPPORT. The 360 uses the same endpoint with a different
+   packet meaning, and the difference is contained in one decode function.
+   The current decode handles the original pad only. Adding the 360 costs
+   little; note that a 360 pad already has an inbox driver, so the value
+   there is the remapping rather than basic function.
+
+   OPEN: WHETHER TO IMPORT XBCD CONFIGURATIONS. An XBCD map matrix
+   converts to bindings row by row with no loss, so an importer is cheap.
+   Whether anyone has a configuration worth importing is a different
+   question.
+
+   OPEN: WHETHER ABSOLUTE MOUSE MODE SHIPS AT ALL. It needs
+   Input(Data,Var,Abs) fields, which a relative mouse collection does not
+   have, so it means either a fourth collection or a descriptor selected
+   at AddDevice. It is the only part of this design that would add a
+   devnode for something most profiles will not use. See
+   analog-to-mouse.txt section 10.

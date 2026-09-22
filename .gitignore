@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+
+# Visual Studio build output and per-user state (src_drv/)
+build/
+.vs/
+*.vcxproj.user
+*.suo
+*.sdf
+*.VC.db
+*.opendb
+*.ilk
+*.pdb
+
+# Driver signing artefacts -- local only, never committed
+*.cer
+*.pfx
+*.cat
