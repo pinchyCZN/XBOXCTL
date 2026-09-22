@@ -291,6 +291,22 @@ Table of Contents
    status leaves stale bytes from the previous packet in the buffer and
    the decode cannot tell.
 
+   TEARDOWN WAITS, AND THIS IS NOT OPTIONAL. IoCancelIrp only ASKS; the
+   bus driver completes the transfer some time later. Freeing the IRP on
+   the strength of having called it means the completion lands in freed
+   memory, which is a bugcheck on unplug - the single most likely thing to
+   happen during testing.
+
+   The driver keeps a count of transfers in flight, starting at one for a
+   reference the device itself holds. Each submit takes another and its
+   completion drops it; a completion that resubmits takes the new
+   reference BEFORE dropping its own, so the count never touches zero
+   while polling is meant to continue. Removal stops further acquires,
+   drops the device's reference and waits for the rest, and only then
+   frees the IRPs. Cancelling the periodic timer is followed by a DPC
+   flush for the same reason: KeCancelTimer does not wait for a routine
+   already running.
+
 5.2.  The Report Queue
 
    A report produced with no read waiting is queued; a read arriving with
@@ -461,7 +477,8 @@ Table of Contents
    | ordered array and rollover        | parser and both transports        |
    | the mouse button and motion state | rumble and the LED output report  |
    | the report queue and coalescing   | the configurator                  |
-   | the two-slot poll engine          |                                   |
+   | the two-slot poll engine, and the |                                   |
+   | drain that makes teardown safe    |                                   |
    | DriverEntry and the minidriver    |                                   |
    | IOCTL surface                     |                                   |
    | a fixed default gamepad map       |                                   |
@@ -484,7 +501,7 @@ Table of Contents
    |   | queue, poll engine, harness    | projects build on both           |
    |   |                                | platforms. DONE                  |
    +---+--------------------------------+----------------------------------+
-   | 2 | Bring-up on hardware           | three child devnodes appear,     |
+   | 2 | Bring-up in a VM, on hardware  | three child devnodes appear,     |
    |   |                                | the gamepad works in joy.cpl     |
    |   |                                | and in a game, Device Manager    |
    |   |                                | shows no errors, and the         |

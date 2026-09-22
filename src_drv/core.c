@@ -454,14 +454,25 @@ static const u8 CORE_DEFAULT_BUTTONS[12] = {
  * the NEGATIVE half; the positive half is the next index. CORE_SA_GUIDE
  * marks an axis nothing drives, which reads as centred.
  */
+/*
+ * X/Y FOR THE LEFT STICK AND Rx/Ry FOR THE RIGHT is the convention every
+ * DirectInput title that auto-maps a gamepad expects. Putting the right
+ * stick anywhere else - on Z, say - leaves it unreachable in anything that
+ * does not offer manual binding.
+ *
+ * Z, Rz and Slider are unassigned. The triggers are buttons 11 and 12 in
+ * this default; binding them to Z and Rz instead is what exposes the
+ * pressure the pad actually reports, and is a configuration choice rather
+ * than a descriptor one.
+ */
 static const u8 CORE_DEFAULT_AXES[CORE_GP_AXIS_COUNT] = {
-	CORE_SA_LSTICK_XNEG,    /* X      */
-	CORE_SA_LSTICK_YNEG,    /* Y      */
-	CORE_SA_RSTICK_XNEG,    /* Z      */
-	CORE_SA_RSTICK_YNEG,    /* Rx     */
-	CORE_SA_GUIDE,          /* Ry     */
-	CORE_SA_GUIDE,          /* Rz     */
-	CORE_SA_GUIDE           /* Slider */
+	CORE_SA_LSTICK_XNEG,    /* X      left stick horizontal  */
+	CORE_SA_LSTICK_YNEG,    /* Y      left stick vertical    */
+	CORE_SA_GUIDE,          /* Z      unassigned             */
+	CORE_SA_RSTICK_XNEG,    /* Rx     right stick horizontal */
+	CORE_SA_RSTICK_YNEG,    /* Ry     right stick vertical   */
+	CORE_SA_GUIDE,          /* Rz     unassigned             */
+	CORE_SA_GUIDE           /* Slider unassigned             */
 };
 
 static void core_build_gamepad(core_state *cs, u8 *payload)

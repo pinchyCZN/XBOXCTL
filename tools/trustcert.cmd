@@ -1,0 +1,120 @@
+@echo off
+setlocal
+rem ----------------------------------------------------------------------
+rem trustcert.cmd - install the test certificate so a test-signed driver
+rem will load. GUEST side, MUST BE ELEVATED. Run once per VM.
+rem
+rem     trustcert.cmd [path-to-xboxctl-test.cer]
+rem
+rem BOTH STORES ARE REQUIRED, and this is the usual reason a correctly
+rem signed driver is still refused:
+rem
+rem   Root             makes the chain verifiable at all. Without it the
+rem                    signature terminates in an untrusted root.
+rem   TrustedPublisher makes Windows willing to LOAD it without asking.
+rem                    Without it the chain verifies and the driver is
+rem                    still blocked.
+rem
+rem The symptom of missing either is the same and it is not an error
+rem message: pnputil /enum-drivers reports the package with
+rem
+rem     Signer Name:    Unknown
+rem
+rem while every healthy package names its signer. An unsigned kernel
+rem driver cannot load on x64, and nothing inbox claims a Class_58
+rem device, so the pad is left as an Unknown device in Device Manager.
+rem
+rem TEST SIGNING MUST ALSO BE ON, and on Win10/11 Secure Boot must be off
+rem for it to take effect. This script checks and reports both; it does
+rem not change them, because both need a reboot and that is your call.
+rem ----------------------------------------------------------------------
+
+set "CER=%~1"
+if "%CER%"=="" (
+    if exist "%~dp0xboxctl-test.cer" set "CER=%~dp0xboxctl-test.cer"
+)
+
+net session >nul 2>&1
+if errorlevel 1 (
+    echo   NOT ELEVATED. Run this from an Administrator command prompt.
+    exit /b 1
+)
+if not exist "%CER%" (
+    echo   No certificate found. Pass its path, or stage it with
+    echo   tools\package.cmd on the host.
+    exit /b 1
+)
+
+echo   using %CER%
+echo.
+echo ============================================================
+echo == INSTALLING INTO BOTH REQUIRED STORES
+echo ============================================================
+certutil -addstore -f Root "%CER%"
+certutil -addstore -f TrustedPublisher "%CER%"
+echo.
+
+echo ============================================================
+echo == VERIFYING
+echo ============================================================
+rem MATCH THE CERTIFICATE'S SUBJECT, NOT THIS PROJECT'S NAME. The file is
+rem called xboxctl-test.cer but the certificate inside it is the shared
+rem test identity, CN=Adaptoid Test Signing - renaming a file does not
+rem rename what it contains. Searching for "XBOXCTL" here would report the
+rem certificate as missing immediately after installing it successfully.
+set "CERTCN=Adaptoid Test Signing"
+set "OK=1"
+certutil -store Root | findstr /i "%CERTCN%" >nul
+if errorlevel 1 (
+    echo   MISSING from Root
+    set "OK="
+) else (
+    echo   present in Root
+)
+certutil -store TrustedPublisher | findstr /i "%CERTCN%" >nul
+if errorlevel 1 (
+    echo   MISSING from TrustedPublisher
+    set "OK="
+) else (
+    echo   present in TrustedPublisher
+)
+echo.
+
+echo ============================================================
+echo == THE OTHER TWO PRECONDITIONS
+echo ============================================================
+bcdedit | findstr /i "testsigning"
+if errorlevel 1 (
+    echo   testsigning is NOT set. Turn it on and reboot:
+    echo       bcdedit /set testsigning on
+)
+rem SECURE BOOT, READ FROM THE REGISTRY rather than msinfo32: the value
+rem only exists when the machine booted UEFI, so its ABSENCE is the
+rem answer "legacy BIOS, Secure Boot cannot be in the way" - which is the
+rem default for a VirtualBox VM.
+set "SBKEY=HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State"
+reg query "%SBKEY%" /v UEFISecureBootEnabled >nul 2>&1
+if errorlevel 1 (
+    echo   Secure Boot: not present, legacy BIOS boot - nothing to disable.
+) else (
+    for /f "tokens=3" %%V in (
+        'reg query "%SBKEY%" /v UEFISecureBootEnabled ^| findstr /i UEFISecureBootEnabled'
+    ) do (
+        if /i "%%V"=="0x0" (
+            echo   Secure Boot: OFF
+        ) else (
+            echo   Secure Boot: ON - testsigning does nothing until it is off.
+        )
+    )
+)
+echo.
+
+if defined OK (
+    echo   Certificate is in place. Re-run deploy.cmd, then replug the
+    echo   controller, then state.cmd - Signer Name should no longer read
+    echo   Unknown.
+) else (
+    echo   Certificate did NOT install into both stores. Nothing else
+    echo   will work until it does.
+)
+endlocal

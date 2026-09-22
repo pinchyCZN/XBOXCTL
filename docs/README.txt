@@ -62,7 +62,17 @@ Read In This Order
        keep-alive timer does, why DevicesArePolled TRUE blocks a driver
        that must push, and the 64-bit overflow in its radial math.
 
-   ../src_drv/README.txt is the fifth document and covers the code rather
+   5.  kernel-debugging.txt
+
+       How to break into the driver while it runs in a 64-bit VM: the
+       serial pipe, the guest boot flags, the x64 debugger, the daemon an
+       agent drives it through, symbols, Driver Verifier, and the
+       commands worth knowing for this driver in particular. Procedure
+       rather than design, and the two traps in it - quitting while
+       halted, and gc producing no output through a pipe - each cost
+       hours elsewhere.
+
+   ../src_drv/README.txt is the sixth document and covers the code rather
    than the design: layout, build, the core seam, the WDK 7.1 toolchain,
    installing, and which paths are stubbed in the harness build.
 

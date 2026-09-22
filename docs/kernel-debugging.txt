@@ -1,0 +1,449 @@
+XBOXCTL                                                    Procedure Note
+bring-up                                             live kernel debugging
+
+
+                 LIVE KERNEL DEBUGGING OF XBOXCTL
+
+
+Abstract
+
+   How to break into xboxctl.sys while it runs in a 64-bit Windows 10
+   VirtualBox guest, driven from the host, and how to reach that session
+   from an agent.
+
+   THE DEBUGGER DOES NOT GO IN THE VM. Windows already contains
+   everything the guest side needs; it is a boot flag, not an install.
+   The debugger runs on the HOST and talks to the guest's built-in stub
+   over a serial port, which VirtualBox presents as a named pipe.
+
+   Four pieces have to agree, each configured somewhere different:
+
+       the virtual serial port      VirtualBox, VM powered off
+       the guest's debug stub       bcdedit inside the guest, then reboot
+       the debugger                 kd on the host, owned by a daemon
+       the symbol path              set per kd session, not persistent
+
+   A fault in a HID minidriver takes the guest down with it, and the
+   input stack is not something a target can be debugged over. This is
+   not optional equipment for phase 2.
+
+Table of Contents
+
+   1.  The Virtual Serial Port
+   2.  The Guest
+   3.  The Host Debugger
+   4.  Driving It From An Agent
+   4.1.  No MCP Server Is Needed
+   4.2.  Never Quit While The Target Is Halted
+   4.3.  Log And Continue Does Not Work Through A Pipe
+   5.  Symbols
+   6.  Driver Verifier
+   7.  Recipes For This Driver
+   7.1.  Did The Build Land
+   7.2.  Reaching Our Device Extension
+   7.3.  Watching A Packet Arrive
+   7.4.  After A Bugcheck
+   7.5.  The Pad Has To Reach The Guest First
+   8.  When It Does Not Connect
+
+1.  The Virtual Serial Port
+
+   THE VM MUST BE POWERED OFF. A saved or paused VM refuses the change;
+   a saved one has to have its state discarded, which loses that session.
+
+       VBoxManage modifyvm "<vm>" --uart1 0x3F8 4
+       VBoxManage modifyvm "<vm>" --uartmode1 server \\.\pipe\adaptoid-dbg
+
+   0x3F8 and IRQ 4 are COM1, which is what debugport:1 means in the
+   guest. The two must match or nothing connects.
+
+   "server" MEANS VIRTUALBOX CREATES THE PIPE. The debugger is then the
+   client. Getting this backwards - "client" mode, where VirtualBox
+   expects something else to have made the pipe - is the most common
+   reason a first attempt sees nothing at all.
+
+   In the GUI the same thing is Settings -> Serial Ports -> Port 1:
+
+       Enable Serial Port          ticked
+       Port Number                 COM1
+       Port Mode                   Host Pipe
+       Connect to existing pipe    UNTICKED  (this is what "server" means)
+       Path/Address                \\.\pipe\adaptoid-dbg
+
+   To check what a VM currently has:
+
+       VBoxManage showvminfo "<vm>" --machinereadable | findstr uart
+
+   THE PIPE NAME IS SHARED WITH THE ADAPTOID PROJECT and that is the only
+   thing wrong with it. One pipe name can serve one VM at a time, so the
+   two projects' guests cannot both be debugged at once. Renaming needs
+   the VM powered off and the daemon restarted.
+
+2.  The Guest
+
+   Nothing is installed. From an ELEVATED command prompt inside the VM:
+
+       bcdedit /debug on
+       bcdedit /dbgsettings serial debugport:1 baudrate:115200
+
+   then reboot the guest.
+
+   MAKE A SEPARATE BOOT ENTRY IF THE VM IS ALSO USED FOR ANYTHING ELSE.
+   A debug-enabled boot is slower and stalls early if the pipe is not
+   there:
+
+       bcdedit /copy {current} /d "Windows 10 [debug]"
+
+   which prints a GUID; apply /debug on to that GUID instead of {current}
+   and pick the entry at boot.
+
+   BAUD RATE IS NOMINAL over a named pipe - there is no real UART to run
+   slowly - but both ends must still name the same number.
+
+   Confirm it took with bcdedit /enum {current} and look for debug = Yes.
+
+   TEST SIGNING IS A SEPARATE SETTING and this driver does need it, which
+   is the difference from a signed production driver. 64-bit Windows will
+   not load an unsigned or self-signed kernel image without it:
+
+       bcdedit /set testsigning on
+
+   and on Windows 10 Secure Boot must be off for that to take effect.
+   tools\trustcert.cmd checks both and reports; it changes neither,
+   because both need a reboot.
+
+3.  The Host Debugger
+
+   USE THE x64 BUILD. kd is a cross debugger - the build's bitness is the
+   host process, not the machine being debugged - and an x64 kd debugs an
+   x86 target perfectly well. The awkward direction is the reverse, where
+   an x86 kd against an x64 target loads x86 extensions that then
+   misreport pointer-width in !devobj and friends.
+
+       C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe
+
+   tools\kdd.py already prefers it, so nothing needs saying on the
+   command line.
+
+   Connected by hand, the target string is:
+
+       kd.exe -k com:pipe,port=\\.\pipe\adaptoid-dbg,resets=0,reconnect
+
+   resets=0 is correct for a pipe; it is a real-serial-line workaround.
+   reconnect reopens the pipe when the VM restarts, which saves
+   relaunching after every guest reboot.
+
+   THE PIPE ONLY EXISTS WHILE THE VM IS RUNNING, so start the VM first.
+   With reconnect, starting kd first is merely slower rather than wrong.
+
+   THE GUEST IS FROZEN WHILE ANYONE SITS AT THE PROMPT. Type g to let it
+   run. Section 4.2 is what happens if that is forgotten.
+
+4.  Driving It From An Agent
+
+   ONE kd RUNS FOR THE LIFE OF THE VM. tools/kdd.py is a daemon that owns
+   that process; tools/kdc.py is a one-shot client that talks to it over
+   127.0.0.1:8097.
+
+       python tools/kdd.py --pipe adaptoid-dbg        leave this open
+       python tools/kdc.py --status
+       python tools/kdc.py "lm vm xboxctl" "!drvobj xboxctl 2"
+
+   A CLIENT CALL SENDS ITS COMMANDS AS ONE BATCH: the daemon breaks in,
+   runs them all, and resumes. The guest is frozen for the length of the
+   batch, not once per command, and it is left running afterwards. Only
+   --hold leaves it halted, and then only because another batch follows.
+
+   q, qd and qq are refused by the daemon rather than passed through.
+
+   THE BREAK REQUEST MUST BE A CONSOLE CONTROL EVENT. Writing 0x03 to
+   kd's stdin does nothing when stdin is a pipe - Ctrl+C is a console
+   event, not a byte in the stream, so it is read as data and discarded.
+   kd is spawned in its own process group and halted with
+   GenerateConsoleCtrlEvent. A break-in that silently never happens looks
+   exactly like a debugger that has hung.
+
+4.1.  No MCP Server Is Needed
+
+   kdc.py is an ordinary command, so an agent with shell access already
+   has the whole interface. tools/kdmcp.py in the sibling project wraps
+   the same session as MCP tools instead, for an agent that can only
+   reach a stdio server; it adds no capability and needs registration, so
+   it is not carried here.
+
+   Kernel work lives in extension commands - !drvobj, !devobj, !devstack,
+   !irp, !analyze - so passing arbitrary command text through is the main
+   interface rather than a fallback. Any wrapper that offers a fixed set
+   of operations is the wrong shape for this.
+
+4.2.  Never Quit While The Target Is Halted
+
+   A DEBUGGER THAT EXITS WITHOUT RESUMING LEAVES THE GUEST STOPPED
+   FOREVER. The target halts at an int 3 and waits for a debugger to
+   release it; nothing else in the system will. Detaching does not resume
+   it. The guest then shows a frozen screen, ignores the VM console, and
+   needs a hard restart - which reads as "the pipe is wedged" and is not.
+
+   This is the shape that causes it, and it fails every time:
+
+       kd -b -k com:pipe,... -cf script.kd     where script.kd ends in qd
+
+   -b breaks in on connect and no g is ever issued.
+
+   VirtualBox contributes a second, independent failure: its pipe server
+   does not reliably accept a new client after one disconnects, so the
+   pipe can refuse a fresh kd even with none running. Holding one
+   connection open for the life of the VM avoids both at once, which is
+   the whole reason kdd.py exists.
+
+4.3.  Log And Continue Does Not Work Through A Pipe
+
+   A BREAKPOINT COMMAND ENDING IN gc PRODUCES NO OUTPUT HERE, and
+   produces it silently. The classic tracing shape
+
+       bp xboxctl!XcOnTransfer ".printf \"len %d\\n\", @rdx; gc"
+
+   is correct kd and works at an interactive console. Driven through a
+   pipe it yields nothing at all: kd buffers standard output when that
+   output is not a console, and flushes when it prints a prompt. gc never
+   prompts - that is its purpose - so the text sits in the buffer
+   indefinitely and the breakpoint looks like it never fired.
+
+   THE FAILURE IS INDISTINGUISHABLE FROM THE FUNCTION NOT BEING CALLED.
+   bl still lists the breakpoint as enabled, the guest still runs, and
+   the obvious conclusion - that the code path is not taken - is wrong.
+
+   USE HALTING BREAKPOINTS AND STEP THEM INSTEAD. Set the breakpoint with
+   no command so it stops, then walk the sequence in one batch, reading
+   what is needed at each stop and resuming with g. Each g returns when
+   the next hit arrives, so one client call captures a whole sequence.
+   The guest is frozen only between a hit and its resume.
+
+   The cost is that the last g in a batch has nothing left to catch and
+   waits out its timeout, so keep timeouts short and expect the tail of a
+   batch to run dry.
+
+5.  Symbols
+
+   THE SYMBOL PATH IS PER kd SESSION AND kdd.py REPLAYS NOTHING. A guest
+   reboot that restarts the debugger leaves it empty again, and an empty
+   path is not an error - it is a stack full of bare addresses that reads
+   as a corrupt stack.
+
+   tools/kd-init.kd sets both halves. Replay it after every guest reboot:
+
+       python tools/kdc.py --file tools/kd-init.kd --timeout 150
+
+   Two entries are needed:
+
+       srv*C:\symbols*https://msdl.microsoft.com/download/symbols
+           ntoskrnl, hidclass, usbport. Without these every frame through
+           the kernel is an address.
+
+       N:\DEV\XBOXCTL\src_drv\build\x64\Release
+           xboxctl.sys.pdb, so our frames carry function names and source
+           lines, and dt can print our structures by name.
+
+   THE SECOND PATH IS THE HOST'S, NOT THE GUEST'S. kd runs on the host
+   and reads the build tree directly. The .pdb is never copied into the
+   VM and must not be, since a stale copy there would be found first.
+
+   Confirm with lm m nt, which must say "(pdb symbols)" rather than
+   "(export symbols)" or "(no symbols)".
+
+   THE PDB IS REWRITTEN BY EVERY BUILD. A debugger session that outlives
+   a rebuild is reading symbols for an image the guest is not running;
+   .reload /f xboxctl.sys after a deploy, or accept that every offset is
+   a guess.
+
+6.  Driver Verifier
+
+   TURN IT ON FOR THIS DRIVER BEFORE TRUSTING ANY RESULT. Verifier turns
+   a silent memory or IRQL violation into an immediate bugcheck with the
+   offending call on the stack, instead of a corruption that surfaces
+   somewhere unrelated an hour later.
+
+       verifier /standard /driver xboxctl.sys      (then reboot)
+       verifier /querysettings                     what is armed
+       verifier /reset                             off again, then reboot
+
+   It matters here specifically because the poll engine reuses IRPs
+   across completions, frees them on removal, and completes IRPs it did
+   not allocate. Those are exactly the mistakes the I/O verification
+   option catches and exactly the ones that are invisible without it.
+
+   Expect the guest to be slower and to bugcheck sooner. Both are the
+   point.
+
+7.  Recipes For This Driver
+
+   NOTHING BELOW HAS BEEN RUN AGAINST A LOADED xboxctl.sys YET. The
+   session, the symbol path and break-and-resume are confirmed working;
+   these are the commands to use once the driver installs, not a record
+   of output already seen. Correct them here when they are run for real.
+
+7.1.  Did The Build Land
+
+       lm vm xboxctl
+
+   Before install this prints nothing, which is the right answer rather
+   than a failure. Afterwards it gives the load address and the PDB.
+
+   BOTH THE LOAD ADDRESS AND THE PDB GUID CHANGE ON EVERY BUILD. If
+   neither moved across a deploy, the kernel is still running the
+   previous image - Windows does not replace a mapped image, and
+   deploy.cmd warns when it finds the service already running. That is
+   the one deploy failure that reports success at every step.
+
+       !drvobj xboxctl 7
+
+   The driver object, its dispatch table and its device objects. The
+   dispatch table is worth a look on the first install: hidclass
+   overwrites what DriverEntry installed, so the entries are hidclass's,
+   not ours, and that is correct rather than a symptom.
+
+7.2.  Reaching Our Device Extension
+
+   TWO HOPS, AND CONFUSING THEM MAKES EVERY FIELD WRONG. hidclass owns
+   DeviceObject->DeviceExtension and keeps ours behind its
+   MiniDeviceExtension pointer:
+
+       DEVICE_OBJECT
+         +0x040 DeviceExtension  ->  HID_DEVICE_EXTENSIO---------------+
+                                       +0x00 PhysicalDeviceObjec-------+
+                                       +0x08 NextDeviceObjec-----------+
+                                       +0x10 MiniDeviceExtension -> ours
+
+   So, given a device object address from !drvobj:
+
+       dt nt!_DEVICE_OBJECT <devobj> DeviceExtension
+       dq <that> L3                      third pointer is ours
+       dt xboxctl!_XC_DEVEXT <that>
+
+   The offsets above are the x64 layout of three pointers and are
+   INFERENCE from the structure, not measured. Read the third pointer
+   rather than trusting the number.
+
+   The fields worth reading first, all of them counters the harness also
+   asserts on:
+
+       dt xboxctl!_XC_DEVEXT <addr> Started Removed PollStopMask ^
+           IoCount IoDraining ReportCount PendingReadCount ^
+           ReportsDropped PollErrors PollInterval
+
+   PollInterval IS THE ONE NUMBER THIS PROJECT STILL OWES ITSELF. It is
+   bInterval as the endpoint reported it, captured at StartDevice, and
+   the emission-rate reasoning in analog-to-mouse.txt section 3.3 rests
+   on a guess until it is read here. Record it in driver-plan.txt
+   section 6 once it is known.
+
+7.3.  Watching A Packet Arrive
+
+   A halting breakpoint, stepped, per section 4.3:
+
+       bp xboxctl!XcOnTransfer
+       g
+
+   On each hit, the raw packet and what the engine made of it:
+
+       db @r8 L14                        the 20 raw bytes
+       dt xboxctl!_XC_DEVEXT <addr> ReportCount
+       g
+
+   THE PAD REPORTS ON EVERY POLL WHETHER OR NOT ANYTHING CHANGED, so
+   this breakpoint fires continuously at the endpoint rate. Expect to
+   have to disable it - bd 0 - rather than to wait for it.
+
+   To see what left the driver instead, break where reports meet the OS:
+
+       bp xboxctl!XcReportSink
+
+   with the report id in the second argument register.
+
+   ARGUMENT REGISTERS ARE x64 CALLING CONVENTION - rcx, rdx, r8, r9 - and
+   only at function entry, before the prologue has moved them. A
+   breakpoint set on a line rather than the symbol will read registers
+   that no longer hold arguments.
+
+7.4.  After A Bugcheck
+
+       !analyze -v
+
+   is the first command and usually the last one needed. With our PDB on
+   the path the faulting frame names a function and a source line.
+
+   For the teardown class of fault specifically - a completion landing in
+   freed memory - the useful follow-ups are:
+
+       !irp <address>          from the analyze output
+       !verifier 3 xboxctl.sys pool tracking, if verifier is on
+       lm vm xboxctl           confirm the image matches the PDB
+
+   A BUGCHECK ON UNPLUG IS THE SHAPE TO SUSPECT FIRST. The driver keeps
+   an in-flight transfer count for exactly this reason; if one appears,
+   read IoCount and IoDraining before anything else, because a nonzero
+   count at the moment of the fault says the drain was skipped rather
+   than that it failed.
+
+7.5.  The Pad Has To Reach The Guest First
+
+   A DRIVER THAT NEVER SEES A DEVICE LOOKS EXACTLY LIKE A DRIVER THAT
+   FAILED. pnputil /add-driver /install stages the package and installs it
+   onto MATCHING PRESENT DEVICES; with no pad in the guest there is
+   nothing to install onto, so the INF's AddService never runs. The result
+   is a correctly staged, correctly signed package with no service, no
+   device node, no HID children and nothing loaded - and every one of
+   those reads as a driver fault.
+
+   Check the package first. state.cmd section 1 naming our INF with a
+   Signer Name that is not Unknown means the package half is sound, and
+   the question is the pad.
+
+   VIRTUALBOX NEEDS A USB CONTROLLER THE DEVICE CAN LIVE ON. The original
+   Xbox controller is USB 1.1 full speed, which is OHCI. A VM configured
+   with xHCI alone cannot take it and the attach fails with
+
+       is busy with a previous request     E_INVALIDARG
+
+   while VBoxManage list usbhost reports the device as Captured - taken
+   from the host and delivered nowhere. Read the VM's actual controllers
+   rather than the GUI checkbox:
+
+       VBoxManage showvminfo "<vm>" --machinereadable ^
+           | findstr /i "usb ehci xhci"
+
+   usb= is OHCI. EHCI and xHCI need the Oracle Extension Pack, matched to
+   the VirtualBox version; OHCI does not, and is the right controller for
+   this device regardless. With the VM powered off:
+
+       VBoxManage modifyvm "<vm>" --usb-ohci on
+       VBoxManage usbfilter add 0 --target "<vm>" --name "Xbox pad" ^
+           --vendorid 045E --productid 0285
+
+   A FILTER BEATS ATTACHING BY HAND, because it captures the device as it
+   arrives rather than trying to take it from a host that has already
+   enumerated it.
+
+8.  When It Does Not Connect
+
+   IN ORDER OF HOW OFTEN EACH IS THE ANSWER:
+
+   The VM is not running, so the pipe does not exist. VirtualBox creates
+   it at power-on and destroys it at power-off.
+
+   The port is in client mode. "Connect to existing pipe" must be
+   unticked; see section 1.
+
+   The guest was not rebooted after bcdedit /debug on.
+
+   Another kd already holds the pipe. kdd.py is meant to be the only one;
+   check with python tools/kdc.py --status before starting a second.
+
+   A previous session quit while halted, so the guest is sitting at an
+   int 3 with nothing to release it and the VM looks frozen. Section 4.2.
+   A hard restart of the guest is the only way out.
+
+   The pipe name does not match between VirtualBox and the daemon. The
+   daemon reports what it is using:
+
+       python tools/kdc.py --status

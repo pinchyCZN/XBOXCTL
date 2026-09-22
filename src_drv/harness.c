@@ -23,6 +23,15 @@
  * THE KERNEL STUBS
  * ====================================================================== */
 
+/*
+ * Declared before the stubs because one of them reports a failure: a wait
+ * on an unsignalled event would hang a real driver, and the harness has to
+ * say so rather than sail past it.
+ */
+static int g_Checks = 0;
+static int g_Failures = 0;
+
+
 static ULONGLONG g_InterruptTime = 0;
 
 ULONGLONG KeQueryInterruptTime(void)
@@ -96,6 +105,52 @@ void KstubFireTimer(PKTIMER Timer)
 	}
 }
 
+void KeFlushQueuedDpcs(void)
+{
+	/* Single threaded: no DPC can be running. */
+}
+
+void KeInitializeEvent(PKEVENT Event, int Type, BOOLEAN State)
+{
+	(void)Type;
+	Event->Signalled = State ? 1 : 0;
+}
+
+LONG KeSetEvent(PKEVENT Event, int Increment, BOOLEAN Wait)
+{
+	LONG was = Event->Signalled;
+
+	(void)Increment;
+	(void)Wait;
+	Event->Signalled = 1;
+	return was;
+}
+
+/*
+ * A wait that cannot block is the honest stub here. The harness is single
+ * threaded, so anything the driver waits for has already happened by the
+ * time it waits - and a wait that blocked would simply deadlock rather than
+ * model anything. A test asserts on the COUNT reaching zero instead, which
+ * is the property the wait exists to guarantee.
+ */
+NTSTATUS KeWaitForSingleObject(PVOID Object, int Reason, int Mode,
+                               BOOLEAN Alertable, PVOID Timeout)
+{
+	PKEVENT event = (PKEVENT)Object;
+
+	(void)Reason;
+	(void)Mode;
+	(void)Alertable;
+	(void)Timeout;
+
+	if (event != NULL && !event->Signalled) {
+		printf("  FAIL  waited on an unsignalled event - a real driver "
+		       "would hang here\n");
+		g_Failures++;
+	}
+	return STATUS_SUCCESS;
+}
+
 PVOID ExAllocatePoolWithTag(POOL_TYPE Type, ULONG Bytes, ULONG Tag)
 {
 	(void)Type;
@@ -165,9 +220,6 @@ NTSTATUS HidRegisterMinidriver(PHID_MINIDRIVER_REGISTRATION Registration)
 /* ======================================================================
  * TEST SCAFFOLDING
  * ====================================================================== */
-
-static int g_Checks = 0;
-static int g_Failures = 0;
 
 static void check(int condition, const char *what)
 {
@@ -697,10 +749,63 @@ static int test_transport(void)
 	check_eq(node.Data[1 + CORE_GP_RAW + CORE_RAW_DIGITAL], CORE_DIG_BACK,
 	         "the raw packet rides along in the diagnostic tail");
 
+	/* The right stick must land on Rx/Ry, not on Z. Anything that
+	 * auto-maps a gamepad expects it there. */
+	make_packet(packet);
+	put_le16(&packet[CORE_RAW_RSTICK_X], 32767);
+	XcOnTransfer(&devext, STATUS_SUCCESS, packet,
+	             CORE_RAW_PACKET_BYTES, 4000);
+	check(XcDequeueReport(&devext, &node), "report queued");
+	{
+		const u8 *ax = &node.Data[1 + CORE_GP_AXES];
+		s16 z  = (s16)(ax[4] | (ax[5] << 8));
+		s16 rx = (s16)(ax[6] | (ax[7] << 8));
+
+		check(rx > 32000, "right stick X drives Rx");
+		check_eq(z, 0, "and leaves Z alone");
+	}
+
 	/* Stopping releases the engine and disarms the tick. */
 	XcStopDevice(&devext);
 	check(!devext.Started, "device stopped");
 	check(!devext.TickArmed, "tick disarmed");
+
+	return 0;
+}
+
+/* ======================================================================
+ * TEARDOWN
+ *
+ * IoCancelIrp only ASKS; the bus driver completes the transfer some time
+ * later. Freeing the IRP on the strength of having called it means the
+ * completion lands in freed memory - a bugcheck on unplug, which is the
+ * single most likely thing to happen during testing.
+ * ====================================================================== */
+
+static int test_teardown(void)
+{
+	static XC_DEVEXT devext;
+
+	XcDevExtInit(&devext);
+	check_eq(devext.IoCount, 1, "one reference, held by the device");
+
+	XcStartDevice((PDEVICE_OBJECT)&devext, NULL);
+	check_eq(devext.IoCount, 3, "plus one per transfer in flight");
+
+	XcRemoveDevice(&devext);
+	check_eq(devext.IoCount, 0, "teardown waits for every one of them");
+	check(devext.IoDraining, "and refuses new ones");
+	check(devext.Removed, "device marked removed");
+
+	/* A completion arriving mid-teardown must not restart polling. */
+	check(!XcIoAcquire(&devext), "a late submit is refused");
+	check_eq((long)XcPollSubmit(&devext, 0), (long)STATUS_DELETE_PENDING,
+	         "and XcPollSubmit says why");
+	check(!devext.Poll[0].Active, "the slot stays inactive");
+
+	/* Draining twice must not double-decrement the device's reference. */
+	XcIoDrainAndWait(&devext);
+	check_eq(devext.IoCount, 0, "a second drain is a no-op");
 
 	return 0;
 }
@@ -744,6 +849,7 @@ int main(int argc, char **argv)
 	printf("[mouse]\n");        test_mouse();
 	printf("[queue]\n");        test_queue();
 	printf("[transport]\n");    test_transport();
+	printf("[teardown]\n");     test_teardown();
 	printf("[registration]\n"); test_driver_entry();
 
 	printf("---------------\n");

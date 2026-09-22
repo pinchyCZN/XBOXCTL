@@ -11,11 +11,14 @@
 ; A hardware-ID match outranks the generic compatible-ID match, so PnP loads
 ; this rather than the inbox path.
 ;
-; UNSIGNED. 64-bit Windows will not load this without test signing enabled:
+; TEST SIGNED. tools\signdriver.cmd signs both xboxctl.sys and the catalogue
+; named above with a shared self-signed identity, CN=Adaptoid Test Signing.
+; 64-bit Windows loads that only with test signing enabled:
 ;
 ;     bcdedit /set testsigning on        (then reboot)
 ;
-; and the driver must carry a test certificate. See README.txt section 6.
+; and the certificate trusted in BOTH the Root and TrustedPublisher stores -
+; tools	rustcert.cmd does that. See README.txt section 6.
 ;
 
 [Version]
@@ -23,7 +26,7 @@ Signature   = "$WINDOWS NT$"
 Class       = HIDClass
 ClassGuid   = {745A17A0-74D3-11D0-B6FE-00A0C90F57DA}
 Provider    = %ProviderName%
-DriverVer   = 09/22/2026,0.1.0922.0300
+DriverVer   = 09/22/2026,0.1.0922.1450
 CatalogFile = xboxctl.cat
 PnpLockdown = 1
 

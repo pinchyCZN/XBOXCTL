@@ -357,6 +357,21 @@ Table of Contents
    | 18-19 | Right stick Y, signed 16-bit little endian                     |
    +-------+----------------------------------------------------------------+
 
+   THE PAD IS NOT A HID DEVICE AND NOTHING INBOX CLAIMS IT. Its interface
+   is class 0x58, subclass 0x42, so PnP offers these compatible IDs and no
+   others, read off a live controller:
+
+       USB\Class_58&SubClass_42&Prot_00
+       USB\Class_58&SubClass_42
+       USB\Class_58
+
+   0x58 is not HID class 3, so hidusb never matches and there is no
+   fallback driver of any kind. With no driver installed the pad is an
+   Unknown device in Device Manager, which is why the 20-byte format
+   below had to be worked out rather than read from a descriptor - and
+   why a failed install here is unambiguous rather than something that
+   masquerades as a working game controller.
+
    Y IS UP-POSITIVE, the opposite of the HID convention, and XBCD does
    not negate it. It splits the value into two unipolar semiaxes and lets
    the map matrix decide which output half each one drives, so the sign

@@ -187,17 +187,36 @@ Table of Contents
 6.  Installing It
 
    WINDOWS 10 AND 11 ON x64 WILL NOT LOAD AN UNSIGNED DRIVER. For
-   development:
+   development, test signing plus a self-signed certificate in both the
+   Trusted Root and Trusted Publishers stores. For anything shared,
+   attestation signing through Partner Center covers a non-WHQL driver.
 
-       bcdedit /set testsigning on
-       shutdown /r /t 0
+   ../tools carries the whole loop. Host side, once:
 
-   then create a test certificate, sign xboxctl.sys with it, and install
-   the certificate into the machine's Trusted Root and Trusted Publishers
-   stores. For anything shared, attestation signing through Partner
-   Center covers a non-WHQL driver.
+       tools\mktestcert.cmd          creates the test certificate
 
-   Install with the INF through Device Manager, or with pnputil:
+   Host side, every build:
+
+       tools\package.cmd [dest]      build, run the harness, stamp
+                                     DriverVer, sign, build and sign the
+                                     catalogue, stage to the share
+
+   Guest side, from an ELEVATED prompt. Once per VM:
+
+       trustcert.cmd                 both certificate stores, and checks
+                                     testsigning and Secure Boot
+
+   Guest side, every build:
+
+       deploy.cmd                    remove nodes, remove stale packages,
+                                     install, rescan
+       state.cmd                     what is actually installed and bound
+       undeploy.cmd                  back to a clean slate
+
+   package.cmd copies the four guest-side scripts and the .cer next to
+   the staged package, so the guest needs no view of the source tree.
+
+   Doing it by hand instead:
 
        pnputil /add-driver xboxctl.inf /install
 
@@ -215,6 +234,36 @@ Table of Contents
    A KERNEL DEBUGGER IS NOT OPTIONAL for bring-up. A fault in a HID
    minidriver takes the machine down with it, and the input stack is not
    something a target can be debugged over.
+
+   A GHOST DEVICE NODE OUTRANKS GOOD INTENTIONS. A key under
+   Enum\USB\VID_045E&PID_xxxx with no Service and no DeviceDesc is a pad
+   that was plugged in once and never got a driver. Driver selection is
+   sticky per node, so a leftover keeps its old decision and a freshly
+   installed package is never reconsidered. deploy.cmd removes the nodes
+   it can find; Device Manager with "Show hidden devices" turned on shows
+   the rest.
+
+6.1.  The Ampersand Trap In The Scripts
+
+   Three of the guest-side scripts loop over the five hardware IDs, and
+   the list CANNOT live in a variable.
+
+   cmd finishes expanding %VAR% and !VAR! before it finishes tokenising
+   the line, so an ampersand arriving from a variable is re-read as a
+   command separator. A for whose set comes from one fails with
+
+       'PID_0202" "VID_045E' is not recognized as an internal or
+       external command
+
+   once per entry, and the loop body never runs - while the script as a
+   whole carries on and reports success. Delayed expansion does not help;
+   measured, it fails identically.
+
+   Quoted literals written into the for itself are tokenised with their
+   quotes already in place, so the ampersand stays text. Each script
+   therefore keeps its list in one :eachHwid subroutine that calls a
+   handler per id, and passes the id on as a quoted argument - safe for
+   the same reason, since %~1 is read after tokenising is done.
 
 7.  What Is Built And What Is Stubbed
 

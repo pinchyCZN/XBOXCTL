@@ -129,6 +129,20 @@ typedef struct _XC_DEVEXT {
 	ULONG               PollStopMask;
 	KSPIN_LOCK          PollLock;
 
+	/*
+	 * IN-FLIGHT TRANSFER COUNT, and it is what makes teardown safe.
+	 *
+	 * IoCancelIrp is asynchronous: it asks, and the bus driver completes
+	 * the transfer some time later. Freeing the IRP on the strength of
+	 * having called it means the completion lands in freed memory. The
+	 * count starts at one - a reference held by the device itself - and
+	 * each submitted transfer takes another; teardown drops the device's
+	 * reference and waits for the rest.
+	 */
+	LONG                IoCount;
+	BOOLEAN             IoDraining;
+	KEVENT              IoIdle;
+
 	/* --- the report queue and the pending reads --- */
 	XC_REPORT_NODE      ReportQueue[XC_REPORT_QUEUE_MAX];
 	ULONG               ReportHead;
@@ -199,6 +213,18 @@ int      XcDequeueReport(PXC_DEVEXT DevExt, XC_REPORT_NODE *out);
 
 NTSTATUS XcStartDevice(PDEVICE_OBJECT Fdo, PIRP Irp);
 void     XcStopDevice(PXC_DEVEXT DevExt);
+
+/*
+ * Teardown. Stops polling, waits for every transfer already in flight to
+ * come back, and only then frees the IRPs they would complete into.
+ */
+void     XcRemoveDevice(PXC_DEVEXT DevExt);
+
+/* The in-flight count of section XC_DEVEXT. Acquire refuses once draining
+ * has begun, which is what stops a completion resubmitting into teardown. */
+BOOLEAN  XcIoAcquire(PXC_DEVEXT DevExt);
+void     XcIoRelease(PXC_DEVEXT DevExt);
+void     XcIoDrainAndWait(PXC_DEVEXT DevExt);
 
 NTSTATUS XcPollStart(PXC_DEVEXT DevExt, ULONG Reason);
 void     XcPollStop(PXC_DEVEXT DevExt, ULONG Reason);

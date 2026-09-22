@@ -269,6 +269,69 @@ static void XcCancelPendingReads(PXC_DEVEXT DevExt)
 }
 
 /* ======================================================================
+ * THE IN-FLIGHT COUNT
+ *
+ * A hand-rolled remove lock, scoped to the one thing that needs it: the
+ * transfers the poll engine has outstanding.
+ *
+ * The count starts at one, a reference held by the device itself. Each
+ * submitted transfer takes another and its completion drops it.
+ * XcIoDrainAndWait stops further acquires, drops the device's reference and
+ * waits for the rest, so by the time it returns nothing can complete into
+ * memory that is about to be freed.
+ * ====================================================================== */
+
+BOOLEAN XcIoAcquire(PXC_DEVEXT DevExt)
+{
+	KIRQL   irql;
+	BOOLEAN ok = FALSE;
+
+	KeAcquireSpinLock(&DevExt->PollLock, &irql);
+	if (!DevExt->IoDraining) {
+		DevExt->IoCount++;
+		ok = TRUE;
+	}
+	KeReleaseSpinLock(&DevExt->PollLock, irql);
+	return ok;
+}
+
+void XcIoRelease(PXC_DEVEXT DevExt)
+{
+	KIRQL irql;
+	LONG  remaining;
+
+	KeAcquireSpinLock(&DevExt->PollLock, &irql);
+	remaining = --DevExt->IoCount;
+	KeReleaseSpinLock(&DevExt->PollLock, irql);
+
+	if (remaining == 0) {
+		KeSetEvent(&DevExt->IoIdle, IO_NO_INCREMENT, FALSE);
+	}
+}
+
+void XcIoDrainAndWait(PXC_DEVEXT DevExt)
+{
+	KIRQL irql;
+	LONG  remaining;
+
+	KeAcquireSpinLock(&DevExt->PollLock, &irql);
+	if (DevExt->IoDraining) {
+		/* Already drained. Draining twice would decrement a reference
+		 * that is no longer held. */
+		KeReleaseSpinLock(&DevExt->PollLock, irql);
+		return;
+	}
+	DevExt->IoDraining = TRUE;
+	remaining = --DevExt->IoCount;
+	KeReleaseSpinLock(&DevExt->PollLock, irql);
+
+	if (remaining > 0) {
+		KeWaitForSingleObject(&DevExt->IoIdle, Executive, KernelMode,
+		                      FALSE, NULL);
+	}
+}
+
+/* ======================================================================
  * THE POLL ENGINE
  * ====================================================================== */
 
@@ -325,12 +388,19 @@ static NTSTATUS XcPollComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
 	/*
 	 * Resubmit this slot immediately. The other slot is still in flight,
 	 * so the endpoint is never left unqueued.
+	 *
+	 * RESUBMIT BEFORE RELEASING. The new transfer takes its own reference
+	 * while this one still holds its own, so the count never touches zero
+	 * while polling is meant to continue - and a drain that runs in
+	 * between cannot conclude the device is idle when it is not.
 	 */
 	if (DevExt->PollStopMask == 0 && !DevExt->Removed) {
 		XcPollSubmit(DevExt, slot->Index);
 	} else {
 		slot->Active = FALSE;
 	}
+
+	XcIoRelease(DevExt);
 
 	/* The IRP is ours and is reused, so the I/O manager must not touch
 	 * it after this returns. */
@@ -344,6 +414,13 @@ NTSTATUS XcPollSubmit(PXC_DEVEXT DevExt, ULONG SlotIndex)
 
 	if (slot->Irp == NULL || slot->Urb == NULL) {
 		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	/* A refused reference means teardown has begun; do not start work
+	 * that would complete into memory about to be freed. */
+	if (!XcIoAcquire(DevExt)) {
+		slot->Active = FALSE;
+		return STATUS_DELETE_PENDING;
 	}
 
 	UsbBuildInterruptOrBulkTransferRequest(
@@ -415,6 +492,10 @@ static void XcPollFree(PXC_DEVEXT DevExt)
 
 NTSTATUS XcPollSubmit(PXC_DEVEXT DevExt, ULONG SlotIndex)
 {
+	if (!XcIoAcquire(DevExt)) {
+		DevExt->Poll[SlotIndex].Active = FALSE;
+		return STATUS_DELETE_PENDING;
+	}
 	DevExt->Poll[SlotIndex].Active = TRUE;
 	return STATUS_SUCCESS;
 }
@@ -468,9 +549,32 @@ void XcPollStop(PXC_DEVEXT DevExt, ULONG Reason)
 		}
 	}
 #else
+	/* The driver build drops each transfer's reference from
+	 * XcPollComplete when the cancelled transfer comes back. There is no
+	 * completion here, so the cancel stands in for it. */
 	for (i = 0; i < XC_POLL_SLOTS; i++) {
-		DevExt->Poll[i].Active = FALSE;
+		if (DevExt->Poll[i].Active) {
+			DevExt->Poll[i].Active = FALSE;
+			XcIoRelease(DevExt);
+		}
 	}
+#endif
+}
+
+/*
+ * Teardown, in the one order that is safe: stop asking, wait for what was
+ * already asked to come back, and only then free what it completes into.
+ */
+void XcRemoveDevice(PXC_DEVEXT DevExt)
+{
+	DevExt->Removed = TRUE;
+
+	XcStopDevice(DevExt);
+	XcPollStop(DevExt, XC_STOP_REMOVING);
+	XcIoDrainAndWait(DevExt);
+
+#ifndef XBOXCTL_USERMODE
+	XcPollFree(DevExt);
 #endif
 }
 
@@ -640,6 +744,11 @@ void XcDevExtInit(PXC_DEVEXT DevExt)
 	KeInitializeSpinLock(&DevExt->CoreLock);
 	InitializeListHead(&DevExt->PendingReads);
 
+	/* One reference, held by the device. XcIoDrainAndWait drops it. */
+	DevExt->IoCount = 1;
+	DevExt->IoDraining = FALSE;
+	KeInitializeEvent(&DevExt->IoIdle, NotificationEvent, FALSE);
+
 	/* Every stop reason starts asserted; StartDevice clears the first. */
 	DevExt->PollStopMask = XC_STOP_NOT_STARTED;
 
@@ -655,6 +764,12 @@ void XcStopDevice(PXC_DEVEXT DevExt)
 	if (DevExt->TickArmed) {
 		KeCancelTimer(&DevExt->Tick);
 		DevExt->TickArmed = FALSE;
+		/*
+		 * CANCELLING A TIMER DOES NOT WAIT FOR A DPC ALREADY RUNNING.
+		 * Its routine touches the engine, so it has to be known
+		 * finished before anything below frees or resets it.
+		 */
+		KeFlushQueuedDpcs();
 	}
 
 	/*
@@ -898,9 +1013,7 @@ NTSTATUS NTAPI XcPnp(PDEVICE_OBJECT Fdo, PIRP Irp)
 		break;
 
 	case IRP_MN_REMOVE_DEVICE:
-		DevExt->Removed = TRUE;
-		XcStopDevice(DevExt);
-		XcPollFree(DevExt);
+		XcRemoveDevice(DevExt);
 		break;
 
 	case IRP_MN_QUERY_REMOVE_DEVICE:

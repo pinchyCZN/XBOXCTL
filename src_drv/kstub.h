@@ -142,6 +142,22 @@ ULONGLONG KeQueryInterruptTime(void);
 void KstubSetInterruptTime(ULONGLONG Now100ns);
 void KstubAdvanceMs(ULONG Milliseconds);
 
+/* ---- events ------------------------------------------------------- */
+
+typedef struct _KEVENT {
+	LONG Signalled;
+} KEVENT, *PKEVENT;
+
+#define NotificationEvent   0
+#define SynchronizationEvent 1
+#define Executive           0
+#define KernelMode          0
+
+void     KeInitializeEvent(PKEVENT Event, int Type, BOOLEAN State);
+LONG     KeSetEvent(PKEVENT Event, int Increment, BOOLEAN Wait);
+NTSTATUS KeWaitForSingleObject(PVOID Object, int Reason, int Mode,
+                               BOOLEAN Alertable, PVOID Timeout);
+
 /* ---- DPCs and timers ---------------------------------------------- */
 
 struct _KDPC;
@@ -171,6 +187,10 @@ BOOLEAN KeCancelTimer(PKTIMER Timer);
 
 /* Fire the timer DPC by hand. Harness only. */
 void KstubFireTimer(PKTIMER Timer);
+
+/* The driver build waits for any DPC already running to finish before it
+ * frees what one might touch. The harness has no second thread. */
+void KeFlushQueuedDpcs(void);
 
 /* ---- memory ------------------------------------------------------- */
 

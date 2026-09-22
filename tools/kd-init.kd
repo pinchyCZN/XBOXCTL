@@ -1,0 +1,30 @@
+$$ kd-init.kd - symbol setup. Replay after every guest reboot.
+$$
+$$     python tools/kdc.py --file tools/kd-init.kd --timeout 150
+$$
+$$ THE SYMBOL PATH DOES NOT SURVIVE A NEW kd SESSION. kdd.py replays
+$$ nothing on connect, so a VM reboot that restarts the debugger leaves
+$$ the path empty again - and an empty path is not an error, it is a
+$$ stack trace full of bare addresses that reads as a corrupt stack.
+$$
+$$ Two entries, and both are needed:
+$$   the Microsoft store  - ntoskrnl, hidclass, usbport. Without these
+$$                          every frame through the kernel is an address.
+$$   our own build output - xboxctl.sys.pdb, so our frames carry function
+$$                          names and source lines. The linker writes it
+$$                          beside the .sys; /Z7 puts the rest in the objs.
+$$
+$$ THE SECOND PATH IS THE HOST'S, NOT THE GUEST'S. kd runs on the host, so
+$$ it reads the build tree directly - the .pdb never has to be copied into
+$$ the VM, and must not be, since a stale copy there would be found first.
+
+.sympath srv*C:\symbols*https://msdl.microsoft.com/download/symbols;N:\DEV\XBOXCTL\src_drv\build\x64\Release
+.reload
+
+$$ Proof the path took. nt must say "pdb symbols", not "export symbols"
+$$ and not "no symbols".
+lm m nt
+
+$$ Our driver, once it is installed. Before that this prints nothing,
+$$ which is the correct answer rather than a failure.
+lm vm xboxctl
