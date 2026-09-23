@@ -506,7 +506,9 @@ typedef struct _core_mouse_state {
 typedef struct _core_bind_state {
 	u8  active;             /* the source is past its threshold  */
 	u8  latched;            /* TOGGLE output, independent of it  */
-	u8  reserved[2];
+	u8  repeat_on;          /* the asserted half of the cycle    */
+	u8  repeat_done;        /* NO_REPEAT_FIRST has had its turn  */
+	u64 repeat_at;          /* when the next flip falls due      */
 } core_bind_state;
 
 /*

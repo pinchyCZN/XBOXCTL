@@ -824,8 +824,86 @@ static void core_apply_action(core_state *cs, const core_binding *b,
 	}
 }
 
+/*
+ * ======================================================================
+ * REPEAT, ALSO KNOWN AS AUTOFIRE
+ *
+ * ../docs/mapping-engine.txt section 6. The action is asserted at once,
+ * held for repeat_delay_ms, and then alternates every half period until
+ * the binding deactivates.
+ *
+ * A HID REPORT CARRIES STATE, NOT EVENTS, so a press and a release inside
+ * one report are invisible: the host compares before with after and they
+ * are identical. Autofire therefore cannot be a burst of presses inside a
+ * single report - it has to be an alternating output that the ordinary
+ * emit-on-change path turns into reports.
+ *
+ * DEADLINES ARE DRIVEN BY WHICHEVER CLOCK ARRIVES FIRST, the packet or
+ * the tick. Packets come every 4ms and the tick only every 16, so at any
+ * usable rate the packets do the work and the tick is what keeps a cycle
+ * moving if they are late.
+ *
+ * Returns whether the action fires THIS pass - the initial assertion or
+ * a repeat re-assertion - which is what the actions with no held state,
+ * the wheel and the pointer nudge, are driven by.
+ */
+static int core_repeat(const core_binding *b, core_bind_state *st,
+                       int edge, int *asserted, u64 now_100ns)
+{
+	u64 half;
+	int fired = edge;
+
+	if (!(b->flags & CORE_BF_REPEAT) || b->repeat_hz == 0) {
+		return fired;
+	}
+
+	if (!*asserted) {
+		/* RESET ON RELEASE, whatever half the cycle was in. A cycle
+		 * left mid-flight would resume from where it stopped the next
+		 * time the control was touched. */
+		st->repeat_on   = 0;
+		st->repeat_done = 0;
+		st->repeat_at   = 0;
+		return 0;
+	}
+
+	/* Half a period, in 100ns units. One second is 10,000,000 of them. */
+	half = 10000000u / ((u64)b->repeat_hz * 2u);
+	if (half == 0) {
+		half = 1;
+	}
+
+	if (edge || st->repeat_at == 0) {
+		/*
+		 * THE FIRST INTERVAL IS THE DELAY, IF THERE IS ONE. That is
+		 * what makes a held control behave like a keyboard: one
+		 * press, a pause, then repetition.
+		 */
+		st->repeat_on   = 1;
+		st->repeat_done = 0;
+		st->repeat_at   = now_100ns +
+		        (b->repeat_delay_ms
+		         ? (u64)b->repeat_delay_ms * CORE_100NS_PER_MS
+		         : half);
+		fired = 1;
+	} else if (!st->repeat_done && now_100ns >= st->repeat_at) {
+		st->repeat_on = (u8)(!st->repeat_on);
+		st->repeat_at = now_100ns + half;
+		if (st->repeat_on) {
+			fired = 1;
+		} else if (b->flags & CORE_BF_NO_REPEAT_FIRST) {
+			/* One cycle only: assert, wait, release, stop. A
+			 * delayed single shot rather than a repeat. */
+			st->repeat_done = 1;
+		}
+	}
+
+	*asserted = st->repeat_on;
+	return fired;
+}
+
 static void core_apply_binding(core_state *cs, const core_binding *b,
-                               core_bind_state *st)
+                               core_bind_state *st, u64 now_100ns)
 {
 	s32 value;
 	int active;
@@ -862,6 +940,8 @@ static void core_apply_binding(core_state *cs, const core_binding *b,
 
 	asserted = (b->flags & CORE_BF_TOGGLE) ? st->latched : active;
 
+	edge = core_repeat(b, st, edge, &asserted, now_100ns);
+
 	core_apply_action(cs, b, value, asserted, edge);
 }
 
@@ -871,7 +951,7 @@ static void core_apply_binding(core_state *cs, const core_binding *b,
  * switches to could be shadowed by that layer, and the pad would be stuck
  * there with nothing left holding the way out.
  */
-static u32 core_resolve_hold(core_state *cs, u32 base)
+static u32 core_resolve_hold(core_state *cs, u32 base, u64 now_100ns)
 {
 	u32 effective = base;
 	u32 i;
@@ -882,7 +962,7 @@ static u32 core_resolve_hold(core_state *cs, u32 base)
 		if (b->action != CORE_ACT_LAYER_HOLD) {
 			continue;
 		}
-		core_apply_binding(cs, b, &cs->bind[0][i]);
+		core_apply_binding(cs, b, &cs->bind[0][i], now_100ns);
 
 		if (cs->bind[0][i].active && b->code < cs->cfg.layout_count) {
 			/* Highest-numbered active hold wins. Arbitrary, but
@@ -895,7 +975,7 @@ static u32 core_resolve_hold(core_state *cs, u32 base)
 	return effective;
 }
 
-static void core_evaluate(core_state *cs)
+static void core_evaluate(core_state *cs, u64 now_100ns)
 {
 	u32 layer;
 	u32 i;
@@ -926,7 +1006,7 @@ static void core_evaluate(core_state *cs)
 	 */
 	core_chords_evaluate(cs, layer);
 
-	layer = core_resolve_hold(cs, cs->layer_base);
+	layer = core_resolve_hold(cs, cs->layer_base, now_100ns);
 	if (core_layer_change(cs, (u8)layer)) {
 		changed = 1;
 	}
@@ -950,7 +1030,7 @@ static void core_evaluate(core_state *cs)
 		if (b->action == CORE_ACT_LAYER_HOLD && layer == 0) {
 			continue;
 		}
-		core_apply_binding(cs, b, &cs->bind[layer][i]);
+		core_apply_binding(cs, b, &cs->bind[layer][i], now_100ns);
 	}
 }
 
@@ -1257,7 +1337,7 @@ void core_on_packet(core_state *cs, const u8 *raw, u32 len, u64 now_100ns)
 	}
 
 	core_decode(cs);
-	core_evaluate(cs);
+	core_evaluate(cs, now_100ns);
 	core_emit_gamepad(cs);
 }
 
@@ -1287,13 +1367,23 @@ void core_tick(core_state *cs, u64 now_100ns)
 		elapsed_ms = CORE_MAX_TICK_MS;
 	}
 
-	/*
-	 * Autofire deadlines and the mouse velocity accumulator both live
-	 * here. Neither exists until the binding table does; see
-	 * ../docs/mapping-engine.txt section 6 and
-	 * ../docs/analog-to-mouse.txt section 3.2.
-	 */
 	(void)elapsed_ms;
+
+	/*
+	 * RE-RUN THE EVALUATION ON THE LAST PACKET SEEN. Repeat
+	 * deadlines are a function of time rather than of packet
+	 * arrival, so a cycle has to keep moving even when nothing new
+	 * has come in. Packets normally get there first at 4ms against
+	 * this timer's 16; this is what covers the gap when they do
+	 * not.
+	 *
+	 * WITH NO PACKET YET THERE IS NOTHING TO EVALUATE, and the
+	 * decoded state would be all zeroes rather than merely stale.
+	 */
+	if (cs->raw_valid) {
+		core_evaluate(cs, now_100ns);
+		core_emit_gamepad(cs);
+	}
 }
 
 /* ======================================================================

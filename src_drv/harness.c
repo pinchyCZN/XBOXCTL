@@ -1691,6 +1691,282 @@ static int test_chords(void)
 }
 
 /* ======================================================================
+ * AUTOFIRE
+ *
+ * ../docs/mapping-engine.txt section 6. A HID report carries state, not
+ * events, so a press and a release inside one report are invisible to the
+ * host. Autofire has to be an alternating output that the ordinary
+ * emit-on-change path turns into reports, not a burst inside one.
+ * ====================================================================== */
+
+/* How many times a gamepad button went from clear to set across the
+ * reports collected since the last sink_reset. */
+static long sink_button_presses(u16 bit)
+{
+	long presses = 0;
+	int  was = 0;
+	int  i;
+
+	for (i = 0; i < g_SinkCount; i++) {
+		const u8 *p;
+		int       now;
+
+		if (g_Sink[i].id != CORE_REPORT_ID_GAMEPAD) {
+			continue;
+		}
+		p = &g_Sink[i].payload[CORE_GP_BUTTONS];
+		now = ((u16)(p[0] | (p[1] << 8)) & bit) ? 1 : 0;
+		if (now && !was) {
+			presses++;
+		}
+		was = now;
+	}
+	return presses;
+}
+
+static int test_autofire(void)
+{
+	static core_config cfg;
+	core_state         cs;
+	u8                 packet[CORE_RAW_PACKET_BYTES];
+	u8                 blob[4096];
+	u32                len;
+	u64                t = 1000;
+	const u64          PACKET = 4 * CORE_100NS_PER_MS;
+	int                k;
+
+	/* --- A at 10 Hz, no delay ------------------------------------- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	cfg.layout[0].binding[1].source    = CORE_SA_A;
+	cfg.layout[0].binding[1].action    = CORE_ACT_JOY_BUTTON;
+	cfg.layout[0].binding[1].code      = 1;
+	cfg.layout[0].binding[1].flags     = CORE_BF_REPEAT;
+	cfg.layout[0].binding[1].repeat_hz = 10;
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	check_eq(core_set_config(&cs, blob, len, NULL), CORE_CFG_OK,
+	         "an autofire binding installs");
+
+	make_packet(packet);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	sink_reset();
+
+	/* Hold A for one second: 250 packets at 4ms. */
+	packet[CORE_RAW_ANALOG_BASE + 0] = 255;
+	for (k = 0; k < 250; k++) {
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	}
+	{
+		long presses = sink_button_presses(0x0001);
+
+		check(presses >= 9 && presses <= 11,
+		      "holding A for a second at 10 Hz presses button 1 about"
+		      " ten times");
+	}
+
+	/* --- and releasing lets go, FROM EVERY PHASE OF THE CYCLE ----- */
+	{
+		int stuck = -1;
+		int hold;
+
+		/*
+		 * A 10 Hz cycle is 100ms, or 25 packets. Letting go at one
+		 * arbitrary moment tests one phase and passes by luck; walk
+		 * the whole period and every phase is covered, the asserted
+		 * half included.
+		 */
+		for (hold = 1; hold <= 30 && stuck < 0; hold++) {
+			packet[CORE_RAW_ANALOG_BASE + 0] = 0;
+			for (k = 0; k < 40; k++) {
+				core_on_packet(&cs, packet,
+				               CORE_RAW_PACKET_BYTES, t += PACKET);
+			}
+
+			packet[CORE_RAW_ANALOG_BASE + 0] = 255;
+			for (k = 0; k < hold; k++) {
+				core_on_packet(&cs, packet,
+				               CORE_RAW_PACKET_BYTES, t += PACKET);
+			}
+
+			packet[CORE_RAW_ANALOG_BASE + 0] = 0;
+			core_on_packet(&cs, packet,
+			               CORE_RAW_PACKET_BYTES, t += PACKET);
+			if (cs.gp.buttons & 0x0001) {
+				stuck = hold;
+			}
+		}
+		check_eq(stuck, -1,
+		         "RELEASING ALWAYS RELEASES, from any phase. A binding"
+		         " that deactivates during the asserted half must not"
+		         " leave the button held");
+	}
+
+	/* --- the same, on a key, which is where it would be worst ----- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	cfg.layout[0].binding[1].source    = CORE_SA_A;
+	cfg.layout[0].binding[1].action    = CORE_ACT_KEY;
+	cfg.layout[0].binding[1].code      = 0x1A;      /* W */
+	cfg.layout[0].binding[1].flags     = CORE_BF_REPEAT;
+	cfg.layout[0].binding[1].repeat_hz = 10;
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+
+	make_packet(packet);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	{
+		int stuck = -1;
+		int hold;
+
+		for (hold = 1; hold <= 30 && stuck < 0; hold++) {
+			packet[CORE_RAW_ANALOG_BASE + 0] = 0;
+			for (k = 0; k < 40; k++) {
+				core_on_packet(&cs, packet,
+				               CORE_RAW_PACKET_BYTES, t += PACKET);
+			}
+
+			packet[CORE_RAW_ANALOG_BASE + 0] = 255;
+			for (k = 0; k < hold; k++) {
+				core_on_packet(&cs, packet,
+				               CORE_RAW_PACKET_BYTES, t += PACKET);
+			}
+
+			packet[CORE_RAW_ANALOG_BASE + 0] = 0;
+			core_on_packet(&cs, packet,
+			               CORE_RAW_PACKET_BYTES, t += PACKET);
+			if (cs.kb.count != 0) {
+				stuck = hold;
+			}
+		}
+		check_eq(stuck, -1,
+		         "AND ON A KEY TOO - a key left held by an interrupted"
+		         " autofire cycle types forever");
+	}
+
+	/* --- repeat_delay_ms: one press, a pause, then repetition ----- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	cfg.layout[0].binding[1].source          = CORE_SA_A;
+	cfg.layout[0].binding[1].action          = CORE_ACT_JOY_BUTTON;
+	cfg.layout[0].binding[1].code            = 1;
+	cfg.layout[0].binding[1].flags           = CORE_BF_REPEAT;
+	cfg.layout[0].binding[1].repeat_hz       = 20;
+	cfg.layout[0].binding[1].repeat_delay_ms = 300;
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+
+	make_packet(packet);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	sink_reset();
+	packet[CORE_RAW_ANALOG_BASE + 0] = 255;
+
+	/* 250ms - inside the delay. */
+	for (k = 0; k < 62; k++) {
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	}
+	check_eq(sink_button_presses(0x0001), 1,
+	         "inside repeat_delay_ms the button is pressed exactly once");
+	check(cs.gp.buttons & 0x0001, "and is still held");
+
+	/* Another 500ms - past it, and repeating at 20 Hz. */
+	for (k = 0; k < 125; k++) {
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	}
+	check(sink_button_presses(0x0001) > 5,
+	      "past the delay it repeats - the keyboard behaviour, where a"
+	      " held key types once, pauses, then runs");
+
+	/* --- NO_REPEAT_FIRST is a delayed single shot ----------------- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	cfg.layout[0].binding[1].source          = CORE_SA_A;
+	cfg.layout[0].binding[1].action          = CORE_ACT_JOY_BUTTON;
+	cfg.layout[0].binding[1].code            = 1;
+	cfg.layout[0].binding[1].flags           = (u8)(CORE_BF_REPEAT |
+	                                                CORE_BF_NO_REPEAT_FIRST);
+	cfg.layout[0].binding[1].repeat_hz       = 20;
+	cfg.layout[0].binding[1].repeat_delay_ms = 100;
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+
+	make_packet(packet);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	sink_reset();
+	packet[CORE_RAW_ANALOG_BASE + 0] = 255;
+	for (k = 0; k < 250; k++) {
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	}
+	check_eq(sink_button_presses(0x0001), 1,
+	         "NO_REPEAT_FIRST presses once and stops, however long the"
+	         " control is held");
+	check(!(cs.gp.buttons & 0x0001), "and has let go by the end");
+
+	/* --- a wheel with REPEAT scrolls once per period -------------- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	cfg.layout[0].binding[1].source    = CORE_SA_A;
+	cfg.layout[0].binding[1].action    = CORE_ACT_MOUSE_WHEEL;
+	cfg.layout[0].binding[1].code      = 1;
+	cfg.layout[0].binding[1].flags     = CORE_BF_REPEAT;
+	cfg.layout[0].binding[1].repeat_hz = 10;
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+
+	make_packet(packet);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	sink_reset();
+	packet[CORE_RAW_ANALOG_BASE + 0] = 255;
+	for (k = 0; k < 250; k++) {
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	}
+	{
+		long detents = sink_wheel_total();
+
+		check(detents >= 9 && detents <= 11,
+		      "AN ACTION WITH NO HELD STATE REPEATS DIFFERENTLY - the"
+		      " wheel emits one detent per period rather than"
+		      " alternating");
+	}
+
+	/* --- the shipped arcade layer, end to end --------------------- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+
+	make_packet(packet);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+
+	/* Start+Back to layer 2, then hold A. */
+	packet[CORE_RAW_DIGITAL] = (u8)(CORE_DIG_START | CORE_DIG_BACK);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	check_eq(cs.layout, 1, "Start+Back reaches the autofire layer");
+
+	packet[CORE_RAW_DIGITAL] = 0;
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	sink_reset();
+	packet[CORE_RAW_ANALOG_BASE + 0] = 255;
+	for (k = 0; k < 250; k++) {
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	}
+	{
+		long presses = sink_button_presses(0x0001);
+
+		check(presses >= 11 && presses <= 13,
+		      "and holding A there fires button 1 at the shipped 12 Hz");
+	}
+
+	return 0;
+}
+
+/* ======================================================================
  * THE REGISTRATION CONTRACT
  * ====================================================================== */
 
@@ -1851,6 +2127,7 @@ int main(int argc, char **argv)
 	printf("[bindings]\n");     test_bindings();
 	printf("[control]\n");      test_control();
 	printf("[chords]\n");       test_chords();
+	printf("[autofire]\n");     test_autofire();
 	printf("[registration]\n"); test_driver_entry();
 
 	printf("---------------\n");

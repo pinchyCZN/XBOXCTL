@@ -684,9 +684,10 @@ Table of Contents
    |   | and its commands, harness      | binding with no replug           |
    |   | tests for every malformed case |                                  |
    +---+--------------------------------+----------------------------------+
-   | 5 | The binding engine: activation,| one binding types into Notepad,  |
-   |   | hysteresis, the keyboard and    | and into a game that reads Raw  |
-   |   | mouse paths                    | Input                            |
+   | 5 | The binding engine: activation,| DONE. One binding types into     |
+   |   | hysteresis, the keyboard and   | Notepad, chords cycle the layer, |
+   |   | mouse paths, chords, layers,   | autofire runs at its configured  |
+   |   | autofire                       | rate                             |
    +---+--------------------------------+----------------------------------+
    | 6 | The stick: curve table,        | the FPS profile of               |
    |   | accumulator, radial pipeline    | analog-to-mouse.txt section 9   |
