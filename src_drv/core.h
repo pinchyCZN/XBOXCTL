@@ -396,6 +396,13 @@ typedef struct _core_config {
 	 * evaluation costs one AND rather than a search.
 	 */
 	u32         suppress[CORE_MAX_LAYOUTS];
+
+	/*
+	 * One bit per source any chord in this layout names. Held back
+	 * while the chord it belongs to is live, and during the hold-off
+	 * that keeps a chord from being preceded by its own members.
+	 */
+	u32         chord_members[CORE_MAX_LAYOUTS];
 } core_config;
 
 /*
@@ -532,8 +539,24 @@ typedef struct _core_state {
 	u8              raw[CORE_RAW_PACKET_BYTES];
 	int             raw_valid;
 
+	/* --- layers --- */
+	u8              layout;         /* the EFFECTIVE layer      */
+	u8              layer_base;     /* what CYCLE and SET latch */
+	u8              layer_pending;
+	u8              layer_pending_valid;
+
+	/* --- chords --- */
+	s32             chord_value[CORE_MAX_CHORDS];
+
+	/*
+	 * Sources held back this packet, so a chord is not preceded by
+	 * its own members. Folded into the source lookup rather than
+	 * checked at each use, so a held source reads as released and
+	 * every binding on it deactivates the ordinary way.
+	 */
+	u32             hold_mask;
+
 	/* --- output state --- */
-	u8                   layout;
 	core_keyboard_state  kb;
 	core_mouse_state     ms;
 

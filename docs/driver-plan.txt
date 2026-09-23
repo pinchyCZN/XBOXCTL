@@ -514,8 +514,21 @@ Table of Contents
        \Device\xboxctl, with a \DosDevices\xboxctl symbolic link, so
        user mode opens \\.\xboxctl with CreateFile and drives it with
        DeviceIoControl. One control device for the whole driver, created
-       on the first device arrival and reference counted, as the
+       on the first device arrival and deleted with the last, as the
        Adaptoid's is - ../../ADAPTOID/docs/ioctl-surface.txt section 1.2.
+
+   THE LIFETIME IS A TRAP, NOT A PREFERENCE. Creating the control
+   device at DriverEntry is simpler, works, and is wrong: a driver
+   object that owns a device object is never unloaded, so the image
+   stays resident for the whole boot. Installing a new build then
+   changes nothing at all - every step of the install reports success,
+   the service reports RUNNING, and the kernel goes on executing the
+   previous driver until the machine is rebooted. Tying the control
+   device to the pads means unplugging the last one unloads the
+   driver, which is what makes an unplug, deploy, replug cycle work.
+
+   The cost is that \\.\xboxctl does not exist while no pad is
+   plugged in, and there is nothing to configure then anyway.
 
        EVERY CODE IS METHOD_BUFFERED, so the I/O manager copies the
        payload and the transfer method itself raises no pointer-width

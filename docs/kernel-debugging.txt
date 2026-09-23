@@ -479,6 +479,30 @@ Table of Contents
    hardware or a hypervisor that offers a sleep state; see
    driver-plan.txt section 5.4.
 
+8.1.  A Guest That Will Not Boot, And Is Not Crashing
+
+   TWO THINGS LOOK IDENTICAL FROM THE VM WINDOW and are not.
+
+   A GUEST LEFT BROKEN INTO THE DEBUGGER is stopped, not hung. It shows
+   no cursor, takes no input and survives a replug because it is not
+   running at all. kdc.py sends a break to run a command and resumes
+   afterwards, so a batch that is INTERRUPTED - a timeout, a killed
+   client - leaves the target stopped indefinitely.
+
+       python tools/kdc.py --go        release it
+
+   Confirm before diagnosing anything else: !analyze -v on a stopped
+   guest reports MANUAL_BREAKIN, and a stack that ends in
+   nt!Phase1Initialization means it was caught during boot rather than
+   in anything a driver did.
+
+   A GUEST IN A BOOTCHECK LOOP reboots instead. The tell is vertarget:
+   the kernel base moves on every sample and System Uptime is 0:00:00,
+   because each sample lands in a different boot. A driver that
+   bugchecks while its device is being started does this whenever the
+   device is attached at power-on, and the machine only comes up again
+   with the device unplugged.
+
 8.  When It Does Not Connect
 
    IN ORDER OF HOW OFTEN EACH IS THE ANSWER:

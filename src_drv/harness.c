@@ -31,7 +31,6 @@
 static int g_Checks = 0;
 static int g_Failures = 0;
 
-
 static ULONGLONG g_InterruptTime = 0;
 
 ULONGLONG KeQueryInterruptTime(void)
@@ -844,6 +843,7 @@ static int test_transport(void)
 	packet[CORE_RAW_ANALOG_BASE + 6] = 255;       /* left trigger  */
 	XcOnTransfer(&devext, STATUS_SUCCESS, packet,
 	             CORE_RAW_PACKET_BYTES, 5000);
+
 	check(XcDequeueReport(&devext, &node), "report queued");
 	{
 		const u8 *b = &node.Data[1 + CORE_GP_BUTTONS];
@@ -1361,6 +1361,8 @@ static int test_bindings(void)
  * ====================================================================== */
 
 extern long g_MutexDepth;
+extern LONG g_ControlDeviceAlive;
+extern LONG g_ControlDeviceUnderLock;
 
 static int test_control(void)
 {
@@ -1518,8 +1520,17 @@ static int test_control(void)
 	check_eq(devext.Core.cfg.layout[0].binding[2].action, CORE_ACT_NONE,
 	         "and the pushed binding is gone");
 
+	/* --- THE CONTROL DEVICE LIVES ONLY WHILE A PAD DOES ----------- */
+	check_eq(g_ControlDeviceAlive, 1,
+	         "a pad arriving brings the control device up");
+
 	/* --- removal takes it back out of the registry ---------------- */
 	XcRemoveDevice(&devext);
+	check_eq(g_ControlDeviceAlive, 0,
+	         "AND THE LAST PAD LEAVING TAKES IT DOWN. A driver object"
+	         " that still owns a device is never unloaded, so one that"
+	         " outlived the pad would pin the old image in memory and"
+	         " make the next install do nothing at all");
 	status = XcControlCommand(IOCTL_XC_GET_DEVICES, buffer, 0,
 	                          sizeof(buffer), &written);
 	memcpy(&list, buffer, sizeof(list));
@@ -1540,6 +1551,141 @@ static int test_control(void)
 	 */
 	check_eq(g_MutexDepth, 0,
 	         "the device lock is free after every command above");
+
+	/*
+	 * THE CONTROL DEVICE IS NEVER CREATED OR DELETED UNDER THE LOCK.
+	 * The lock raises IRQL to APC_LEVEL and IoCreateDevice needs
+	 * PASSIVE_LEVEL, so holding it across either call bugchecks under
+	 * Driver Verifier - during boot, where the pad is started, which
+	 * means a machine that will not come up until the pad is out.
+	 */
+	check_eq(g_ControlDeviceUnderLock, 0,
+	         "the control device is created and deleted at"
+	         " PASSIVE_LEVEL, never under the device lock");
+
+	return 0;
+}
+
+/* ======================================================================
+ * CHORDS AND LAYERS
+ *
+ * ../docs/mapping-engine.txt sections 2.2 and 7. The hard part is not
+ * making a chord fire; it is making sure its members do not fire on the
+ * way in. A packet is 4ms and two buttons pressed together land tens of
+ * milliseconds apart, so "suppress while the chord is complete" is not
+ * enough on its own.
+ * ====================================================================== */
+
+/* Start and Back are digital, and live in the packet's button bitmask. */
+static void chord_buttons(core_state *cs, u8 *packet, u8 digital, u64 when)
+{
+	packet[CORE_RAW_DIGITAL] = digital;
+	core_on_packet(cs, packet, CORE_RAW_PACKET_BYTES, when);
+}
+
+static int test_chords(void)
+{
+	static core_config cfg;
+	core_state         cs;
+	u8                 packet[CORE_RAW_PACKET_BYTES];
+	/* 100ns units: CORE_100NS_PER_MS is 10000, so one
+	 * packet at 250 Hz is 40000 and not 4000. */
+	u64                t = 1000;
+	const u64          PACKET = 4 * CORE_100NS_PER_MS;
+	u8                 blob[4096];
+	u32                len;
+
+	/* --- the shipped arrangement: Start+Back cycles the layer ----- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	check_eq(core_set_config(&cs, blob, len, NULL), CORE_CFG_OK,
+	         "the built-in configuration installs");
+	check(cs.cfg.chord_members[0] & (1u << CORE_SA_START),
+	      "Start is known to be a chord member");
+	check(cs.cfg.chord_members[0] & (1u << CORE_SA_BACK),
+	      "and so is Back");
+	check(!(cs.cfg.suppress[0] & (1u << CORE_SA_START)),
+	      "BUT NEITHER IS SUPPRESSED - naming a source in a chord does"
+	      " not bind it, so Start keeps its own button");
+
+	make_packet(packet);
+	chord_buttons(&cs, packet, 0, t += PACKET);
+	check_eq(cs.layout, 0, "the pad starts on layer 1");
+
+	/* --- the members reach the gamepad on their own ---------------- */
+	chord_buttons(&cs, packet, CORE_DIG_START, t += PACKET);
+	check(cs.gp.buttons & 0x0040,
+	      "Start alone drives its own button - nothing waits on the"
+	      " chance that a chord might be coming");
+	chord_buttons(&cs, packet, 0, t += PACKET);
+
+	/* --- a short tap of a member still reaches the gamepad -------- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+	make_packet(packet);
+	chord_buttons(&cs, packet, 0, t += PACKET);
+	{
+		int saw_start = 0;
+		int k;
+
+		/* Press Start for 20ms - an ordinary tap - then release, and
+		 * watch every packet for five more packets. */
+		for (k = 0; k < 5; k++) {
+			chord_buttons(&cs, packet, CORE_DIG_START, t += PACKET);
+			if (cs.gp.buttons & 0x0040) { saw_start = 1; }
+		}
+		for (k = 0; k < 20; k++) {
+			chord_buttons(&cs, packet, 0, t += PACKET);
+			if (cs.gp.buttons & 0x0040) { saw_start = 1; }
+		}
+		check(saw_start, "A SHORT TAP OF START REACHES THE GAMEPAD");
+	}
+
+	/* --- a layer change releases what the old layer was holding --- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	cfg.layout[0].binding[1].source = CORE_SA_A;
+	cfg.layout[0].binding[1].action = CORE_ACT_KEY;
+	cfg.layout[0].binding[1].code   = 0x1A;         /* W */
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+
+	make_packet(packet);
+	packet[CORE_RAW_ANALOG_BASE + 0] = 255;         /* hold A */
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	check_eq(cs.kb.count, 1, "A holds W down on layer 1");
+
+	chord_buttons(&cs, packet, (u8)(CORE_DIG_START | CORE_DIG_BACK),
+	              t += PACKET);
+	chord_buttons(&cs, packet, (u8)(CORE_DIG_START | CORE_DIG_BACK),
+	              t += PACKET);
+	check_eq(cs.layout, 1, "the chord switches layer with A still held");
+	check_eq(cs.kb.count, 0,
+	         "AND W IS RELEASED. Layer 2 has nothing bound to A, so"
+	         " nothing there would ever have let go of it");
+
+	/* --- an empty chord is not a chord that is always on ---------- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	cfg.layout[0].chord[0].member[0] = CORE_SA_NONE;
+	cfg.layout[0].chord[0].member[1] = CORE_SA_NONE;
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+
+	make_packet(packet);
+	chord_buttons(&cs, packet, 0, t += PACKET);
+	check_eq((long)cs.chord_value[0], 0,
+	         "A CHORD NAMING NOTHING NEVER FIRES - an all-members-down"
+	         " test over an empty set is vacuously true");
+	chord_buttons(&cs, packet, 0, t += PACKET);
+	check_eq(cs.layout, 0, "so it cannot cycle the layer either");
 
 	return 0;
 }
@@ -1704,6 +1850,7 @@ int main(int argc, char **argv)
 	printf("[config]\n");       test_config();
 	printf("[bindings]\n");     test_bindings();
 	printf("[control]\n");      test_control();
+	printf("[chords]\n");       test_chords();
 	printf("[registration]\n"); test_driver_entry();
 
 	printf("---------------\n");

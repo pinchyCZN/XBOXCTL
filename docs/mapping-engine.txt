@@ -134,21 +134,73 @@ Table of Contents
        };
 
    Chord N appears to the binding table as source index 64 + N, with a
-   value of MAX_VALUE when every named member is above its own
-   activation threshold and 0 otherwise.
+   value of MAX_VALUE when every named member is down and 0 otherwise. A
+   chord that names no member never fires; an all-members-down test over
+   an empty set would otherwise be vacuously true.
 
-   ONE RULE MAKES OR BREAKS IT: WHILE A CHORD IS ACTIVE, SUPPRESS THE
-   BINDINGS OF ITS MEMBERS. Otherwise pressing Start then Back fires
-   Start's own binding on the way in, and every chord is preceded by a
-   spurious keystroke. Suppression must also be retroactive within the
-   packet - a member that went active in the same packet that completed
-   the chord must not have emitted - which is why chords are evaluated
-   before ordinary bindings in section 9.
+   A MEMBER IS "DOWN" AT THE DEFAULT MAP'S THRESHOLD, not at one of its
+   own. Every control that makes sense in a chord is digital on this pad
+   and reads either zero or full scale, so a second threshold would be a
+   knob with nothing behind it.
+
+   ONE RULE MAKES OR BREAKS IT: WHILE A CHORD IS ACTIVE, SUPPRESS ITS
+   MEMBERS. Otherwise pressing Start then Back fires Start's own control
+   on the way in, and every chord is preceded by a spurious press.
+
+   SUPPRESSION LASTS EXACTLY AS LONG AS THE CHORD, and no longer. A
+   member pressed on the way to a chord reaches the gamepad for the few
+   packets before the last member lands. That is what XBCD does and it
+   is the right trade.
+
+   THE OBVIOUS IMPROVEMENT IS A TRAP, which is why it is recorded here
+   rather than left to be rediscovered. Holding a member back in case a
+   chord is coming DELAYS a press; it does not DEFER one. A press
+   released inside that window never reaches anything at all, so every
+   tap shorter than the window is swallowed - and Start is a button
+   people tap. Delaying to avoid a cosmetic flicker costs the control
+   its ordinary use.
+
+   Deferring rather than delaying - replaying a swallowed tap once the
+   window closes - would work, at the cost of a per-source queue of
+   pending transitions. Nothing needs it.
 
    MEMBER SUPPRESSION IS NOT THE SAME AS SECTION 4.1. A chord is its own
    source, so naming Start and Back as members does not bind Start or
-   Back, and both keep their default gamepad buttons. They are held back
-   only for the packets in which the chord itself is active.
+   Back, and both keep their own controls until the chord takes them.
+
+   A HELD SOURCE READS AS RELEASED rather than being skipped, so every
+   binding on it deactivates by the ordinary path and lets go of what it
+   was asserting. Skipping would freeze it mid-press.
+
+2.3.  The Hold-Off
+
+   SUPPRESSING MEMBERS ONLY WHILE THE CHORD IS COMPLETE IS NOT ENOUGH,
+   and the arithmetic says so plainly. A packet is 4ms at 250 Hz. Two
+   buttons a person means to press together land ten to thirty
+   milliseconds apart, which is three to eight packets. The first member
+   therefore drives its own control for that whole span before the second
+   arrives, so Start opens the pause menu on the way to every layer
+   change.
+
+   So a member that has just gone down is held back until either the
+   chord completes, or chord_holdoff_ms passes and no chord is coming.
+   The member then behaves normally: the hold-off DELAYS a control, it
+   never costs it.
+
+   IT IS OFF BY DEFAULT, AND THAT IS THE IMPORTANT PART. A hold-off
+   DELAYS a press; it does not DEFER one. A press released inside the
+   window never reaches anything at all, so a tap shorter than the
+   window is swallowed whole - and an ordinary tap of Start is well
+   under 50ms. Start is a button people press constantly, so the trade
+   is a rare cosmetic fix bought at the price of a common broken one.
+
+   Set a hold-off only on members that are never pressed alone. On
+   Start and Back, leave it at 0 and accept the brief press on the way
+   into a deliberate layer change, which is what XBCD does.
+
+   Deferring rather than delaying - replaying a swallowed tap after the
+   window closes - would remove the trade, at the cost of a per-source
+   queue of pending transitions. Nothing needs it yet.
 
 3.  Actions
 
@@ -409,6 +461,14 @@ Table of Contents
    layer it switches to has no binding holding it and it releases
    immediately. The configurator should place it automatically and warn
    if it is missing; the driver should not try to be clever about it.
+
+   ON A LAYER CHANGE, SEED THE INCOMING LAYER FROM WHAT IS ALREADY HELD,
+   marking its bindings active without firing them. Without this a layer
+   change re-triggers itself: the control that asked for the change is
+   still down when the new layer arrives, the new layer has its own copy
+   of that binding with its own state, and that copy sees a source going
+   from released to held. It is a rising edge, so it cycles again - one
+   layer per packet, for as long as the chord is held.
 
    ON EVERY LAYER CHANGE, RELEASE EVERYTHING THE OLD LAYER ASSERTED.
    Walk the output state and clear it, emitting the reports that

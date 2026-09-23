@@ -92,8 +92,11 @@ if ($handle -eq [IntPtr](-1)) {
     $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
     Write-Host "  cannot open \\.\xboxctl: error $err"
     if ($err -eq 2) {
-        Write-Host "  The driver is not loaded, or it is an older build"
-        Write-Host "  with no control device. Run deploy.cmd."
+        Write-Host "  THE CONTROL DEVICE EXISTS ONLY WHILE A PAD IS"
+        Write-Host "  PLUGGED IN. It arrives with the first pad and goes"
+        Write-Host "  with the last, so that unplugging lets the driver"
+        Write-Host "  unload and the next deploy.cmd maps a new build."
+        Write-Host "  Plug the pad in, or run deploy.cmd if it is in."
     } elseif ($err -eq 5) {
         Write-Host "  Access denied - run this from an ELEVATED prompt."
     }

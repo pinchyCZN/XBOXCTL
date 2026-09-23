@@ -20,4 +20,8 @@ powercfg /a
 rundll32.exe powrprof.dll,SetSuspendState 0,1,0
 
 
-powershell -ExecutionPolicy Bypass -File hidread.ps1
+powershell -ExecutionPolicy Bypass -File hidread.ps1 -Buttons
+
+powershell -ExecutionPolicy Bypass -File hidread.ps1 -nosticks
+
+powershell -ExecutionPolicy Bypass -File xbctl.ps1 set -Path arcade.bin

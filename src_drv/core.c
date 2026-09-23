@@ -507,15 +507,25 @@ static const struct {
  * ====================================================================== */
 
 /*
- * A source that is not a semiaxis reads as inactive. Nothing may index
- * cs->semiaxis with a value that came off the wire without this check -
- * the enumeration stops at CORE_SEMIAXIS_COUNT and chord indices start
- * well past it.
+ * Nothing may index cs->semiaxis with a value that came off the wire
+ * without this check - the enumeration stops at CORE_SEMIAXIS_COUNT and
+ * chord indices start well past it.
+ *
+ * A HELD SOURCE READS AS RELEASED rather than being skipped, so every
+ * binding on it deactivates by the ordinary path and lets go of whatever
+ * it was asserting. Skipping would freeze it mid-press instead.
  */
 static s32 core_source_value(const core_state *cs, u8 source)
 {
 	if (source < CORE_SEMIAXIS_COUNT) {
+		if (cs->hold_mask & (1u << source)) {
+			return 0;
+		}
 		return cs->semiaxis[source];
+	}
+	if (source >= CORE_SA_CHORD_BASE &&
+	    source < CORE_SA_CHORD_BASE + CORE_MAX_CHORDS) {
+		return cs->chord_value[source - CORE_SA_CHORD_BASE];
 	}
 	return 0;
 }
@@ -526,6 +536,136 @@ static int core_suppressed(u32 mask, u8 source)
 		return 0;
 	}
 	return (mask & (1u << source)) != 0;
+}
+
+/*
+ * ======================================================================
+ * CHORDS
+ *
+ * ../docs/mapping-engine.txt section 2.2. A chord is its own source, so
+ * naming Start and Back as members does not bind either of them; they
+ * keep their own controls until the chord they belong to takes them.
+ * ====================================================================== */
+
+/*
+ * A MEMBER IS "PRESSED" AT THE DEFAULT MAP'S THRESHOLD, not at some
+ * threshold of its own. Every control that makes sense in a chord is
+ * digital on this pad - it reads 0 or full scale - so a second, separate
+ * threshold would be a knob with nothing behind it.
+ */
+static int core_member_down(const core_state *cs, u8 source)
+{
+	if (source >= CORE_SEMIAXIS_COUNT) {
+		return 0;
+	}
+	return cs->semiaxis[source] >= CORE_DEFAULT_BUTTON_ON;
+}
+
+/*
+ * Chord values and the hold mask, both before any binding is looked at.
+ *
+ * A MEMBER IS SUPPRESSED ONLY WHILE ITS CHORD IS COMPLETE. Pressing
+ * Start on the way to Start+Back therefore reaches the gamepad for the
+ * few packets before Back lands, which is what XBCD does and is a
+ * price worth paying: the alternative, holding a member back in case a
+ * chord is coming, DELAYS a press rather than deferring it, so any tap
+ * shorter than the window is swallowed whole - and Start is a button
+ * people tap.
+ */
+static void core_chords_evaluate(core_state *cs, u32 layer)
+{
+	const core_layout *lay = &cs->cfg.layout[layer];
+	u32 hold = 0;
+	u32 i;
+	int m;
+
+	for (i = 0; i < CORE_MAX_CHORDS; i++) {
+		const core_chord *ch = &lay->chord[i];
+		u32 mask = 0;
+		int named = 0;
+		int all_down = 1;
+
+		for (m = 0; m < CORE_CHORD_MEMBERS; m++) {
+			u8 src = ch->member[m];
+
+			if (src == CORE_SA_NONE) {
+				continue;
+			}
+			named++;
+			if (src < CORE_SEMIAXIS_COUNT) {
+				mask |= 1u << src;
+			}
+			if (!core_member_down(cs, src)) {
+				all_down = 0;
+			}
+		}
+
+		/* A chord naming nothing is not a chord that is always on. */
+		if (named == 0) {
+			cs->chord_value[i] = 0;
+			continue;
+		}
+
+		if (all_down) {
+			cs->chord_value[i] = CORE_MAX_VALUE;
+			hold |= mask;
+		} else {
+			cs->chord_value[i] = 0;
+		}
+	}
+
+	cs->hold_mask = hold;
+}
+
+/*
+ * ======================================================================
+ * LAYERS
+ * ====================================================================== */
+
+static int core_layer_change(core_state *cs, u8 to)
+{
+	if (to >= cs->cfg.layout_count || to == cs->layout) {
+		return 0;
+	}
+
+	/*
+	 * RELEASE EVERYTHING THE OLD LAYER ASSERTED, before the new one is
+	 * live. A layer change that leaves W held because the incoming
+	 * layer has nothing bound to that source is the classic failure of
+	 * every layered remapper, and this is the whole of the fix.
+	 */
+	core_release_all(cs);
+	cs->layout = to;
+	return 1;
+}
+
+/*
+ * Seed the incoming layer's bindings from what is ALREADY held, marking
+ * them active without firing anything.
+ *
+ * WITHOUT THIS A LAYER CHANGE RE-TRIGGERS ITSELF. The control that asked
+ * for the change is still down when the new layer arrives, and the new
+ * layer has its own copy of the binding with its own state. That copy
+ * would see a source going from released to held - a rising edge - and
+ * cycle straight back, one layer per packet, for as long as the chord
+ * was held.
+ */
+static void core_layer_prime(core_state *cs, u32 layer)
+{
+	u32 i;
+
+	for (i = 0; i < cs->cfg.binding_count; i++) {
+		core_binding    *b  = &cs->cfg.layout[layer].binding[i];
+		core_bind_state *st = &cs->bind[layer][i];
+		s32              value;
+
+		if (b->action == CORE_ACT_NONE) {
+			continue;
+		}
+		value = core_source_value(cs, b->source);
+		st->active  = (u8)(value > 0 && value >= (s32)b->on_at);
+		st->latched = 0;
+	}
 }
 
 /*
@@ -646,6 +786,39 @@ static void core_apply_action(core_state *cs, const core_binding *b,
 		}
 		break;
 
+	/*
+	 * A LAYER CHANGE IS DEFERRED BY ONE PACKET. Applying it here would
+	 * leave the rest of this walk running against a layout that is no
+	 * longer live, and the binding that asked for the change would be
+	 * re-evaluated under the layer it just switched to.
+	 */
+	case CORE_ACT_LAYER_SET:
+		if (edge) {
+			cs->layer_pending = (u8)b->code;
+			cs->layer_pending_valid = 1;
+		}
+		break;
+
+	case CORE_ACT_LAYER_CYCLE:
+		if (edge) {
+			s32 step = (s32)(s16)b->code;
+			s32 count = (s32)cs->cfg.layout_count;
+			s32 next;
+
+			if (count > 0) {
+				/* WRAP BOTH WAYS. A step of -1 from layer 0
+				 * must reach the last layer, and C's % keeps
+				 * the sign of its left operand. */
+				next = ((s32)cs->layer_base + step) % count;
+				if (next < 0) {
+					next += count;
+				}
+				cs->layer_pending = (u8)next;
+				cs->layer_pending_valid = 1;
+			}
+		}
+		break;
+
 	default:
 		break;
 	}
@@ -692,22 +865,92 @@ static void core_apply_binding(core_state *cs, const core_binding *b,
 	core_apply_action(cs, b, value, asserted, edge);
 }
 
-static void core_evaluate(core_state *cs)
+/*
+ * LAYER_HOLD IS RESOLVED AGAINST THE BASE LAYER, and that ordering is the
+ * point rather than an accident: a hold binding evaluated in the layer it
+ * switches to could be shadowed by that layer, and the pad would be stuck
+ * there with nothing left holding the way out.
+ */
+static u32 core_resolve_hold(core_state *cs, u32 base)
 {
-	u32 layer = cs->layout;
+	u32 effective = base;
 	u32 i;
 
+	for (i = 0; i < cs->cfg.binding_count; i++) {
+		core_binding *b = &cs->cfg.layout[0].binding[i];
+
+		if (b->action != CORE_ACT_LAYER_HOLD) {
+			continue;
+		}
+		core_apply_binding(cs, b, &cs->bind[0][i]);
+
+		if (cs->bind[0][i].active && b->code < cs->cfg.layout_count) {
+			/* Highest-numbered active hold wins. Arbitrary, but
+			 * deterministic, and simpler to explain than a stack. */
+			if (b->code >= effective) {
+				effective = b->code;
+			}
+		}
+	}
+	return effective;
+}
+
+static void core_evaluate(core_state *cs)
+{
+	u32 layer;
+	u32 i;
+	int changed = 0;
+
+	/* A change asked for by the previous packet lands here, before
+	 * anything in this one is looked at. */
+	if (cs->layer_pending_valid) {
+		cs->layer_pending_valid = 0;
+		cs->layer_base = cs->layer_pending;
+		changed |= core_layer_change(cs, cs->layer_pending);
+	}
+
+	if (cs->layer_base >= cs->cfg.layout_count) {
+		cs->layer_base = 0;
+	}
+
+	layer = cs->layout;
+	if (layer >= cs->cfg.layout_count) {
+		layer = 0;
+		cs->layout = 0;
+	}
+
+	/*
+	 * CHORDS BEFORE ANYTHING READS A SOURCE. They decide the hold mask,
+	 * and the hold mask is what every later lookup goes through - the
+	 * layer-hold pass below included.
+	 */
+	core_chords_evaluate(cs, layer);
+
+	layer = core_resolve_hold(cs, cs->layer_base);
+	if (core_layer_change(cs, (u8)layer)) {
+		changed = 1;
+	}
+	layer = cs->layout;
 	if (layer >= cs->cfg.layout_count) {
 		layer = 0;
 	}
 
+	if (changed) {
+		core_layer_prime(cs, layer);
+	}
+
 	core_zero(&cs->gp, (u32)sizeof(cs->gp));
 
-	core_fold_default(cs, cs->cfg.suppress[layer]);
+	core_fold_default(cs, cs->cfg.suppress[layer] | cs->hold_mask);
 
 	for (i = 0; i < cs->cfg.binding_count; i++) {
-		core_apply_binding(cs, &cs->cfg.layout[layer].binding[i],
-		                   &cs->bind[layer][i]);
+		core_binding *b = &cs->cfg.layout[layer].binding[i];
+
+		/* Already evaluated, against the base layer. */
+		if (b->action == CORE_ACT_LAYER_HOLD && layer == 0) {
+			continue;
+		}
+		core_apply_binding(cs, b, &cs->bind[layer][i]);
 	}
 }
 
@@ -988,6 +1231,11 @@ void core_release_all(core_state *cs)
 	 */
 	core_zero(cs->bind, (u32)sizeof(cs->bind));
 	core_zero(&cs->gp, (u32)sizeof(cs->gp));
+
+	/* And the chord machinery, so a member that was down when this
+	 * was called does not come back mid hold-off. */
+	core_zero(cs->chord_value, (u32)sizeof(cs->chord_value));
+	cs->hold_mask = 0;
 }
 
 void core_on_packet(core_state *cs, const u8 *raw, u32 len, u64 now_100ns)
@@ -1207,6 +1455,9 @@ void core_config_suppress(core_config *cfg)
 
 	for (l = 0; l < CORE_MAX_LAYOUTS; l++) {
 		u32 mask = 0;
+		u32 members = 0;
+		u32 c;
+		int m;
 
 		if (l < cfg->layout_count) {
 			for (i = 0; i < cfg->binding_count; i++) {
@@ -1229,8 +1480,23 @@ void core_config_suppress(core_config *cfg)
 					mask |= 1u << b->source;
 				}
 			}
+
+			/* Every source any chord in this layout names. */
+			for (c = 0; c < cfg->chord_count &&
+			            c < CORE_MAX_CHORDS; c++) {
+				const core_chord *ch = &cfg->layout[l].chord[c];
+
+				for (m = 0; m < CORE_CHORD_MEMBERS; m++) {
+					u8 src = ch->member[m];
+
+					if (src < CORE_SEMIAXIS_COUNT) {
+						members |= 1u << src;
+					}
+				}
+			}
 		}
-		cfg->suppress[l] = mask;
+		cfg->suppress[l]      = mask;
+		cfg->chord_members[l] = members;
 	}
 }
 

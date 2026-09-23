@@ -5,6 +5,18 @@
         powershell -ExecutionPolicy Bypass -File hidread.ps1            gamepad
         powershell -ExecutionPolicy Bypass -File hidread.ps1 -Col 2     keyboard
         powershell -ExecutionPolicy Bypass -File hidread.ps1 -Quiet     count only
+        powershell -ExecutionPolicy Bypass -File hidread.ps1 -NoSticks
+
+    -NoSticks PRINTS THE WHOLE REPORT, exactly as the default does, but
+    only when something OTHER THAN THE TWO ANALOG STICKS changes. The
+    sticks rest a count or two either side of centre and never settle, so
+    a raw dump scrolls continuously and whatever you wanted to watch is
+    off the top of the window before you can read it.
+
+    EVERYTHING ELSE STILL COUNTS AS A CHANGE - buttons, the hat, the
+    layer, and both TRIGGERS, which are axes but are not sticks. Moving
+    a stick updates the numbers on the next line that prints; it just
+    does not cause a line to print by itself.
 
     WHY THIS EXISTS. It shows the wire bytes, which is the quickest way to
     see what the driver is actually emitting - report ID first, then the
@@ -19,6 +31,7 @@
 param(
     [int]$Col = 1,
     [switch]$Quiet,
+    [switch]$NoSticks,
     [int]$Seconds = 0
 )
 
@@ -162,6 +175,15 @@ Write-Host "  reading - Ctrl+C to stop"
 $buf = New-Object byte[] 64
 $n = 0
 $start = Get-Date
+
+# THE STICK BYTES, and only those, are excluded from the change test.
+# driver-plan.txt section 4.2: bytes 3..10 are X, Y, Rx and Ry in the
+# mapped payload, and bytes 29..36 are the same four axes in the raw
+# tail. Bytes 11..14 are the TRIGGERS and are deliberately kept - they
+# are axes, but they do not drift.
+$STICK_BYTES = @(3, 4, 5, 6, 7, 8, 9, 10,
+                 29, 30, 31, 32, 33, 34, 35, 36)
+$lastSignificant = $null
 try {
     while ($true) {
         $got = 0
@@ -172,7 +194,26 @@ try {
         }
         $n++
         if ($n -eq 1) { Write-Host ("  report length {0} bytes" -f $got) }
-        if (-not $Quiet) {
+
+        $show = $true
+        if ($NoSticks) {
+            # Build a key from every byte that is not a stick axis, and
+            # print only when that key changes.
+            $sb = New-Object Text.StringBuilder
+            for ($j = 0; $j -lt $got; $j++) {
+                if ($STICK_BYTES -notcontains $j) {
+                    $null = $sb.Append('{0:x2}' -f $buf[$j])
+                }
+            }
+            $key = $sb.ToString()
+            if ($key -eq $lastSignificant) {
+                $show = $false
+            } else {
+                $lastSignificant = $key
+            }
+        }
+
+        if ($show -and -not $Quiet) {
             # PRINT THE WHOLE REPORT. A truncated dump hides the raw tail,
             # and the tail is where the analog pressures are: a button that
             # reads one bit in the mapped payload has a full 0..255 value

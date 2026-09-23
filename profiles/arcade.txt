@@ -29,6 +29,7 @@ curve = linear          # linear | quad | cubic | smoothstep | <y1> <y2>
 
 [layer 1]
 start+back -> layer_cycle 1
+a -> key w
 
 [layer 2]
 start+back -> layer_cycle 1

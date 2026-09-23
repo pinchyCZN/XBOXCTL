@@ -1439,9 +1439,26 @@ NTSTATUS NTAPI XcClose(PDEVICE_OBJECT Fdo, PIRP Irp)
  * driver, a registry of the pads behind it, and six commands.
  * ====================================================================== */
 
-static PXC_DEVEXT g_Devices[XC_MAX_DEVICES];
-static FAST_MUTEX g_DeviceLock;
-static BOOLEAN    g_DeviceLockReady;
+static PXC_DEVEXT      g_Devices[XC_MAX_DEVICES];
+static FAST_MUTEX      g_DeviceLock;
+static BOOLEAN         g_DeviceLockReady;
+static PDRIVER_OBJECT  g_DriverObject;
+
+static NTSTATUS XcControlDeviceCreate(void);
+static void     XcControlDeviceDelete(void);
+
+/* Caller holds the lock. */
+static ULONG XcDeviceCount(void)
+{
+	ULONG i, n = 0;
+
+	for (i = 0; i < XC_MAX_DEVICES; i++) {
+		if (g_Devices[i] != NULL) {
+			n++;
+		}
+	}
+	return n;
+}
 
 /*
  * A FAST MUTEX, NOT A SPIN LOCK, and the reason is what runs underneath it.
@@ -1451,6 +1468,11 @@ static BOOLEAN    g_DeviceLockReady;
  * DeviceIoControl and a PnP remove, arrive at PASSIVE_LEVEL, so a mutex is
  * both sufficient and correct.
  */
+static void XcSetDriverObject(PDRIVER_OBJECT DriverObject)
+{
+	g_DriverObject = DriverObject;
+}
+
 static void XcDeviceLockInit(void)
 {
 	if (!g_DeviceLockReady) {
@@ -1470,9 +1492,26 @@ void XcDeviceRegistryReset(void)
 	XcDeviceLockInit();
 }
 
+/*
+ * THE CONTROL DEVICE LIVES EXACTLY AS LONG AS A PAD DOES, and that is not
+ * a detail. A driver object that owns a device object is never unloaded,
+ * so a control device created at DriverEntry pins the image in memory for
+ * the life of the boot - and then installing a new build does nothing,
+ * however loudly the installer reports success, because the kernel goes
+ * on running the old one until a reboot.
+ *
+ * Created on the first arrival and deleted with the last removal, the
+ * driver unloads when the pad is unplugged and the next deploy maps the
+ * new image. The Adaptoid reference counts its control device the same
+ * way - ADAPTOID/docs/ioctl-surface.txt section 1.2.
+ *
+ * The cost is that \\.\xboxctl does not exist while no pad is plugged
+ * in. There is nothing to configure then anyway.
+ */
 void XcDeviceRegister(PXC_DEVEXT DevExt)
 {
 	ULONG i;
+	int   first = 0;
 
 	XcDeviceLockInit();
 	ExAcquireFastMutex(&g_DeviceLock);
@@ -1483,11 +1522,28 @@ void XcDeviceRegister(PXC_DEVEXT DevExt)
 		}
 		if (g_Devices[i] == NULL) {
 			g_Devices[i] = DevExt;
+			first = (XcDeviceCount() == 1);
 			break;
 		}
 	}
 
 	ExReleaseFastMutex(&g_DeviceLock);
+
+	/*
+	 * OUTSIDE THE LOCK, AND THAT IS NOT TIDINESS. ExAcquireFastMutex
+	 * raises IRQL to APC_LEVEL; IoCreateDevice and IoCreateSymbolicLink
+	 * both require PASSIVE_LEVEL. Creating the control device while
+	 * holding this mutex is an IRQL violation that Driver Verifier
+	 * bugchecks on the spot - and because the pad is started during
+	 * boot, that is a bugcheck on every boot and a machine that will
+	 * not come up until the pad is unplugged.
+	 *
+	 * Only the caller that took the count from nothing to one creates,
+	 * so two pads arriving together still produce one control device.
+	 */
+	if (first) {
+		(void)XcControlDeviceCreate();
+	}
 }
 
 /*
@@ -1499,6 +1555,7 @@ void XcDeviceRegister(PXC_DEVEXT DevExt)
 void XcDeviceUnregister(PXC_DEVEXT DevExt)
 {
 	ULONG i;
+	int   last;
 
 	XcDeviceLockInit();
 	ExAcquireFastMutex(&g_DeviceLock);
@@ -1508,8 +1565,14 @@ void XcDeviceUnregister(PXC_DEVEXT DevExt)
 			g_Devices[i] = NULL;
 		}
 	}
+	last = (XcDeviceCount() == 0);
 
 	ExReleaseFastMutex(&g_DeviceLock);
+
+	/* PASSIVE_LEVEL only, for the reason given in XcDeviceRegister. */
+	if (last) {
+		XcControlDeviceDelete();
+	}
 }
 
 /* Caller holds the lock. */
@@ -1824,11 +1887,15 @@ static NTSTATUS NTAPI XcDeviceControlWrapper(PDEVICE_OBJECT DeviceObject,
 	return XcCompleteControl(Irp, status, written);
 }
 
-static NTSTATUS XcControlDeviceCreate(PDRIVER_OBJECT DriverObject)
+static NTSTATUS XcControlDeviceCreate(void)
 {
 	UNICODE_STRING name;
 	UNICODE_STRING link;
 	NTSTATUS       status;
+
+	if (g_ControlDevice != NULL || g_DriverObject == NULL) {
+		return STATUS_SUCCESS;
+	}
 
 	RtlInitUnicodeString(&name, XC_CONTROL_NAME);
 	RtlInitUnicodeString(&link, XC_CONTROL_LINK);
@@ -1838,7 +1905,7 @@ static NTSTATUS XcControlDeviceCreate(PDRIVER_OBJECT DriverObject)
 	 * remember, and two tools looking at the same driver is a reasonable
 	 * thing to want.
 	 */
-	status = IoCreateDevice(DriverObject, 0, &name, XC_DEVICE_TYPE,
+	status = IoCreateDevice(g_DriverObject, 0, &name, XC_DEVICE_TYPE,
 	                        FILE_DEVICE_SECURE_OPEN, FALSE,
 	                        &g_ControlDevice);
 	if (!NT_SUCCESS(status)) {
@@ -1890,16 +1957,39 @@ static void XcInstallWrappers(PDRIVER_OBJECT DriverObject)
 
 #else   /* XBOXCTL_USERMODE */
 
-/* The harness drives XcControlCommand directly; there is no device object
- * and no dispatch table to wrap. */
-static NTSTATUS XcControlDeviceCreate(PDRIVER_OBJECT DriverObject)
+/*
+ * The harness drives XcControlCommand directly; there is no device object
+ * and no dispatch table to wrap. The COUNT is kept, though, because the
+ * lifetime is the thing worth testing: a control device that outlives the
+ * last pad pins the driver in memory and the next install silently does
+ * nothing.
+ */
+/*
+ * AND WHETHER IT WAS EVER DONE UNDER THE LOCK. ExAcquireFastMutex raises
+ * IRQL to APC_LEVEL and IoCreateDevice demands PASSIVE_LEVEL, so doing
+ * this inside the device lock is an IRQL violation - one that bugchecks
+ * during boot, where the pad is started, and leaves a machine that will
+ * not come up. The harness cannot raise IRQL, but it can count.
+ */
+LONG g_ControlDeviceAlive;
+LONG g_ControlDeviceUnderLock;
+extern long g_MutexDepth;
+
+static NTSTATUS XcControlDeviceCreate(void)
 {
-	(void)DriverObject;
+	if (g_MutexDepth != 0) {
+		g_ControlDeviceUnderLock = 1;
+	}
+	g_ControlDeviceAlive = 1;
 	return STATUS_SUCCESS;
 }
 
 static void XcControlDeviceDelete(void)
 {
+	if (g_MutexDepth != 0) {
+		g_ControlDeviceUnderLock = 1;
+	}
+	g_ControlDeviceAlive = 0;
 }
 
 static void XcInstallWrappers(PDRIVER_OBJECT DriverObject)
@@ -1984,13 +2074,12 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 	XcDeviceRegistryReset();
 	XcInstallWrappers(DriverObject);
 
-	status = XcControlDeviceCreate(DriverObject);
-	if (!NT_SUCCESS(status)) {
-		/* The minidriver still works; only configuring it does not.
-		 * Failing the load would leave the pad with no driver at all,
-		 * which is strictly worse. */
-		status = STATUS_SUCCESS;
-	}
+	/*
+	 * THE CONTROL DEVICE IS NOT CREATED HERE. It appears with the first
+	 * pad and goes with the last, so the driver can unload - see the
+	 * note above XcDeviceRegister.
+	 */
+	XcSetDriverObject(DriverObject);
 
-	return status;
+	return STATUS_SUCCESS;
 }
