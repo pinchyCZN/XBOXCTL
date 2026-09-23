@@ -1,0 +1,18 @@
+"Xbox pad"
+045E --productid 0285
+
+verifier /standard /driver xboxctl.sys
+
+verifier /standard /faults 2000 /driver xboxctl.sys
+
+verifier /query
+
+verifier /querysettings
+
+
+"c:\Program Files\Oracle\VirtualBox\VBoxManage.exe" setextradata "win10_h2_test2" "VBoxInternal/Devices/acpi/0/Config/S1Enabled" 1
+"c:\Program Files\Oracle\VirtualBox\VBoxManage.exe" setextradata "win10_h2_test2" "VBoxInternal/Devices/acpi/0/Config/S4Enabled" 1
+
+powercfg /a 
+
+rundll32.exe powrprof.dll,SetSuspendState 0,1,0

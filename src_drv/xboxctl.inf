@@ -26,7 +26,7 @@ Signature   = "$WINDOWS NT$"
 Class       = HIDClass
 ClassGuid   = {745A17A0-74D3-11D0-B6FE-00A0C90F57DA}
 Provider    = %ProviderName%
-DriverVer   = 09/22/2026,0.1.0922.1450
+DriverVer   = 09/22/2026,0.1.0922.1854
 CatalogFile = xboxctl.cat
 PnpLockdown = 1
 
@@ -98,6 +98,9 @@ AddReg = XboxCtl_Joystick
 ; default map in core.c - CORE_DEFAULT_BUTTONS. Change one and the other
 ; must change with it.
 ;
+; THE ORDER IS XBCD'S, not the order the controls sit in the raw packet,
+; so a profile or a habit built on that driver transfers unchanged.
+;
 ; Only VID_045E&PID_0289 is registered here. The key is per VID and PID, so
 ; a second pad model needs its own copy of this block.
 ; ---------------------------------------------------------------------
@@ -110,18 +113,21 @@ HKLM,%OEMKEY%\%VIDPID%\Axes\1,,,"Left stick Y"
 HKLM,%OEMKEY%\%VIDPID%\Axes\0,Attributes,1,01,01,00,00,01,00,30,00
 HKLM,%OEMKEY%\%VIDPID%\Axes\1,Attributes,1,01,01,00,00,01,00,31,00
 
+; Buttons 12 to 15 are declared but nothing drives them by default.
+; They exist so a layer or a chord has a destination; naming them
+; would advertise controls the pad does not have.
 HKLM,%OEMKEY%\%VIDPID%\Buttons\0,,,"A"
 HKLM,%OEMKEY%\%VIDPID%\Buttons\1,,,"B"
 HKLM,%OEMKEY%\%VIDPID%\Buttons\2,,,"X"
 HKLM,%OEMKEY%\%VIDPID%\Buttons\3,,,"Y"
 HKLM,%OEMKEY%\%VIDPID%\Buttons\4,,,"Black"
 HKLM,%OEMKEY%\%VIDPID%\Buttons\5,,,"White"
-HKLM,%OEMKEY%\%VIDPID%\Buttons\6,,,"Left trigger"
-HKLM,%OEMKEY%\%VIDPID%\Buttons\7,,,"Right trigger"
-HKLM,%OEMKEY%\%VIDPID%\Buttons\8,,,"Start"
-HKLM,%OEMKEY%\%VIDPID%\Buttons\9,,,"Back"
-HKLM,%OEMKEY%\%VIDPID%\Buttons\10,,,"Left stick click"
-HKLM,%OEMKEY%\%VIDPID%\Buttons\11,,,"Right stick click"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\6,,,"Start"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\7,,,"Back"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\8,,,"Left stick click"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\9,,,"Right stick click"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\10,,,"Left trigger"
+HKLM,%OEMKEY%\%VIDPID%\Buttons\11,,,"Right trigger"
 
 [Strings]
 ProviderName = "XBOXCTL"

@@ -39,7 +39,46 @@ Table of Contents
    5.1.  Two Poll Slots
    5.2.  The Report Queue
    5.3.  Coalescing
-   6.  The Tick
+   5.4.  Power
+   5.4.  Power
+
+   A DEVICE POWER TRANSITION IS HANDLED IN BOTH DIRECTIONS AND THE ORDER
+   IS ASYMMETRIC. Going down, the work happens BEFORE the IRP is
+   forwarded: once the bus has taken the device's power away, submitting
+   to it is meaningless. Coming up, it happens AFTER, in a completion
+   routine, because the hardware is not powered until the stack below has
+   finished with the IRP.
+
+   Going down: stop the poll engine with XC_STOP_POWER_DOWN, and RELEASE
+   EVERYTHING BEING HELD.
+
+   THE RELEASE IS THE HALF THAT IS EASY TO FORGET, and it is the one a
+   user would notice. A key or a mouse button asserted at the moment the
+   device suspends has nothing to release it: the release would have come
+   from a packet saying the control came back up, and no more packets are
+   coming. Without it the host holds that key down for the whole of the
+   suspend and after it.
+
+   NOT A DRAIN. The IRPs are cancelled but not freed and the device object
+   survives, so nothing can complete into freed memory. Waiting would also
+   be wrong - a power IRP can arrive at DISPATCH_LEVEL, where a wait is
+   not allowed.
+
+   Coming up: clear the bit and restart. A slot whose cancel has not
+   landed yet is still marked active, so it is skipped here; its
+   completion arrives with STATUS_CANCELLED, which is a failure, so it
+   asks the recovery worker for a restart and the worker resubmits it.
+   Polling resumes either way.
+
+   NOT VERIFIED ON HARDWARE. The logic above is covered by the harness,
+   including that a key held at the moment of suspend is released. The
+   IRP plumbing is not: the test VM's hypervisor advertises only S5, so
+   no sleep state can be entered and no device power IRP is ever
+   delivered. See kernel-debugging.txt section 7.6, which also records
+   why the extradata keys that appear to enable S1 or S4 must not be
+   tried on VirtualBox 7.0.4.
+
+6.  The Tick
    7.  The Configuration Transport
    8.  The Configurator
    9.  State
@@ -291,6 +330,63 @@ Table of Contents
    status leaves stale bytes from the previous packet in the buffer and
    the decode cannot tell.
 
+   NOTHING MAY COMPLETE A PnP IRP WITH STATUS_PENDING. IoCallDriver
+   returns STATUS_PENDING for a transfer it has queued, which is what a
+   successful submit looks like - so the status travels out of
+   XcPollStart, out of XcStartDevice, and into the start IRP unless it is
+   normalised. XcPollStart owes its caller whether polling STARTED, not
+   what the I/O manager thought of one submit.
+
+   DRIVER VERIFIER CALLS THIS 0xC9 ARG1=6 and names the driver.
+   WITHOUT VERIFIER IT IS WORSE AND SILENT: the PnP manager reads the
+   start IRP as still outstanding and waits for a completion that already
+   happened. PnP is serialised, so every device operation on the machine
+   stops behind it, and the symptom is a guest that freezes the instant
+   the pad is plugged in with nothing in the driver looking wrong.
+
+   A HALTED ENDPOINT IS CLEARED BEFORE A RETRY, NOT JUST RETRIED. A stall
+   persists until something clears it, so every resubmit onto a stalled
+   pipe fails exactly as the first did; the attempts are exhausted and
+   polling stops for good with the device still present, recoverable only
+   by a replug. The recovery worker therefore issues a pipe reset before
+   each attempt - at PASSIVE_LEVEL, which is why it belongs to the work
+   item and not to the completion routine.
+
+   ONLY WHILE THE PIPE IS IDLE. Resetting a pipe that still has a
+   transfer outstanding is not a meaningful request, and one slot can
+   fail while the other is still in flight. That one is about to fail the
+   same way, and the next pass finds both idle.
+
+   IN THIS WDK THERE IS NO WEAKER VARIANT TO PICK BY MISTAKE.
+   usb.h defines URB_FUNCTION_RESET_PIPE as
+   URB_FUNCTION_SYNC_RESET_PIPE_AND_CLEAR_STALL, both 0x1E, so the reset
+   clears the halt on the DEVICE as well as the host's view of it.
+
+   THE PORT IS NOT CYCLED. That is the heavier recovery - it destroys and
+   recreates the device object, so every handle holder sees a removal -
+   and it cannot be issued from the recovery worker without releasing the
+   in-flight reference first, because the removal it triggers waits on
+   exactly that reference. A pipe reset addresses the failure this driver
+   can actually hit; a genuinely departed device is PnP's to handle.
+
+   A FAILED TRANSFER IS NEVER RESUBMITTED FROM THE COMPLETION ROUTINE.
+   When the device is gone the bus driver fails a submit SYNCHRONOUSLY -
+   IoCallDriver does not return until the completion routine has already
+   run - so resubmitting from inside it re-enters it on the same stack,
+   and with a device that fails every time the recursion is unbounded.
+
+   MEASURED ON A LIVE UNPLUG: twenty nested completion frames through
+   usbhub and USBPORT on one stack, a guest that froze, and a bugcheck
+   when the DPC stack ran out. The freeze is the whole machine, not the
+   driver, because a runaway DPC starves every other thread on the
+   processor - including the PnP thread that would have stopped it.
+
+   The success path still resubmits inline and is safe there, because it
+   is rate-limited by the endpoint: a transfer that carried data cannot
+   have its successor complete instantly. Only the failure path hands
+   off, to a work item that retries at PASSIVE_LEVEL a bounded number of
+   times and then gives up and lets PnP tear the device down.
+
    TEARDOWN WAITS, AND THIS IS NOT OPTIONAL. IoCancelIrp only ASKS; the
    bus driver completes the transfer some time later. Freeing the IRP on
    the strength of having called it means the completion lands in freed
@@ -369,12 +465,16 @@ Table of Contents
    advancing if packets stop arriving - a stalled pipe, a pad unplugged
    mid-autofire - so that whatever is held gets released.
 
-   THE PACKET RATE IS ASSUMED, NOT MEASURED. Everything in the stick
-   pipeline scales by elapsed time, so a wrong assumption degrades feel
-   rather than breaking anything, but the emission-rate reasoning in
-   analog-to-mouse.txt section 3.3 depends on the real number. The driver
-   records Pipes[].Interval at StartDevice; read it off a live device and
-   record it here.
+   THE PACKET RATE IS 250 Hz, MEASURED. bInterval on the interrupt IN
+   endpoint of an Xbox Controller S, VID 045E PID 0285, read out of
+   DevExt->PollInterval on a running driver, is 4. The device is USB 1.1
+   full speed, where the unit is a 1ms frame, so a packet arrives every
+   4ms.
+
+   THAT IS THE EMISSION RATE THE ENGINE GETS FOR FREE, and it is the rate
+   analog-to-mouse.txt section 3.3 wanted: enough that a rendered frame
+   at 60fps contains four of them, so the per-frame mouse delta is even.
+   No interpolation timer is needed for the stick path.
 
    THE ELAPSED INTERVAL IS CLAMPED at 50ms. A resume from sleep, a
    debugger break or DPC starvation can hand the engine a gap of seconds,
@@ -501,14 +601,14 @@ Table of Contents
    |   | queue, poll engine, harness    | projects build on both           |
    |   |                                | platforms. DONE                  |
    +---+--------------------------------+----------------------------------+
-   | 2 | Bring-up in a VM, on hardware  | three child devnodes appear,     |
+   | 2 | Bring-up in a VM, on hardware  | DONE. Loads, binds, three child  |
    |   |                                | the gamepad works in joy.cpl     |
    |   |                                | and in a game, Device Manager    |
    |   |                                | shows no errors, and the         |
    |   |                                | keyboard and mouse are silent    |
    +---+--------------------------------+----------------------------------+
-   | 3 | Record the measured endpoint   | section 6 names a number rather  |
-   |   | interval                       | than an assumption               |
+   | 3 | Record the measured endpoint   | DONE. 4ms, 250 Hz; section 6     |
+   |   | interval                       | names it                         |
    +---+--------------------------------+----------------------------------+
    | 4 | The config blob: parse,        | a hand-built blob delivered by   |
    |   | validate, feature report 5,    | feature report changes a         |

@@ -44,6 +44,7 @@ Table of Contents
    7.3.  Watching A Packet Arrive
    7.4.  After A Bugcheck
    7.5.  The Pad Has To Reach The Guest First
+   7.6.  The Guest Has No Sleep State, And Cannot Be Given One
    8.  When It Does Not Connect
 
 1.  The Virtual Serial Port
@@ -256,6 +257,23 @@ Table of Contents
    .reload /f xboxctl.sys after a deploy, or accept that every offset is
    a guess.
 
+   AND THE DEBUGGER HOLDS THAT FILE OPEN, WHICH BREAKS THE NEXT BUILD.
+   Once kd has loaded our symbols the linker cannot rewrite the .pdb and
+   fails with
+
+       LINK : fatal error LNK1201: error writing to program database
+
+   whose text - disk space, invalid path, privilege - names none of the
+   real causes and sends you looking in the wrong place. The daemon holds
+   one kd for the life of the VM, so the lock outlives any single query.
+
+   Drop it before building, and reload after deploying:
+
+       python tools/kdc.py ".reload /u xboxctl.sys"
+
+   Kernel symbols are unaffected: they come from the symbol server cache,
+   which nothing here rewrites.
+
 6.  Driver Verifier
 
    TURN IT ON FOR THIS DRIVER BEFORE TRUSTING ANY RESULT. Verifier turns
@@ -423,6 +441,43 @@ Table of Contents
    A FILTER BEATS ATTACHING BY HAND, because it captures the device as it
    arrives rather than trying to take it from a host that has already
    enumerated it.
+
+7.6.  The Guest Has No Sleep State, And Cannot Be Given One
+
+   THE POWER PATH CANNOT BE EXERCISED ON THIS VM. VirtualBox 7.0.4
+   advertises only S5 to the guest:
+
+       kd> !pocaps
+         Misc Supported Features:  PwrButton SlpButton S5 FullWake
+
+   No S1, S2, S3 or S4, so there is no state to enter and
+   SetSuspendState correctly does nothing. That is the hypervisor, not
+   the driver and not the guest's configuration.
+
+   THE EXTRADATA KEYS THAT USED TO ENABLE THIS ARE GONE, and this is a
+   trap because they are still widely quoted and they do not fail
+   harmlessly. Setting either of
+
+       VBoxInternal/Devices/acpi/0/Config/S1Enabled
+       VBoxInternal/Devices/acpi/0/Config/S4Enabled
+
+   leaves a VM that REFUSES TO START, with
+
+       Unknown configuration value '/S1Enabled' found in the
+       configuration of acpi instance #0  (VERR_CFGM_CONFIG_UNKNOWN_VALUE)
+
+   and a recorded state of "aborted". Both were rejected on 7.0.4, one
+   at a time - CFGM stops at the first unknown value, so removing one
+   only reveals the next. Clear them by setting the key with no value:
+
+       VBoxManage setextradata "<vm>" ^
+           "VBoxInternal/Devices/acpi/0/Config/S1Enabled"
+
+   CONSEQUENCE FOR THE DRIVER. XcPowerDown and XcPowerUp are covered by
+   the harness, including that a held key is released on suspend, but
+   the IRP plumbing around them has never run. Closing that needs real
+   hardware or a hypervisor that offers a sleep state; see
+   driver-plan.txt section 5.4.
 
 8.  When It Does Not Connect
 

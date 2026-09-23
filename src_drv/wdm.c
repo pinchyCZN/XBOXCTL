@@ -355,6 +355,46 @@ void XcOnTransfer(PXC_DEVEXT DevExt, NTSTATUS Status, const u8 *Buffer,
 	KeReleaseSpinLock(&DevExt->CoreLock, irql);
 }
 
+BOOLEAN XcPollAllIdle(PXC_DEVEXT DevExt)
+{
+	ULONG i;
+
+	for (i = 0; i < XC_POLL_SLOTS; i++) {
+		if (DevExt->Poll[i].Active) {
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+void XcPollFinish(PXC_DEVEXT DevExt, ULONG SlotIndex, NTSTATUS Status)
+{
+	/*
+	 * ONLY A TRANSFER THAT SUCCEEDED IS RESUBMITTED HERE. The bus
+	 * driver fails a submit to a departed device SYNCHRONOUSLY, so
+	 * resubmitting from the completion routine re-enters it on the same
+	 * stack, and with a device that fails every time that recursion
+	 * does not stop. A failure is handed to the work item instead.
+	 *
+	 * RESUBMIT BEFORE RELEASING. The new transfer takes its own
+	 * reference while this one still holds its own, so the count never
+	 * touches zero while polling is meant to continue - and a drain
+	 * that runs in between cannot conclude the device is idle when it
+	 * is not.
+	 */
+	if (!NT_SUCCESS(Status)) {
+		DevExt->Poll[SlotIndex].Active = FALSE;
+		XcRequestPollRestart(DevExt);
+	} else if (DevExt->PollStopMask == 0 && !DevExt->Removed) {
+		DevExt->PollRetries = 0;
+		XcPollSubmit(DevExt, SlotIndex);
+	} else {
+		DevExt->Poll[SlotIndex].Active = FALSE;
+	}
+
+	XcIoRelease(DevExt);
+}
+
 #ifndef XBOXCTL_USERMODE
 
 static NTSTATUS XcPollComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
@@ -385,22 +425,7 @@ static NTSTATUS XcPollComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
 	XcOnTransfer(DevExt, status, slot->Buffer, transferred,
 	             (u64)KeQueryInterruptTime());
 
-	/*
-	 * Resubmit this slot immediately. The other slot is still in flight,
-	 * so the endpoint is never left unqueued.
-	 *
-	 * RESUBMIT BEFORE RELEASING. The new transfer takes its own reference
-	 * while this one still holds its own, so the count never touches zero
-	 * while polling is meant to continue - and a drain that runs in
-	 * between cannot conclude the device is idle when it is not.
-	 */
-	if (DevExt->PollStopMask == 0 && !DevExt->Removed) {
-		XcPollSubmit(DevExt, slot->Index);
-	} else {
-		slot->Active = FALSE;
-	}
-
-	XcIoRelease(DevExt);
+	XcPollFinish(DevExt, slot->Index, status);
 
 	/* The IRP is ours and is reused, so the I/O manager must not touch
 	 * it after this returns. */
@@ -449,9 +474,98 @@ NTSTATUS XcPollSubmit(PXC_DEVEXT DevExt, ULONG SlotIndex)
 	return IoCallDriver(DevExt->LowerDeviceObject, slot->Irp);
 }
 
+/*
+ * Error recovery, at PASSIVE_LEVEL and off the completion stack.
+ *
+ * Retries the inactive slots a bounded number of times with a delay
+ * between attempts. A device that is genuinely gone fails all of them
+ * and polling stops; PnP removal follows and the drain collects what
+ * is left. A transient stall recovers on the first or second attempt.
+ */
+static VOID NTAPI XcPollRestartWorker(PDEVICE_OBJECT DeviceObject,
+                                      PVOID Context)
+{
+	PXC_DEVEXT    DevExt = (PXC_DEVEXT)Context;
+	LARGE_INTEGER delay;
+	ULONG         attempt;
+	ULONG         i;
+
+	(void)DeviceObject;
+
+	for (attempt = 0; attempt < XC_POLL_RETRY_MAX; attempt++) {
+		int failed = 0;
+
+		if (DevExt->Removed || DevExt->PollStopMask != 0) {
+			break;
+		}
+
+		/*
+		 * CLEAR THE PIPE FIRST, BUT ONLY WHILE NOTHING IS ON IT. A
+		 * stall is the failure a retry alone cannot fix, and resetting
+		 * a pipe that still has a transfer outstanding is not a
+		 * meaningful request. One slot can fail while the other is
+		 * still in flight; that one is about to fail the same way, and
+		 * the next attempt through this loop finds both idle.
+		 */
+		if (XcPollAllIdle(DevExt)) {
+			XcResetPipe(DevExt);
+		}
+
+		for (i = 0; i < XC_POLL_SLOTS; i++) {
+			NTSTATUS st;
+
+			if (DevExt->Poll[i].Active) {
+				continue;
+			}
+			st = XcPollSubmit(DevExt, i);
+			if (!NT_SUCCESS(st) && st != STATUS_PENDING) {
+				failed = 1;
+			}
+		}
+		if (!failed) {
+			break;
+		}
+
+		DevExt->PollRetries++;
+		delay.QuadPart = -((LONGLONG)XC_POLL_RETRY_MS * 10000);
+		KeDelayExecutionThread(KernelMode, FALSE, &delay);
+	}
+
+	InterlockedExchange(&DevExt->RestartQueued, 0);
+	XcIoRelease(DevExt);
+}
+
+void XcRequestPollRestart(PXC_DEVEXT DevExt)
+{
+	DevExt->PollRestartRequests++;
+
+	if (DevExt->RestartWorkItem == NULL) {
+		return;
+	}
+	/* One outstanding at a time. */
+	if (InterlockedCompareExchange(&DevExt->RestartQueued, 1, 0) != 0) {
+		return;
+	}
+	/* A refused reference means teardown has begun and owns the
+	 * recovery; the drain must not be left waiting on a worker that
+	 * is about to be queued. */
+	if (!XcIoAcquire(DevExt)) {
+		InterlockedExchange(&DevExt->RestartQueued, 0);
+		return;
+	}
+
+	IoQueueWorkItem((PIO_WORKITEM)DevExt->RestartWorkItem,
+	                XcPollRestartWorker, DelayedWorkQueue, DevExt);
+}
+
 static NTSTATUS XcPollAllocate(PXC_DEVEXT DevExt)
 {
 	ULONG i;
+
+	DevExt->RestartWorkItem = IoAllocateWorkItem(DevExt->Fdo);
+	if (DevExt->RestartWorkItem == NULL) {
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
 
 	for (i = 0; i < XC_POLL_SLOTS; i++) {
 		DevExt->Poll[i].Index = i;
@@ -476,6 +590,13 @@ static void XcPollFree(PXC_DEVEXT DevExt)
 {
 	ULONG i;
 
+	/* Safe only after the drain: a queued worker holds a reference, so
+	 * by the time the count reaches zero none can still be pending. */
+	if (DevExt->RestartWorkItem != NULL) {
+		IoFreeWorkItem((PIO_WORKITEM)DevExt->RestartWorkItem);
+		DevExt->RestartWorkItem = NULL;
+	}
+
 	for (i = 0; i < XC_POLL_SLOTS; i++) {
 		if (DevExt->Poll[i].Urb != NULL) {
 			ExFreePoolWithTag(DevExt->Poll[i].Urb, XC_POOL_TAG);
@@ -497,7 +618,30 @@ NTSTATUS XcPollSubmit(PXC_DEVEXT DevExt, ULONG SlotIndex)
 		return STATUS_DELETE_PENDING;
 	}
 	DevExt->Poll[SlotIndex].Active = TRUE;
-	return STATUS_SUCCESS;
+
+	/*
+	 * STATUS_PENDING, BECAUSE THAT IS WHAT IoCallDriver RETURNS for a
+	 * transfer it has queued. Returning STATUS_SUCCESS here would make
+	 * the harness unable to see the one status that must never reach a
+	 * PnP IRP.
+	 */
+	return STATUS_PENDING;
+}
+
+/*
+ * The harness has no work item and no second thread, so it records the
+ * request and stops. What is worth testing is that the completion
+ * routine ASKS rather than resubmitting on its own stack.
+ */
+void XcRequestPollRestart(PXC_DEVEXT DevExt)
+{
+	DevExt->PollRestartRequests++;
+}
+
+/* No USB stack here; the count is what the tests assert on. */
+void XcResetPipe(PXC_DEVEXT DevExt)
+{
+	DevExt->PipeResets++;
 }
 
 #endif  /* XBOXCTL_USERMODE */
@@ -530,6 +674,29 @@ NTSTATUS XcPollStart(PXC_DEVEXT DevExt, ULONG Reason)
 			}
 		}
 	}
+
+	/*
+	 * NORMALISE STATUS_PENDING TO SUCCESS. IoCallDriver returns it for
+	 * a transfer that was queued and will complete later, which is
+	 * precisely what starting to poll means - but this value is
+	 * returned all the way out to XcStartDevice and from there into a
+	 * PnP IRP's IoStatus.Status, and COMPLETING AN IRP WITH
+	 * STATUS_PENDING IS A CONTRACT VIOLATION.
+	 *
+	 * Driver Verifier bugchecks 0xC9 arg1=6 on it and names the driver.
+	 * WITHOUT VERIFIER IT IS WORSE AND SILENT: the PnP manager reads
+	 * the start IRP as still outstanding and waits for a completion
+	 * that already happened, and because PnP is serialised every
+	 * device operation on the machine stops behind it. The symptom is
+	 * a guest that freezes the moment the pad is plugged in, with
+	 * nothing in the driver looking wrong.
+	 *
+	 * The status this function owes its caller is whether polling
+	 * STARTED, not what the I/O manager thought of one submit.
+	 */
+	if (status == STATUS_PENDING) {
+		status = STATUS_SUCCESS;
+	}
 	return status;
 }
 
@@ -559,6 +726,43 @@ void XcPollStop(PXC_DEVEXT DevExt, ULONG Reason)
 		}
 	}
 #endif
+}
+
+void XcPowerDown(PXC_DEVEXT DevExt)
+{
+	KIRQL irql;
+
+	XcPollStop(DevExt, XC_STOP_POWER_DOWN);
+
+	/*
+	 * LET GO OF EVERYTHING BEING HELD. See the note in wdm.h: nothing else
+	 * will, because the release would have come from a packet and no more
+	 * packets are coming.
+	 *
+	 * NOT A DRAIN. The IRPs are cancelled but not freed and the device
+	 * object survives, so there is nothing here that a late completion
+	 * could land in. Waiting would also be wrong: a power IRP can arrive
+	 * at DISPATCH_LEVEL, where a wait is not allowed.
+	 */
+	KeAcquireSpinLock(&DevExt->CoreLock, &irql);
+	core_release_all(&DevExt->Core);
+	KeReleaseSpinLock(&DevExt->CoreLock, irql);
+}
+
+void XcPowerUp(PXC_DEVEXT DevExt)
+{
+	if (DevExt->Removed) {
+		return;
+	}
+
+	/*
+	 * A SLOT WHOSE CANCEL HAS NOT LANDED YET IS STILL MARKED ACTIVE, so
+	 * XcPollStart skips it and it does not restart here. That is not a
+	 * leak: its completion arrives with STATUS_CANCELLED, which is a
+	 * failure, so it asks the recovery worker for a restart and the worker
+	 * resubmits it. Polling resumes either way.
+	 */
+	(void)XcPollStart(DevExt, XC_STOP_POWER_DOWN);
 }
 
 /*
@@ -817,6 +1021,35 @@ static NTSTATUS XcSendUrb(PXC_DEVEXT DevExt, PURB Urb)
 	return status;
 }
 
+void XcResetPipe(PXC_DEVEXT DevExt)
+{
+	struct _URB_PIPE_REQUEST *urb;
+
+	if (DevExt->InPipe == NULL || DevExt->Removed) {
+		return;
+	}
+
+	urb = (struct _URB_PIPE_REQUEST *)ExAllocatePoolWithTag(
+	        NonPagedPool, sizeof(struct _URB_PIPE_REQUEST),
+	        XC_POOL_TAG);
+	if (urb == NULL) {
+		return;
+	}
+
+	RtlZeroMemory(urb, sizeof(struct _URB_PIPE_REQUEST));
+	urb->Hdr.Length = (USHORT)sizeof(struct _URB_PIPE_REQUEST);
+	urb->Hdr.Function = URB_FUNCTION_RESET_PIPE;
+	urb->PipeHandle = DevExt->InPipe;
+
+	DevExt->PipeResets++;
+	(void)XcSendUrb(DevExt, (PURB)urb);
+
+	/* The result is deliberately ignored. A reset that fails leaves us
+	 * exactly where we were - about to retry a submit that will fail -
+	 * and the retry count is what ends the attempt either way. */
+	ExFreePoolWithTag(urb, XC_POOL_TAG);
+}
+
 NTSTATUS XcStartDevice(PDEVICE_OBJECT Fdo, PIRP Irp)
 {
 	PXC_DEVEXT                    DevExt = XC_GET_DEVEXT(Fdo);
@@ -1003,6 +1236,16 @@ NTSTATUS NTAPI XcPnp(PDEVICE_OBJECT Fdo, PIRP Irp)
 		if (NT_SUCCESS(status)) {
 			status = XcStartDevice(Fdo, Irp);
 		}
+		/*
+		 * A BACKSTOP, NOT THE FIX. XcPollStart already normalises
+		 * this; the guard is here because the cost of the status
+		 * being STATUS_PENDING is not a failed start but a wedged
+		 * machine, and a future caller of XcStartDevice should not be
+		 * able to reintroduce that from somewhere else.
+		 */
+		if (status == STATUS_PENDING) {
+			status = STATUS_SUCCESS;
+		}
 		Irp->IoStatus.Status = status;
 		IoCompleteRequest(Irp, IO_NO_INCREMENT);
 		return status;
@@ -1031,9 +1274,47 @@ NTSTATUS NTAPI XcPnp(PDEVICE_OBJECT Fdo, PIRP Irp)
 	return IoCallDriver(DevExt->LowerDeviceObject, Irp);
 }
 
+static NTSTATUS XcPowerUpComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
+                                  PVOID Context)
+{
+	PXC_DEVEXT DevExt = (PXC_DEVEXT)Context;
+
+	(void)DeviceObject;
+
+	/* PROPAGATE PENDING. A completion routine that swallows it leaves the
+	 * caller believing the IRP finished synchronously. */
+	if (Irp->PendingReturned) {
+		IoMarkIrpPending(Irp);
+	}
+
+	if (NT_SUCCESS(Irp->IoStatus.Status)) {
+		XcPowerUp(DevExt);
+	}
+	return STATUS_SUCCESS;
+}
+
 NTSTATUS NTAPI XcPower(PDEVICE_OBJECT Fdo, PIRP Irp)
 {
-	PXC_DEVEXT DevExt = XC_GET_DEVEXT(Fdo);
+	PXC_DEVEXT         DevExt = XC_GET_DEVEXT(Fdo);
+	PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+
+	if (stack->MinorFunction == IRP_MN_SET_POWER &&
+	    stack->Parameters.Power.Type == DevicePowerState) {
+
+		if (stack->Parameters.Power.State.DeviceState == PowerDeviceD0) {
+			/* UP: act on the way back, once the stack below has
+			 * powered the hardware. */
+			IoCopyCurrentIrpStackLocationToNext(Irp);
+			IoSetCompletionRoutine(Irp, XcPowerUpComplete, DevExt,
+			                       TRUE, TRUE, TRUE);
+			PoStartNextPowerIrp(Irp);
+			return PoCallDriver(DevExt->LowerDeviceObject, Irp);
+		}
+
+		/* DOWN, to any of D1, D2 or D3: stop touching the hardware and
+		 * let go of what is held, before the bus removes power. */
+		XcPowerDown(DevExt);
+	}
 
 	PoStartNextPowerIrp(Irp);
 	IoSkipCurrentIrpStackLocation(Irp);

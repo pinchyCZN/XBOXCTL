@@ -296,11 +296,10 @@ Table of Contents
    |   500 Hz  | 8.33         | 50 px +/- 1         | smooth                  |
    +-----------+--------------+---------------------+-------------------------+
 
-   250 Hz IS THE TARGET and it is probably free. The commented-out pipe
-   setup in XBCDStartDevice assumes Interval 4, which is 4 ms on a full
-   speed endpoint - 250 Hz - so the pad's own packet rate may be exactly
-   what is wanted with no timer at all. That is an assumption, not a
-   measurement: read Pipes[0].Interval at StartDevice and record it.
+   250 Hz IS THE TARGET AND IT IS FREE. bInterval on the pad's interrupt
+   IN endpoint is 4, read off a running driver; the device is USB 1.1
+   full speed, where the unit is a 1ms frame, so a packet arrives every
+   4ms. The stick path therefore needs no timer of its own.
 
    IF THE MEASURED PACKET RATE IS BELOW THE CONFIGURED EMISSION RATE,
    interpolate. Run a periodic DPC at the emission rate that advances the

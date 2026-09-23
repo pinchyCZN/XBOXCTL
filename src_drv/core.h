@@ -127,6 +127,9 @@ typedef signed   long long  s64;
 #define CORE_SA_RSTICK_YPOS     23
 #define CORE_SA_GUIDE           24
 
+/* Not a semiaxis. Marks an axis half that nothing drives. */
+#define CORE_SA_NONE            0xFF
+
 /* ======================================================================
  * THE COMPOSITE HID DESCRIPTOR
  *
@@ -156,7 +159,7 @@ typedef signed   long long  s64;
  * Payload sizes, EXCLUDING the leading report ID byte. The sink is handed a
  * payload and an ID; whoever writes the wire format prepends the ID.
  */
-#define CORE_GAMEPAD_PAYLOAD    39
+#define CORE_GAMEPAD_PAYLOAD    36
 #define CORE_KEYBOARD_PAYLOAD   8
 #define CORE_MOUSE_PAYLOAD      7
 
@@ -166,24 +169,49 @@ typedef signed   long long  s64;
 /*
  * Gamepad payload layout, byte offsets past the report ID.
  *
- *     0..2    buttons 1..24
- *     3..16   X Y Z Rx Ry Rz Slider, signed 16-bit little endian
- *     17      hat in the low nibble, four pad bits
- *     18      active layout, 1-based
- *     19..38  the raw 20-byte packet, verbatim
+ *     0..1    buttons 1..16
+ *     2..13   X Y Rx Ry Z Rz, signed 16-bit little endian
+ *     14      hat in the low nibble, four pad bits
+ *     15      active layout, 1-based
+ *     16..35  the raw 20-byte packet, verbatim
+ *
+ * SIXTEEN BUTTONS IS TWO BYTES WITH NO PADDING, and it is the count the
+ * pad justifies plus a little. Twelve controls map one to one - the six
+ * analog face buttons, both triggers, Start, Back and the two thumb
+ * clicks - and the D-pad is the hat rather than four more. The spare four
+ * exist so a layer or a chord has somewhere to put a gamepad button that
+ * no single control produces.
+ *
+ * DECLARING MORE IS NOT FREE. Every button an application can see but
+ * never press is a dead row in its binding UI, and the count cannot be
+ * changed later without changing the device's identity and making every
+ * game re-bind.
  *
  * THE RAW PACKET RIDES ALONG ON PURPOSE. A configurator asking "press the
  * control you want to bind" gets the mapped output and the physical truth
  * from one HID read, with no second channel to open.
  */
 #define CORE_GP_BUTTONS         0
-#define CORE_GP_AXES            3
-#define CORE_GP_HAT             17
-#define CORE_GP_LAYOUT          18
-#define CORE_GP_RAW             19
+#define CORE_GP_AXES            2
+#define CORE_GP_HAT             14
+#define CORE_GP_LAYOUT          15
+#define CORE_GP_RAW             16
 
-#define CORE_GP_AXIS_COUNT      7
-#define CORE_GP_BUTTON_COUNT    24
+/*
+ * SIX AXES, IN TWO KINDS. The sticks are bipolar and rest at centre; the
+ * triggers are unipolar and rest at zero, so they are declared as a
+ * separate item with their own logical range rather than sharing the
+ * sticks'. A trigger on a bipolar axis rests in the middle of its bar and
+ * wastes half of it.
+ *
+ * DirectInput recognises eight axes in total - X, Y, Z, Rx, Ry, Rz and two
+ * sliders - so six leaves two spare. Nothing drives a slider, so none is
+ * declared: an axis an application can see and nothing can move is a dead
+ * bar in every properties page.
+ */
+#define CORE_GP_AXIS_COUNT      6
+#define CORE_GP_STICK_AXES      4       /* bipolar, declared first */
+#define CORE_GP_BUTTON_COUNT    16
 #define CORE_HAT_CENTRED        8
 
 /*

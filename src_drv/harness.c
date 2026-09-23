@@ -716,9 +716,24 @@ static int test_transport(void)
 	static XC_DEVEXT devext;
 	XC_REPORT_NODE   node;
 	u8               packet[CORE_RAW_PACKET_BYTES];
+	NTSTATUS         status;
 
 	XcDevExtInit(&devext);
-	XcStartDevice((PDEVICE_OBJECT)&devext, NULL);
+	status = XcStartDevice((PDEVICE_OBJECT)&devext, NULL);
+
+	/*
+	 * NEVER STATUS_PENDING. This value is what XcPnp writes into the
+	 * start IRP before completing it, and an IRP completed with
+	 * STATUS_PENDING makes the PnP manager wait forever for a
+	 * completion that already happened - which stops every device
+	 * operation on the machine, because PnP is serialised. Verifier
+	 * calls it 0xC9 arg1=6; without Verifier the guest simply freezes
+	 * the moment the pad is plugged in.
+	 */
+	check(status != STATUS_PENDING,
+	      "StartDevice never reports STATUS_PENDING");
+	check_eq((long)status, (long)STATUS_SUCCESS,
+	         "StartDevice reports plain success");
 
 	check(devext.Started, "device started");
 	check_eq((long)devext.PollStopMask, 0, "no stop reason outstanding");
@@ -737,6 +752,34 @@ static int test_transport(void)
 	check_eq((long)devext.PollErrors, 2, "short transfer counted");
 	check_eq((long)devext.ReportCount, 0, "and produced nothing");
 
+	/*
+	 * A FAILED TRANSFER MUST NOT BE RESUBMITTED ON THE CALLER'S STACK.
+	 * The bus driver fails a submit to a departed device synchronously, so
+	 * resubmitting from the completion routine re-enters it and does not
+	 * stop. Recovery is asked for and happens elsewhere.
+	 */
+	{
+		ULONG before = devext.PollRestartRequests;
+
+		XcPollFinish(&devext, 0, STATUS_DEVICE_NOT_CONNECTED);
+		check(!devext.Poll[0].Active,
+		      "a failed slot goes inactive, not straight back out");
+		check_eq((long)(devext.PollRestartRequests - before), 1,
+		         "and recovery is REQUESTED rather than done inline");
+	}
+
+	/*
+	 * THE PIPE IS ONLY RESET WHILE NOTHING IS ON IT. Slot 1 is still
+	 * in flight at this point, so the reset has to wait; resetting a
+	 * pipe with an outstanding transfer is not a meaningful request.
+	 */
+	check(!XcPollAllIdle(&devext),
+	      "one slot down does not make the pipe idle");
+	XcPollFinish(&devext, 1, STATUS_DEVICE_NOT_CONNECTED);
+	check(XcPollAllIdle(&devext), "both slots down does");
+	check_eq((long)devext.PipeResets, 0,
+	         "and nothing has reset the pipe on the failure path");
+
 	/* A good packet reaches the queue. */
 	packet[CORE_RAW_DIGITAL] = CORE_DIG_BACK;
 	XcOnTransfer(&devext, STATUS_SUCCESS, packet,
@@ -749,20 +792,52 @@ static int test_transport(void)
 	check_eq(node.Data[1 + CORE_GP_RAW + CORE_RAW_DIGITAL], CORE_DIG_BACK,
 	         "the raw packet rides along in the diagnostic tail");
 
-	/* The right stick must land on Rx/Ry, not on Z. Anything that
-	 * auto-maps a gamepad expects it there. */
+	/*
+	 * AXIS ORDER IS X, Y, Rx, Ry, Z, Rz. The right stick must land on
+	 * Rx/Ry - anything that auto-maps a gamepad expects it there - and
+	 * the triggers on Z/Rz, which is the only way their pressure
+	 * reaches an application at all.
+	 */
 	make_packet(packet);
 	put_le16(&packet[CORE_RAW_RSTICK_X], 32767);
+	packet[CORE_RAW_ANALOG_BASE + 6] = 255;       /* left trigger  */
+	packet[CORE_RAW_ANALOG_BASE + 7] = 128;       /* right trigger */
 	XcOnTransfer(&devext, STATUS_SUCCESS, packet,
 	             CORE_RAW_PACKET_BYTES, 4000);
 	check(XcDequeueReport(&devext, &node), "report queued");
 	{
 		const u8 *ax = &node.Data[1 + CORE_GP_AXES];
-		s16 z  = (s16)(ax[4] | (ax[5] << 8));
-		s16 rx = (s16)(ax[6] | (ax[7] << 8));
+		s16 x  = (s16)(ax[0] | (ax[1] << 8));
+		s16 rx = (s16)(ax[4] | (ax[5] << 8));
+		s16 z  = (s16)(ax[8] | (ax[9] << 8));
+		s16 rz = (s16)(ax[10] | (ax[11] << 8));
 
 		check(rx > 32000, "right stick X drives Rx");
-		check_eq(z, 0, "and leaves Z alone");
+		check_eq(x, 0, "and leaves the left stick alone");
+		check(z > 32000, "left trigger drives Z, full scale");
+		check(rz > 15000 && rz < 17500,
+		      "right trigger drives Rz, about half");
+		check(z >= 0 && rz >= 0,
+		      "a trigger is unipolar - it never goes negative");
+	}
+
+	/* Buttons follow XBCD numbering: Start is 7, the triggers 11 and
+	 * 12, and the D-pad is not a button at all. */
+	make_packet(packet);
+	packet[CORE_RAW_DIGITAL] = CORE_DIG_START | CORE_DIG_DPAD_LEFT;
+	packet[CORE_RAW_ANALOG_BASE + 6] = 255;       /* left trigger  */
+	XcOnTransfer(&devext, STATUS_SUCCESS, packet,
+	             CORE_RAW_PACKET_BYTES, 5000);
+	check(XcDequeueReport(&devext, &node), "report queued");
+	{
+		const u8 *b = &node.Data[1 + CORE_GP_BUTTONS];
+		u16 mask = (u16)(b[0] | (b[1] << 8));
+
+		check(mask & (1u << 6),  "Start is button 7");
+		check(mask & (1u << 10), "left trigger is button 11");
+		check_eq(mask & 0xF000, 0, "buttons 13..16 stay spare");
+		check_eq(node.Data[1 + CORE_GP_HAT], 6,
+		         "D-pad left reads as hat West");
 	}
 
 	/* Stopping releases the engine and disarms the tick. */
@@ -811,6 +886,57 @@ static int test_teardown(void)
 }
 
 /* ======================================================================
+ * POWER
+ *
+ * A pad that suspends mid-keypress must not leave the keyboard holding
+ * that key. Nothing else can release it: the release would have come from
+ * a packet, and no more packets are coming.
+ * ====================================================================== */
+
+static int test_power(void)
+{
+	static XC_DEVEXT devext;
+	XC_REPORT_NODE   node;
+
+	XcDevExtInit(&devext);
+	XcStartDevice((PDEVICE_OBJECT)&devext, NULL);
+	check_eq(devext.IoCount, 3, "two transfers in flight");
+
+	/* Hold a key down, and clear the reports that produced. */
+	core_key_event(&devext.Core, 0x1A, 1);          /* W down */
+	while (XcDequeueReport(&devext, &node)) {
+		/* drain */
+	}
+
+	XcPowerDown(&devext);
+	check(devext.PollStopMask & XC_STOP_POWER_DOWN,
+	      "suspending stops the poll engine");
+	check(XcPollAllIdle(&devext), "with no transfer left in flight");
+	check_eq(devext.IoCount, 1, "and their references released");
+
+	check(XcDequeueReport(&devext, &node),
+	      "suspending emits a report of its own");
+	check_eq(node.Data[0], CORE_REPORT_ID_KEYBOARD, "a keyboard report");
+	check_eq(node.Data[1 + CORE_KB_KEYS], 0, "WITH THE HELD KEY RELEASED");
+
+	XcPowerUp(&devext);
+	check_eq((long)devext.PollStopMask, 0, "resuming restarts polling");
+	check_eq(devext.IoCount, 3, "both slots back in flight");
+
+	/* And a suspend with nothing held is not news. */
+	XcPowerDown(&devext);
+	while (XcDequeueReport(&devext, &node)) {
+		/* drain */
+	}
+	XcPowerUp(&devext);
+	XcPowerDown(&devext);
+	check_eq((long)devext.ReportCount, 0,
+	         "suspending with nothing held emits nothing");
+
+	return 0;
+}
+
+/* ======================================================================
  * THE REGISTRATION CONTRACT
  * ====================================================================== */
 
@@ -850,6 +976,7 @@ int main(int argc, char **argv)
 	printf("[queue]\n");        test_queue();
 	printf("[transport]\n");    test_transport();
 	printf("[teardown]\n");     test_teardown();
+	printf("[power]\n");        test_power();
 	printf("[registration]\n"); test_driver_entry();
 
 	printf("---------------\n");

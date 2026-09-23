@@ -59,6 +59,25 @@
 
 #define XC_POLL_SLOTS           2
 
+/*
+ * A FAILED TRANSFER IS NEVER RESUBMITTED FROM THE COMPLETION ROUTINE.
+ *
+ * When the device is gone the bus driver fails a submit SYNCHRONOUSLY:
+ * IoCallDriver does not return until the completion routine has already
+ * run, so resubmitting from inside it re-enters it on the same stack.
+ * With a device that fails every time, that recursion is unbounded and
+ * exhausts the DPC stack. Measured on a live unplug: twenty nested
+ * XcPollComplete frames through usbhub and USBPORT, and a guest that
+ * froze and then bugchecked.
+ *
+ * The success path still resubmits inline, and is safe because it is
+ * rate-limited by the endpoint: a transfer that carried data cannot
+ * have its successor complete instantly. Only the failure path hands
+ * off, to a work item that retries at PASSIVE_LEVEL and gives up.
+ */
+#define XC_POLL_RETRY_MAX       3
+#define XC_POLL_RETRY_MS        50
+
 typedef struct _XC_POLL_SLOT {
 	PIRP        Irp;
 	PURB        Urb;
@@ -143,6 +162,14 @@ typedef struct _XC_DEVEXT {
 	BOOLEAN             IoDraining;
 	KEVENT              IoIdle;
 
+	/* Error recovery. RestartWorkItem is a PIO_WORKITEM, held as PVOID
+	 * so the harness needs no stub for a type it never dereferences. */
+	PVOID               RestartWorkItem;
+	LONG                RestartQueued;
+	ULONG               PollRetries;
+	ULONG               PollRestartRequests;
+	ULONG               PipeResets;
+
 	/* --- the report queue and the pending reads --- */
 	XC_REPORT_NODE      ReportQueue[XC_REPORT_QUEUE_MAX];
 	ULONG               ReportHead;
@@ -225,6 +252,68 @@ void     XcRemoveDevice(PXC_DEVEXT DevExt);
 BOOLEAN  XcIoAcquire(PXC_DEVEXT DevExt);
 void     XcIoRelease(PXC_DEVEXT DevExt);
 void     XcIoDrainAndWait(PXC_DEVEXT DevExt);
+
+/*
+ * Ask for polling to be restarted after a failed transfer. In the
+ * driver this queues a work item; the harness only counts the request.
+ * Either way it must NOT submit anything on the caller's stack - see
+ * the note above XC_POLL_RETRY_MAX.
+ */
+void     XcRequestPollRestart(PXC_DEVEXT DevExt);
+
+/*
+ * Clear a halted interrupt IN pipe.
+ *
+ * A HALTED ENDPOINT STAYS HALTED UNTIL SOMETHING CLEARS IT, so a retry
+ * loop on its own cannot recover from a stall: every resubmit onto a
+ * stalled pipe fails exactly as the first one did, the attempts are
+ * exhausted, and polling stops for good with the device still present.
+ * Only a replug would bring it back.
+ *
+ * PASSIVE_LEVEL only, which is why this belongs to the work item and
+ * not to the completion routine.
+ *
+ * In this WDK URB_FUNCTION_RESET_PIPE IS URB_FUNCTION_SYNC_RESET_PIPE_
+ * AND_CLEAR_STALL - usb.h defines the first as the second, both 0x1E -
+ * so the reset clears the halt on the DEVICE as well as the host's
+ * view of it. There is no weaker variant to choose by mistake.
+ */
+void     XcResetPipe(PXC_DEVEXT DevExt);
+
+/* True when no slot has a transfer outstanding. Resetting a pipe with
+ * one in flight is not meaningful; see XcPollRestartWorker. */
+BOOLEAN  XcPollAllIdle(PXC_DEVEXT DevExt);
+
+/*
+ * Device power transitions.
+ *
+ * THE ORDER IS ASYMMETRIC AND BOTH HALVES MATTER. Going down, the work
+ * happens BEFORE the IRP is forwarded: once the bus has taken the
+ * device's power away, submitting to it is meaningless. Coming up, the
+ * work happens AFTER, on the way back through a completion routine,
+ * because the hardware is not powered until the stack below has
+ * finished with the IRP.
+ *
+ * RELEASING WHAT IS HELD IS THE HALF THAT IS EASY TO FORGET. A key or
+ * a mouse button asserted at the moment the device suspends has
+ * nothing to release it: no packet will ever arrive saying the control
+ * came back up, so the host keeps it down for the whole of the suspend
+ * and after it. A pad that sleeps mid-keypress must not leave the
+ * keyboard holding that key.
+ */
+void     XcPowerDown(PXC_DEVEXT DevExt);
+void     XcPowerUp(PXC_DEVEXT DevExt);
+
+
+/*
+ * What to do with a slot whose transfer has come back: resubmit,
+ * stand down, or ask for recovery. Split out of the completion routine
+ * so the decision is the same in both builds and can be tested without
+ * a USB stack - it is the decision that froze a guest when it was
+ * wrong. Consumes the reference the submit took.
+ */
+void     XcPollFinish(PXC_DEVEXT DevExt, ULONG SlotIndex,
+                      NTSTATUS Status);
 
 NTSTATUS XcPollStart(PXC_DEVEXT DevExt, ULONG Reason);
 void     XcPollStop(PXC_DEVEXT DevExt, ULONG Reason);

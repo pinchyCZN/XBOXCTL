@@ -12,7 +12,7 @@
  *
  * Three top-level application collections, in this order:
  *
- *     Col01   Gamepad,  report ID 1     24 buttons, 7 axes, a hat
+ *     Col01   Gamepad,  report ID 1     16 buttons, 6 axes, a hat
  *     Col02   Keyboard, report ID 2     8 modifiers, 6 key slots
  *     Col03   Mouse,    report ID 3     5 buttons, 16-bit X/Y, wheel, pan
  *
@@ -35,12 +35,12 @@ static const u8 CORE_HID_DESCRIPTOR_BYTES[] = {
 
 	0x05, 0x09,             /*   Usage Page (Button)                   */
 	0x19, 0x01,             /*   Usage Minimum (1)                     */
-	0x29, 0x18,             /*   Usage Maximum (24)                    */
+	0x29, 0x10,             /*   Usage Maximum (16)                    */
 	0x15, 0x00,             /*   Logical Minimum (0)                   */
 	0x25, 0x01,             /*   Logical Maximum (1)                   */
 	0x75, 0x01,             /*   Report Size (1)                       */
-	0x95, 0x18,             /*   Report Count (24)                     */
-	0x81, 0x02,             /*   Input (Data,Var,Abs) - 3 bytes        */
+	0x95, 0x10,             /*   Report Count (16) - EXACTLY 2 bytes   */
+	0x81, 0x02,             /*   Input (Data,Var,Abs)                  */
 
 	0x05, 0x01,             /*   Usage Page (Generic Desktop)          */
 	0x09, 0x01,             /*   Usage (Pointer)                       */
@@ -48,16 +48,28 @@ static const u8 CORE_HID_DESCRIPTOR_BYTES[] = {
 	0x16, 0x01, 0x80,       /*     Logical Minimum (-32767)            */
 	0x26, 0xFF, 0x7F,       /*     Logical Maximum (32767)             */
 	0x75, 0x10,             /*     Report Size (16)                    */
-	0x95, 0x07,             /*     Report Count (7)                    */
-	0x09, 0x30,             /*     Usage (X)                           */
-	0x09, 0x31,             /*     Usage (Y)                           */
-	0x09, 0x32,             /*     Usage (Z)                           */
-	0x09, 0x33,             /*     Usage (Rx)                          */
-	0x09, 0x34,             /*     Usage (Ry)                          */
-	0x09, 0x35,             /*     Usage (Rz)                          */
-	0x09, 0x36,             /*     Usage (Slider)                      */
-	0x81, 0x02,             /*     Input (Data,Var,Abs) - 14 bytes     */
+	0x95, 0x04,             /*     Report Count (4)                    */
+	0x09, 0x30,             /*     Usage (X)  - left stick horizontal  */
+	0x09, 0x31,             /*     Usage (Y)  - left stick vertical    */
+	0x09, 0x33,             /*     Usage (Rx) - right stick horizontal */
+	0x09, 0x34,             /*     Usage (Ry) - right stick vertical   */
+	0x81, 0x02,             /*     Input (Data,Var,Abs) - 8 bytes      */
 	0xC0,                   /*   End Collection                        */
+
+	/*
+	 * THE TRIGGERS, AS A SEPARATE ITEM WITH THEIR OWN RANGE. They are
+	 * unipolar - released is zero, not centre - so sharing the sticks
+	 * range of -32767..32767 would rest them in the middle of their bar
+	 * and waste half of it. A second item costs ten bytes and reads the
+	 * way a trigger should.
+	 */
+	0x15, 0x00,             /*   Logical Minimum (0)                   */
+	0x26, 0xFF, 0x7F,       /*   Logical Maximum (32767)               */
+	0x75, 0x10,             /*   Report Size (16)                      */
+	0x95, 0x02,             /*   Report Count (2)                      */
+	0x09, 0x32,             /*   Usage (Z)  - left trigger             */
+	0x09, 0x35,             /*   Usage (Rz) - right trigger            */
+	0x81, 0x02,             /*   Input (Data,Var,Abs) - 4 bytes        */
 
 	/*
 	 * The hat. Logical range is 0..7 and the NULL STATE bit in the Input
@@ -443,10 +455,23 @@ static const u8 CORE_HAT_TABLE[16] = {
  * Semiaxis to HID button, for the default map. Index is the HID button
  * number minus one; the value is the semiaxis that drives it.
  */
+/*
+ * THE NUMBERING IS XBCD'S, so a profile or a habit built on that driver
+ * transfers unchanged. It is not the order the controls sit in the raw
+ * packet: Start and Back come before the thumb clicks, and the triggers
+ * come last.
+ *
+ * THE TRIGGERS ARE HERE AS WELL AS ON Z AND Rz. The axes are what carry
+ * their pressure, but plenty of older titles read only buttons, and one
+ * source driving two destinations costs nothing.
+ *
+ * THE D-PAD IS DELIBERATELY ABSENT. It is the hat; declaring it twice
+ * makes a game bind one press to two different things.
+ */
 static const u8 CORE_DEFAULT_BUTTONS[12] = {
-	CORE_SA_A,        CORE_SA_B,        CORE_SA_X,        CORE_SA_Y,
-	CORE_SA_BLACK,    CORE_SA_WHITE,    CORE_SA_LTRIGGER, CORE_SA_RTRIGGER,
-	CORE_SA_START,    CORE_SA_BACK,     CORE_SA_LTHUMB,   CORE_SA_RTHUMB
+	CORE_SA_A,        CORE_SA_B,      CORE_SA_X,        CORE_SA_Y,
+	CORE_SA_BLACK,    CORE_SA_WHITE,  CORE_SA_START,    CORE_SA_BACK,
+	CORE_SA_LTHUMB,   CORE_SA_RTHUMB, CORE_SA_LTRIGGER, CORE_SA_RTRIGGER
 };
 
 /*
@@ -455,24 +480,29 @@ static const u8 CORE_DEFAULT_BUTTONS[12] = {
  * marks an axis nothing drives, which reads as centred.
  */
 /*
+ * One entry per declared axis, in descriptor order. An axis is the
+ * difference of two semiaxes; a neg of CORE_SA_NONE makes it unipolar,
+ * which is what a trigger is.
+ *
  * X/Y FOR THE LEFT STICK AND Rx/Ry FOR THE RIGHT is the convention every
  * DirectInput title that auto-maps a gamepad expects. Putting the right
- * stick anywhere else - on Z, say - leaves it unreachable in anything that
- * does not offer manual binding.
+ * stick anywhere else - on Z, say - leaves it unreachable in anything
+ * that does not offer manual binding.
  *
- * Z, Rz and Slider are unassigned. The triggers are buttons 11 and 12 in
- * this default; binding them to Z and Rz instead is what exposes the
- * pressure the pad actually reports, and is a configuration choice rather
- * than a descriptor one.
+ * Z AND Rz CARRY THE TRIGGERS, which is what makes the pad's pressure
+ * reach an application at all: a HID button is one bit and has nothing
+ * to say about how hard it was pressed.
  */
-static const u8 CORE_DEFAULT_AXES[CORE_GP_AXIS_COUNT] = {
-	CORE_SA_LSTICK_XNEG,    /* X      left stick horizontal  */
-	CORE_SA_LSTICK_YNEG,    /* Y      left stick vertical    */
-	CORE_SA_GUIDE,          /* Z      unassigned             */
-	CORE_SA_RSTICK_XNEG,    /* Rx     right stick horizontal */
-	CORE_SA_RSTICK_YNEG,    /* Ry     right stick vertical   */
-	CORE_SA_GUIDE,          /* Rz     unassigned             */
-	CORE_SA_GUIDE           /* Slider unassigned             */
+static const struct {
+	u8 neg;
+	u8 pos;
+} CORE_DEFAULT_AXES[CORE_GP_AXIS_COUNT] = {
+	{ CORE_SA_LSTICK_XNEG, CORE_SA_LSTICK_XPOS },   /* X  left stick    */
+	{ CORE_SA_LSTICK_YNEG, CORE_SA_LSTICK_YPOS },   /* Y  left stick    */
+	{ CORE_SA_RSTICK_XNEG, CORE_SA_RSTICK_XPOS },   /* Rx right stick   */
+	{ CORE_SA_RSTICK_YNEG, CORE_SA_RSTICK_YPOS },   /* Ry right stick   */
+	{ CORE_SA_NONE,        CORE_SA_LTRIGGER    },   /* Z  left trigger  */
+	{ CORE_SA_NONE,        CORE_SA_RTRIGGER    }    /* Rz right trigger */
 };
 
 static void core_build_gamepad(core_state *cs, u8 *payload)
@@ -489,16 +519,21 @@ static void core_build_gamepad(core_state *cs, u8 *payload)
 	}
 
 	for (i = 0; i < CORE_GP_AXIS_COUNT; i++) {
-		s32 value = 0;
+		s32 pos = 0;
+		s32 neg = 0;
+		s32 value;
 
-		if (CORE_DEFAULT_AXES[i] != CORE_SA_GUIDE) {
-			s32 neg = cs->semiaxis[CORE_DEFAULT_AXES[i]];
-			s32 pos = cs->semiaxis[CORE_DEFAULT_AXES[i] + 1];
-			value = (s32)(((s64)(pos - neg) * CORE_OUT_AXIS_SCALE)
-			              / CORE_MAX_VALUE);
-			value = core_clamp(value, -CORE_OUT_AXIS_SCALE,
-			                   CORE_OUT_AXIS_SCALE);
+		if (CORE_DEFAULT_AXES[i].pos != CORE_SA_NONE) {
+			pos = cs->semiaxis[CORE_DEFAULT_AXES[i].pos];
 		}
+		if (CORE_DEFAULT_AXES[i].neg != CORE_SA_NONE) {
+			neg = cs->semiaxis[CORE_DEFAULT_AXES[i].neg];
+		}
+
+		value = (s32)(((s64)(pos - neg) * CORE_OUT_AXIS_SCALE)
+		              / CORE_MAX_VALUE);
+		value = core_clamp(value, -CORE_OUT_AXIS_SCALE,
+		                   CORE_OUT_AXIS_SCALE);
 		core_put16(&payload[CORE_GP_AXES + i * 2], value);
 	}
 

@@ -200,6 +200,31 @@ driver, and the harness compiles the same structures a third way. Use `u8`,
 anything that crosses a boundary - a report, the config blob, or an IOCTL
 buffer.
 
+## After a driver fix, repackage and stage it. Every time.
+
+**Any change under `src_drv/` that reaches the driver ends with
+`tools/package.cmd`** - build, harness, DriverVer stamp, sign, catalogue,
+stage to `B:\xboxctl\pkg`. Do not wait to be asked, and do not spend a turn
+asking whether to.
+
+The user tests in a VM that reads `B:`. A fix sitting in the build tree is a
+fix nobody can try, and "shall I package it?" costs a round trip for a
+command that takes seconds and is safe to run at any time.
+
+```
+python tools/kdc.py ".reload /u xboxctl.sys"    release the PDB first
+tools\package.cmd                                build, test, sign, stage
+```
+
+**Unload the symbols first if the debugger has been used.** kd holds
+`xboxctl.sys.pdb` open and the linker then fails with `LNK1201`, whose text
+blames disk space, path and privilege and names none of the real cause.
+
+`package.cmd` runs the harness and **aborts on any failed check**, so a
+staged package is always one that passed. Say what was staged and what the
+user has to do next in the guest - usually `deploy.cmd` then `state.cmd`,
+and a replug when the descriptor changed.
+
 ## Working rules
 
 - **State evidence, not guesses.** Back a claim with a file and line, a
