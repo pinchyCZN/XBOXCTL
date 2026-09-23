@@ -16,3 +16,6 @@ verifier /querysettings
 powercfg /a 
 
 rundll32.exe powrprof.dll,SetSuspendState 0,1,0
+
+
+powershell -ExecutionPolicy Bypass -File hidread.ps1

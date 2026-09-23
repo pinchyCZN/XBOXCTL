@@ -124,7 +124,7 @@ rem The guest cannot see the source tree, only the share, so the scripts
 rem it has to run have to travel with the package. They go BESIDE the
 rem package folder rather than inside it, to keep that folder to exactly
 rem the files the catalogue covers.
-for %%S in (deploy.cmd state.cmd undeploy.cmd trustcert.cmd) do (
+for %%S in (deploy.cmd state.cmd undeploy.cmd trustcert.cmd hidread.ps1) do (
     if exist "%~dp0%%S" copy /y "%~dp0%%S" "%DEST%\..\" >nul
 )
 rem THE CERTIFICATE HAS TO TRAVEL TOO. Without it in the guest's Root and
