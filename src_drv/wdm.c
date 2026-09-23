@@ -771,6 +771,14 @@ void XcPowerUp(PXC_DEVEXT DevExt)
  */
 void XcRemoveDevice(PXC_DEVEXT DevExt)
 {
+	/*
+	 * OUT OF THE REGISTRY BEFORE ANYTHING ELSE, and the unregister
+	 * blocks until any command holding the device lock has finished
+	 * with this extension. After it returns no new command can find
+	 * this device, so the teardown below has the field to itself.
+	 */
+	XcDeviceUnregister(DevExt);
+
 	DevExt->Removed = TRUE;
 
 	XcStopDevice(DevExt);
@@ -1182,6 +1190,10 @@ done:
 	DevExt->TickArmed = TRUE;
 
 	DevExt->Started = TRUE;
+
+	/* Visible to the configurator only now that it can be configured. */
+	XcDeviceRegister(DevExt);
+
 	return XcPollStart(DevExt, XC_STOP_NOT_STARTED);
 }
 
@@ -1350,6 +1362,10 @@ NTSTATUS XcStartDevice(PDEVICE_OBJECT Fdo, PIRP Irp)
 	DevExt->TickArmed = TRUE;
 
 	DevExt->Started = TRUE;
+
+	/* Visible to the configurator only now that it can be configured. */
+	XcDeviceRegister(DevExt);
+
 	return XcPollStart(DevExt, XC_STOP_NOT_STARTED);
 }
 
@@ -1416,15 +1432,506 @@ NTSTATUS NTAPI XcClose(PDEVICE_OBJECT Fdo, PIRP Irp)
 	return STATUS_SUCCESS;
 }
 
-VOID NTAPI XcUnload(PDRIVER_OBJECT DriverObject)
+/* ======================================================================
+ * THE CONTROL DEVICE
+ *
+ * ../docs/driver-plan.txt section 7. One control device for the whole
+ * driver, a registry of the pads behind it, and six commands.
+ * ====================================================================== */
+
+static PXC_DEVEXT g_Devices[XC_MAX_DEVICES];
+static FAST_MUTEX g_DeviceLock;
+static BOOLEAN    g_DeviceLockReady;
+
+/*
+ * A FAST MUTEX, NOT A SPIN LOCK, and the reason is what runs underneath it.
+ * A command may install a configuration, which releases every asserted
+ * output and emits the reports that implies - work that takes other locks
+ * and is not welcome at DISPATCH_LEVEL. Both sides of this lock, a
+ * DeviceIoControl and a PnP remove, arrive at PASSIVE_LEVEL, so a mutex is
+ * both sufficient and correct.
+ */
+static void XcDeviceLockInit(void)
+{
+	if (!g_DeviceLockReady) {
+		ExInitializeFastMutex(&g_DeviceLock);
+		g_DeviceLockReady = TRUE;
+	}
+}
+
+void XcDeviceRegistryReset(void)
+{
+	ULONG i;
+
+	for (i = 0; i < XC_MAX_DEVICES; i++) {
+		g_Devices[i] = NULL;
+	}
+	g_DeviceLockReady = FALSE;
+	XcDeviceLockInit();
+}
+
+void XcDeviceRegister(PXC_DEVEXT DevExt)
+{
+	ULONG i;
+
+	XcDeviceLockInit();
+	ExAcquireFastMutex(&g_DeviceLock);
+
+	for (i = 0; i < XC_MAX_DEVICES; i++) {
+		if (g_Devices[i] == DevExt) {
+			break;              /* already in, do not double-add */
+		}
+		if (g_Devices[i] == NULL) {
+			g_Devices[i] = DevExt;
+			break;
+		}
+	}
+
+	ExReleaseFastMutex(&g_DeviceLock);
+}
+
+/*
+ * UNREGISTER TAKES THE SAME LOCK A COMMAND HOLDS, which is the whole point
+ * of it being a lock rather than an array. A remove that arrives while a
+ * command is configuring that device waits for the command to finish
+ * instead of pulling the extension out from under it.
+ */
+void XcDeviceUnregister(PXC_DEVEXT DevExt)
+{
+	ULONG i;
+
+	XcDeviceLockInit();
+	ExAcquireFastMutex(&g_DeviceLock);
+
+	for (i = 0; i < XC_MAX_DEVICES; i++) {
+		if (g_Devices[i] == DevExt) {
+			g_Devices[i] = NULL;
+		}
+	}
+
+	ExReleaseFastMutex(&g_DeviceLock);
+}
+
+/* Caller holds the lock. */
+static PXC_DEVEXT XcDeviceAt(ULONG index)
+{
+	if (index >= XC_MAX_DEVICES) {
+		return NULL;
+	}
+	return g_Devices[index];
+}
+
+static NTSTATUS XcCmdGetVersion(void *buffer, ULONG out_len, ULONG *written)
+{
+	XC_VERSION_INFO info;
+
+	if (out_len < sizeof(info)) {
+		return STATUS_BUFFER_TOO_SMALL;
+	}
+
+	RtlZeroMemory(&info, sizeof(info));
+	info.signature      = XC_CONFIG_SIGNATURE;
+	info.driver_major   = XC_VERSION_MAJOR;
+	info.driver_minor   = XC_VERSION_MINOR;
+	info.driver_patch   = XC_VERSION_PATCH;
+	info.config_version = CORE_CFG_VERSION;
+	info.max_layouts    = CORE_MAX_LAYOUTS;
+	info.max_bindings   = CORE_MAX_BINDINGS;
+	info.max_chords     = CORE_MAX_CHORDS;
+	info.blob_bytes     = (u16)(sizeof(core_config_header) +
+	                            sizeof(core_stick) * CORE_STICK_COUNT +
+	                            sizeof(core_layout) * CORE_MAX_LAYOUTS);
+
+	RtlCopyMemory(buffer, &info, sizeof(info));
+	*written = (ULONG)sizeof(info);
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS XcCmdGetDevices(void *buffer, ULONG out_len, ULONG *written)
+{
+	XC_DEVICE_LIST list;
+	ULONG          i;
+
+	if (out_len < sizeof(list)) {
+		return STATUS_BUFFER_TOO_SMALL;
+	}
+
+	RtlZeroMemory(&list, sizeof(list));
+	for (i = 0; i < XC_MAX_DEVICES; i++) {
+		PXC_DEVEXT dev = g_Devices[i];
+
+		if (dev == NULL) {
+			continue;
+		}
+		list.device[list.count].index      = i;
+		list.device[list.count].vendor_id  =
+		        dev->DeviceDescriptor.idVendor;
+		list.device[list.count].product_id =
+		        dev->DeviceDescriptor.idProduct;
+		list.device[list.count].started    = (u8)(dev->Started ? 1 : 0);
+		list.count++;
+	}
+
+	RtlCopyMemory(buffer, &list, sizeof(list));
+	*written = (ULONG)sizeof(list);
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS XcCmdGetStats(PXC_DEVEXT dev, ULONG index, void *buffer,
+                              ULONG out_len, ULONG *written)
+{
+	XC_STATS stats;
+
+	if (out_len < sizeof(stats)) {
+		return STATUS_BUFFER_TOO_SMALL;
+	}
+
+	RtlZeroMemory(&stats, sizeof(stats));
+	stats.index            = index;
+	stats.packets_accepted = dev->Core.packets_accepted;
+	stats.packets_rejected = dev->Core.packets_rejected;
+	stats.reports_emitted  = dev->Core.reports_emitted;
+	stats.reports_dropped  = dev->ReportsDropped;
+	stats.poll_errors      = dev->PollErrors;
+	stats.pipe_resets      = dev->PipeResets;
+	stats.poll_restarts    = dev->PollRestartRequests;
+	stats.pending_reads    = dev->PendingReadCount;
+	stats.layer            = (u32)dev->Core.layout + 1;
+
+	RtlCopyMemory(buffer, &stats, sizeof(stats));
+	*written = (ULONG)sizeof(stats);
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS XcCmdGetConfig(PXC_DEVEXT dev, void *buffer, ULONG out_len,
+                               ULONG *written)
+{
+	u32 len;
+
+	len = core_config_save(&dev->Core.cfg, (u8 *)buffer, out_len);
+	if (len == 0) {
+		return STATUS_BUFFER_TOO_SMALL;
+	}
+	*written = len;
+	return STATUS_SUCCESS;
+}
+
+/*
+ * Map a parse failure onto something a caller can act on. A malformed blob
+ * is the caller's fault and says so; anything else would have the
+ * configurator retrying a push that can never succeed.
+ */
+static NTSTATUS XcConfigStatus(int rc)
+{
+	switch (rc) {
+	case CORE_CFG_OK:
+		return STATUS_SUCCESS;
+	case CORE_CFG_ERR_SHORT:
+	case CORE_CFG_ERR_TRUNCATED:
+		return STATUS_BUFFER_TOO_SMALL;
+	case CORE_CFG_ERR_VERSION:
+		return STATUS_REVISION_MISMATCH;
+	default:
+		return STATUS_INVALID_PARAMETER;
+	}
+}
+
+NTSTATUS XcControlCommand(ULONG code, void *buffer, ULONG in_len,
+                          ULONG out_len, ULONG *written)
+{
+	XC_CONFIG_REQUEST request;
+	static u8         blob[XC_CONFIG_BLOB_MAX];
+	PXC_DEVEXT        dev;
+	NTSTATUS          status;
+	ULONG             blob_len;
+	u32               repaired;
+	int               rc;
+
+	*written = 0;
+	if (buffer == NULL) {
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	XcDeviceLockInit();
+	ExAcquireFastMutex(&g_DeviceLock);
+
+	switch (code) {
+	case IOCTL_XC_GET_VERSION:
+		status = XcCmdGetVersion(buffer, out_len, written);
+		break;
+
+	case IOCTL_XC_GET_DEVICES:
+		status = XcCmdGetDevices(buffer, out_len, written);
+		break;
+
+	case IOCTL_XC_GET_CONFIG:
+	case IOCTL_XC_GET_STATS:
+	case IOCTL_XC_RESET_CONFIG:
+	case IOCTL_XC_SET_CONFIG:
+		if (in_len < sizeof(request)) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		/*
+		 * READ THE INPUT OUT BEFORE WRITING A REPLY. Buffered I/O
+		 * hands over one buffer for both directions, so the first
+		 * byte of output destroys the request that asked for it.
+		 */
+		RtlCopyMemory(&request, buffer, sizeof(request));
+
+		dev = XcDeviceAt(request.index);
+		if (dev == NULL) {
+			status = STATUS_DEVICE_DOES_NOT_EXIST;
+			break;
+		}
+
+		if (code == IOCTL_XC_GET_STATS) {
+			status = XcCmdGetStats(dev, request.index, buffer,
+			                       out_len, written);
+			break;
+		}
+		if (code == IOCTL_XC_GET_CONFIG) {
+			status = XcCmdGetConfig(dev, buffer, out_len,
+			                        written);
+			break;
+		}
+		if (code == IOCTL_XC_RESET_CONFIG) {
+			core_set_config_default(&dev->Core);
+			status = STATUS_SUCCESS;
+			break;
+		}
+
+		/* SET_CONFIG: the blob follows the request header. */
+		blob_len = in_len - (ULONG)sizeof(request);
+		if (blob_len == 0 || blob_len > XC_CONFIG_BLOB_MAX) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		/*
+		 * COPY IT OUT OF THE SHARED BUFFER FIRST. The parse writes
+		 * nothing into it, but core_set_config releases outputs and
+		 * emits reports part way through, and nothing should be
+		 * reading a caller-shared buffer across that.
+		 */
+		RtlCopyMemory(blob, (u8 *)buffer + sizeof(request), blob_len);
+
+		repaired = 0;
+		rc = core_set_config(&dev->Core, blob, blob_len, &repaired);
+		status = XcConfigStatus(rc);
+		break;
+
+	default:
+		status = STATUS_INVALID_DEVICE_REQUEST;
+		break;
+	}
+
+	ExReleaseFastMutex(&g_DeviceLock);
+	return status;
+}
+
+/* ----------------------------------------------------------------------
+ * The device object, and getting IRPs to it.
+ *
+ * HidRegisterMinidriver OVERWRITES THE DISPATCH TABLE. One driver object
+ * serves the control device and every HID device, so the entry points set
+ * before registration are gone by the time it returns. The only way to see
+ * an IRP for our own device is to save what hidclass installed and wrap it.
+ * ---------------------------------------------------------------------- */
+
+#ifndef XBOXCTL_USERMODE
+
+static PDEVICE_OBJECT    g_ControlDevice;
+static PDRIVER_DISPATCH  g_HidCreate;
+static PDRIVER_DISPATCH  g_HidClose;
+static PDRIVER_DISPATCH  g_HidDeviceControl;
+static PDRIVER_UNLOAD    g_HidUnload;
+
+static const WCHAR XC_CONTROL_NAME[] = L"\\Device\\xboxctl";
+static const WCHAR XC_CONTROL_LINK[] = L"\\DosDevices\\xboxctl";
+
+/*
+ * IS THIS OURS? A pointer comparison, and deliberately not the Adaptoid's
+ * trick of claiming opens of the HID path with a "\q" suffix - that works
+ * only because it sees IRP_MJ_CREATE before hidclass and tests a single
+ * character of a name it never fully checks.
+ */
+static BOOLEAN XcIsControlDevice(PDEVICE_OBJECT DeviceObject)
+{
+	return (BOOLEAN)(g_ControlDevice != NULL &&
+	                 DeviceObject == g_ControlDevice);
+}
+
+static NTSTATUS XcCompleteControl(PIRP Irp, NTSTATUS Status, ULONG Written)
+{
+	Irp->IoStatus.Status = Status;
+	Irp->IoStatus.Information = Written;
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	return Status;
+}
+
+static NTSTATUS NTAPI XcCreateWrapper(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	if (XcIsControlDevice(DeviceObject)) {
+		return XcCompleteControl(Irp, STATUS_SUCCESS, 0);
+	}
+	if (g_HidCreate != NULL) {
+		return g_HidCreate(DeviceObject, Irp);
+	}
+	return XcCompleteControl(Irp, STATUS_NOT_SUPPORTED, 0);
+}
+
+static NTSTATUS NTAPI XcCloseWrapper(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+	if (XcIsControlDevice(DeviceObject)) {
+		return XcCompleteControl(Irp, STATUS_SUCCESS, 0);
+	}
+	if (g_HidClose != NULL) {
+		return g_HidClose(DeviceObject, Irp);
+	}
+	return XcCompleteControl(Irp, STATUS_NOT_SUPPORTED, 0);
+}
+
+static NTSTATUS NTAPI XcDeviceControlWrapper(PDEVICE_OBJECT DeviceObject,
+                                             PIRP Irp)
+{
+	PIO_STACK_LOCATION stack;
+	NTSTATUS           status;
+	ULONG              written = 0;
+
+	if (!XcIsControlDevice(DeviceObject)) {
+		if (g_HidDeviceControl != NULL) {
+			return g_HidDeviceControl(DeviceObject, Irp);
+		}
+		return XcCompleteControl(Irp, STATUS_NOT_SUPPORTED, 0);
+	}
+
+	stack = IoGetCurrentIrpStackLocation(Irp);
+
+	/*
+	 * METHOD_BUFFERED, so AssociatedIrp.SystemBuffer is a kernel copy and
+	 * no user-mode address is ever touched. It is also ONE buffer for both
+	 * directions, which the command handler is written to expect.
+	 */
+	status = XcControlCommand(
+	        stack->Parameters.DeviceIoControl.IoControlCode,
+	        Irp->AssociatedIrp.SystemBuffer,
+	        stack->Parameters.DeviceIoControl.InputBufferLength,
+	        stack->Parameters.DeviceIoControl.OutputBufferLength,
+	        &written);
+
+	return XcCompleteControl(Irp, status, written);
+}
+
+static NTSTATUS XcControlDeviceCreate(PDRIVER_OBJECT DriverObject)
+{
+	UNICODE_STRING name;
+	UNICODE_STRING link;
+	NTSTATUS       status;
+
+	RtlInitUnicodeString(&name, XC_CONTROL_NAME);
+	RtlInitUnicodeString(&link, XC_CONTROL_LINK);
+
+	/*
+	 * NO EXTENSION AND NO EXCLUSIVITY. There is nothing per-handle to
+	 * remember, and two tools looking at the same driver is a reasonable
+	 * thing to want.
+	 */
+	status = IoCreateDevice(DriverObject, 0, &name, XC_DEVICE_TYPE,
+	                        FILE_DEVICE_SECURE_OPEN, FALSE,
+	                        &g_ControlDevice);
+	if (!NT_SUCCESS(status)) {
+		g_ControlDevice = NULL;
+		return status;
+	}
+
+	status = IoCreateSymbolicLink(&link, &name);
+	if (!NT_SUCCESS(status)) {
+		IoDeleteDevice(g_ControlDevice);
+		g_ControlDevice = NULL;
+		return status;
+	}
+
+	g_ControlDevice->Flags |= DO_BUFFERED_IO;
+	g_ControlDevice->Flags &= ~DO_DEVICE_INITIALIZING;
+	return STATUS_SUCCESS;
+}
+
+static void XcControlDeviceDelete(void)
+{
+	UNICODE_STRING link;
+
+	if (g_ControlDevice == NULL) {
+		return;
+	}
+	RtlInitUnicodeString(&link, XC_CONTROL_LINK);
+	IoDeleteSymbolicLink(&link);
+	IoDeleteDevice(g_ControlDevice);
+	g_ControlDevice = NULL;
+}
+
+/*
+ * Called after HidRegisterMinidriver has had its way with the table.
+ */
+static void XcInstallWrappers(PDRIVER_OBJECT DriverObject)
+{
+	g_HidCreate        = DriverObject->MajorFunction[IRP_MJ_CREATE];
+	g_HidClose         = DriverObject->MajorFunction[IRP_MJ_CLOSE];
+	g_HidDeviceControl = DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL];
+	g_HidUnload        = DriverObject->DriverUnload;
+
+	DriverObject->MajorFunction[IRP_MJ_CREATE]  = XcCreateWrapper;
+	DriverObject->MajorFunction[IRP_MJ_CLOSE]   = XcCloseWrapper;
+	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] =
+	        XcDeviceControlWrapper;
+	DriverObject->DriverUnload = XcUnload;
+}
+
+#else   /* XBOXCTL_USERMODE */
+
+/* The harness drives XcControlCommand directly; there is no device object
+ * and no dispatch table to wrap. */
+static NTSTATUS XcControlDeviceCreate(PDRIVER_OBJECT DriverObject)
 {
 	(void)DriverObject;
+	return STATUS_SUCCESS;
+}
+
+static void XcControlDeviceDelete(void)
+{
+}
+
+static void XcInstallWrappers(PDRIVER_OBJECT DriverObject)
+{
+	(void)DriverObject;
+}
+
+#endif  /* XBOXCTL_USERMODE */
+
+VOID NTAPI XcUnload(PDRIVER_OBJECT DriverObject)
+{
+	XcControlDeviceDelete();
+
+#ifndef XBOXCTL_USERMODE
+	/*
+	 * CHAIN, DO NOT REPLACE. hidclass installed its own unload routine
+	 * and still has devices and allocations to let go of; dropping it
+	 * leaks all of them.
+	 */
+	if (g_HidUnload != NULL) {
+		g_HidUnload(DriverObject);
+	}
+#else
+	(void)DriverObject;
+#endif
 }
 
 NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
                            PUNICODE_STRING RegistryPath)
 {
 	HID_MINIDRIVER_REGISTRATION reg;
+	NTSTATUS                    status;
 
 	DriverObject->MajorFunction[IRP_MJ_CREATE] = XcCreate;
 	DriverObject->MajorFunction[IRP_MJ_CLOSE] = XcClose;
@@ -1462,5 +1969,28 @@ NTSTATUS NTAPI DriverEntry(PDRIVER_OBJECT DriverObject,
 	 */
 	reg.DevicesArePolled = FALSE;
 
-	return HidRegisterMinidriver(&reg);
+	status = HidRegisterMinidriver(&reg);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+
+	/*
+	 * ORDER MATTERS AND THERE IS ONLY ONE THAT WORKS. The registration
+	 * above replaces every entry point set before it, so the wrappers go
+	 * on afterwards; and the control device is created only once they
+	 * are in place, because an open that arrives between the two would
+	 * reach hidclass with a device object it has never heard of.
+	 */
+	XcDeviceRegistryReset();
+	XcInstallWrappers(DriverObject);
+
+	status = XcControlDeviceCreate(DriverObject);
+	if (!NT_SUCCESS(status)) {
+		/* The minidriver still works; only configuring it does not.
+		 * Failing the load would leave the pad with no driver at all,
+		 * which is strictly worse. */
+		status = STATUS_SUCCESS;
+	}
+
+	return status;
 }

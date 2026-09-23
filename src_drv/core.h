@@ -152,8 +152,12 @@ typedef signed   long long  s64;
 #define CORE_REPORT_ID_KEYBOARD 2
 #define CORE_REPORT_ID_MOUSE    3
 #define CORE_REPORT_ID_RUMBLE   4   /* output  */
-#define CORE_REPORT_ID_CONFIG   5   /* feature */
-#define CORE_REPORT_ID_VERSION  6   /* feature */
+
+/*
+ * THERE IS NO FEATURE REPORT. Configuration arrives on the private control
+ * device - ../docs/driver-plan.txt section 7 - not over HID, so IDs 5 and 6
+ * are unassigned and the descriptor declares no feature item at all.
+ */
 
 /*
  * Payload sizes, EXCLUDING the leading report ID byte. The sink is handed a

@@ -63,6 +63,17 @@ void KeInitializeSpinLock(PKSPIN_LOCK Lock)          { *Lock = 0; }
 void KeAcquireSpinLock(PKSPIN_LOCK Lock, PKIRQL Old) { (void)Lock; *Old = 0; }
 void KeReleaseSpinLock(PKSPIN_LOCK Lock, KIRQL New)  { (void)Lock; (void)New; }
 
+/*
+ * The harness is single threaded, so a fast mutex has nothing to
+ * exclude. It still counts, because a handler that returns while
+ * holding it is a deadlock in the driver and a silent pass here
+ * otherwise - test_control asserts the count is zero at the end.
+ */
+long g_MutexDepth;
+void ExInitializeFastMutex(PFAST_MUTEX M) { M->Held = 0; }
+void ExAcquireFastMutex(PFAST_MUTEX M)    { M->Held = 1; g_MutexDepth++; }
+void ExReleaseFastMutex(PFAST_MUTEX M)    { M->Held = 0; g_MutexDepth--; }
+
 void IoAcquireCancelSpinLock(PKIRQL Old) { *Old = 0; }
 void IoReleaseCancelSpinLock(KIRQL Irql) { (void)Irql; }
 
@@ -365,7 +376,12 @@ static int test_descriptor(void)
 		check_eq(top_usages[2], 0x02, "Col03 is a Mouse");
 	}
 
-	check_eq(n_ids, 6, "six distinct report IDs");
+	/*
+	 * FOUR, NOT SIX. Configuration does not travel over HID, so the
+	 * descriptor declares no feature report: 1 gamepad, 2 keyboard,
+	 * 3 mouse, 4 rumble, and nothing else.
+	 */
+	check_eq(n_ids, 4, "four distinct report IDs");
 
 	return 0;
 }
@@ -1336,6 +1352,199 @@ static int test_bindings(void)
 }
 
 /* ======================================================================
+ * THE CONTROL DEVICE
+ *
+ * ../docs/driver-plan.txt section 7. The IRP plumbing is not exercised
+ * here - there is no device object in this build - but every command is,
+ * and so is the one trap buffered I/O sets: input and output share a
+ * buffer, so a reply destroys the request that asked for it.
+ * ====================================================================== */
+
+extern long g_MutexDepth;
+
+static int test_control(void)
+{
+	static XC_DEVEXT devext;
+	static u8        buffer[8192];
+	static u8        blob[4096];
+	static core_config cfg;
+	XC_VERSION_INFO  version;
+	XC_DEVICE_LIST   list;
+	XC_STATS         stats;
+	XC_CONFIG_REQUEST request;
+	ULONG            written;
+	u32              blob_len;
+	NTSTATUS         status;
+
+	XcDeviceRegistryReset();
+	check_eq(g_MutexDepth, 0, "the device lock starts free");
+
+	/* --- GET_VERSION works with no device attached ---------------- */
+	written = 0xFFFFFFFF;
+	status = XcControlCommand(IOCTL_XC_GET_VERSION, buffer, 0,
+	                          sizeof(buffer), &written);
+	check_eq(status, STATUS_SUCCESS,
+	         "GET_VERSION answers with no pad plugged in");
+	check_eq((long)written, (long)sizeof(XC_VERSION_INFO),
+	         "and writes one version structure");
+	memcpy(&version, buffer, sizeof(version));
+	check_eq((long)version.signature, (long)XC_CONFIG_SIGNATURE,
+	         "the signature identifies the driver");
+	check_eq(version.config_version, CORE_CFG_VERSION,
+	         "it names the blob version it speaks");
+	check_eq(version.max_layouts, CORE_MAX_LAYOUTS, "and its ceilings");
+	check_eq(version.blob_bytes, 1048, "and the blob size it emits");
+
+	/* A buffer too small to hold the answer is refused, not truncated. */
+	status = XcControlCommand(IOCTL_XC_GET_VERSION, buffer, 0, 4, &written);
+	check_eq(status, STATUS_BUFFER_TOO_SMALL,
+	         "a short output buffer is REFUSED, never half-filled");
+	check_eq((long)written, 0, "and nothing is reported as written");
+
+	/* --- an unknown code is not a crash --------------------------- */
+	status = XcControlCommand(0xDEADBEEF, buffer, 0, sizeof(buffer),
+	                          &written);
+	check_eq(status, STATUS_INVALID_DEVICE_REQUEST,
+	         "an unknown control code is rejected");
+
+	/* --- with no devices, the list is empty and indexes fail ------ */
+	status = XcControlCommand(IOCTL_XC_GET_DEVICES, buffer, 0,
+	                          sizeof(buffer), &written);
+	check_eq(status, STATUS_SUCCESS, "GET_DEVICES answers when empty");
+	memcpy(&list, buffer, sizeof(list));
+	check_eq((long)list.count, 0, "with a count of zero");
+
+	request.index = 0;
+	memcpy(buffer, &request, sizeof(request));
+	status = XcControlCommand(IOCTL_XC_GET_STATS, buffer,
+	                          sizeof(request), sizeof(buffer), &written);
+	check_eq(status, STATUS_DEVICE_DOES_NOT_EXIST,
+	         "and an index nothing occupies is refused");
+
+	/* --- bring a device up ---------------------------------------- */
+	XcDevExtInit(&devext);
+	XcStartDevice((PDEVICE_OBJECT)&devext, NULL);
+
+	status = XcControlCommand(IOCTL_XC_GET_DEVICES, buffer, 0,
+	                          sizeof(buffer), &written);
+	memcpy(&list, buffer, sizeof(list));
+	check_eq((long)list.count, 1, "a started device appears in the list");
+	check_eq((long)list.device[0].index, 0, "at index 0");
+	check_eq(list.device[0].started, 1, "and reads as started");
+
+	/* --- GET_STATS ------------------------------------------------ */
+	request.index = 0;
+	memcpy(buffer, &request, sizeof(request));
+	status = XcControlCommand(IOCTL_XC_GET_STATS, buffer,
+	                          sizeof(request), sizeof(buffer), &written);
+	check_eq(status, STATUS_SUCCESS, "GET_STATS answers");
+	check_eq((long)written, (long)sizeof(XC_STATS), "with the counters");
+	memcpy(&stats, buffer, sizeof(stats));
+	check_eq((long)stats.layer, 1, "reporting layer 1 as live");
+
+	/* --- GET_CONFIG returns something SET_CONFIG would accept ----- */
+	request.index = 0;
+	memcpy(buffer, &request, sizeof(request));
+	status = XcControlCommand(IOCTL_XC_GET_CONFIG, buffer,
+	                          sizeof(request), sizeof(buffer), &written);
+	check_eq(status, STATUS_SUCCESS, "GET_CONFIG answers");
+	check_eq((long)written, 1048, "with the whole blob");
+	check_eq(core_config_load(&cfg, buffer, written, NULL), CORE_CFG_OK,
+	         "AND WHAT IT RETURNS PARSES - the read-back is a blob, not a"
+	         " debug dump");
+
+	/* --- SET_CONFIG ------------------------------------------------ */
+	core_config_defaults(&cfg);
+	cfg.layout[0].binding[2].source    = CORE_SA_A;
+	cfg.layout[0].binding[2].action    = CORE_ACT_KEY;
+	cfg.layout[0].binding[2].code      = 0x1A;      /* W */
+	blob_len = core_config_save(&cfg, blob, sizeof(blob));
+
+	request.index = 0;
+	memcpy(buffer, &request, sizeof(request));
+	memcpy(buffer + sizeof(request), blob, blob_len);
+	status = XcControlCommand(IOCTL_XC_SET_CONFIG, buffer,
+	                          (ULONG)(sizeof(request) + blob_len),
+	                          sizeof(buffer), &written);
+	check_eq(status, STATUS_SUCCESS, "SET_CONFIG installs a blob");
+	check_eq(devext.Core.cfg.layout[0].binding[2].code, 0x1A,
+	         "and the engine is running it");
+	check(devext.Core.cfg.suppress[0] & (1u << CORE_SA_A),
+	      "with the suppression mask rebuilt for it");
+
+	/* --- a malformed blob is refused and changes nothing ---------- */
+	memcpy(buffer, &request, sizeof(request));
+	memcpy(buffer + sizeof(request), blob, blob_len);
+	buffer[sizeof(request)] ^= 0xFF;                /* break the signature */
+	status = XcControlCommand(IOCTL_XC_SET_CONFIG, buffer,
+	                          (ULONG)(sizeof(request) + blob_len),
+	                          sizeof(buffer), &written);
+	check_eq(status, STATUS_INVALID_PARAMETER,
+	         "a bad signature is refused");
+	check_eq(devext.Core.cfg.layout[0].binding[2].code, 0x1A,
+	         "and the refusal left the running map alone");
+
+	/* An older blob version says so specifically, so a configurator can
+	 * tell "you are out of date" from "that is rubbish". */
+	memcpy(buffer, &request, sizeof(request));
+	memcpy(buffer + sizeof(request), blob, blob_len);
+	buffer[sizeof(request) + 4] = 0;
+	buffer[sizeof(request) + 5] = 0;
+	status = XcControlCommand(IOCTL_XC_SET_CONFIG, buffer,
+	                          (ULONG)(sizeof(request) + blob_len),
+	                          sizeof(buffer), &written);
+	check_eq(status, STATUS_REVISION_MISMATCH,
+	         "an old blob version is distinguishable from a bad one");
+
+	/* A request with no blob behind it is not a zero-length install. */
+	memcpy(buffer, &request, sizeof(request));
+	status = XcControlCommand(IOCTL_XC_SET_CONFIG, buffer,
+	                          sizeof(request), sizeof(buffer), &written);
+	check_eq(status, STATUS_INVALID_PARAMETER,
+	         "SET_CONFIG with no blob is refused");
+
+	/* And a truncated request cannot even name a device. */
+	status = XcControlCommand(IOCTL_XC_SET_CONFIG, buffer, 2,
+	                          sizeof(buffer), &written);
+	check_eq(status, STATUS_INVALID_PARAMETER,
+	         "a request too short to hold an index is refused");
+
+	/* --- RESET_CONFIG --------------------------------------------- */
+	request.index = 0;
+	memcpy(buffer, &request, sizeof(request));
+	status = XcControlCommand(IOCTL_XC_RESET_CONFIG, buffer,
+	                          sizeof(request), sizeof(buffer), &written);
+	check_eq(status, STATUS_SUCCESS, "RESET_CONFIG succeeds");
+	check_eq(devext.Core.cfg.layout[0].binding[2].action, CORE_ACT_NONE,
+	         "and the pushed binding is gone");
+
+	/* --- removal takes it back out of the registry ---------------- */
+	XcRemoveDevice(&devext);
+	status = XcControlCommand(IOCTL_XC_GET_DEVICES, buffer, 0,
+	                          sizeof(buffer), &written);
+	memcpy(&list, buffer, sizeof(list));
+	check_eq((long)list.count, 0, "a removed device leaves the list");
+
+	request.index = 0;
+	memcpy(buffer, &request, sizeof(request));
+	status = XcControlCommand(IOCTL_XC_GET_STATS, buffer,
+	                          sizeof(request), sizeof(buffer), &written);
+	check_eq(status, STATUS_DEVICE_DOES_NOT_EXIST,
+	         "AND ITS INDEX STOPS RESOLVING - a command must not reach an"
+	         " extension PnP has finished with");
+
+	/*
+	 * EVERY PATH RELEASES THE LOCK. A handler that returns while holding
+	 * it wedges every later command and every device removal, and the
+	 * symptom would be a hang with nothing in it to point here.
+	 */
+	check_eq(g_MutexDepth, 0,
+	         "the device lock is free after every command above");
+
+	return 0;
+}
+
+/* ======================================================================
  * THE REGISTRATION CONTRACT
  * ====================================================================== */
 
@@ -1459,6 +1668,26 @@ int main(int argc, char **argv)
 	if (argc == 3 && strcmp(argv[1], "--load") == 0) {
 		return load_blob(argv[2]);
 	}
+	if (argc == 2 && strcmp(argv[1], "--ioctls") == 0) {
+		/* THE CODES AS THE MACRO BUILDS THEM. A user-mode
+		 * tool computes the same arithmetic by hand, and a
+		 * mismatch shows up only as a command the driver
+		 * says it has never heard of. Print them so the two
+		 * can be compared instead of assumed. */
+		printf("GET_VERSION   0x%08lX\n",
+		       (unsigned long)IOCTL_XC_GET_VERSION);
+		printf("GET_DEVICES   0x%08lX\n",
+		       (unsigned long)IOCTL_XC_GET_DEVICES);
+		printf("GET_CONFIG    0x%08lX\n",
+		       (unsigned long)IOCTL_XC_GET_CONFIG);
+		printf("GET_STATS     0x%08lX\n",
+		       (unsigned long)IOCTL_XC_GET_STATS);
+		printf("SET_CONFIG    0x%08lX\n",
+		       (unsigned long)IOCTL_XC_SET_CONFIG);
+		printf("RESET_CONFIG  0x%08lX\n",
+		       (unsigned long)IOCTL_XC_RESET_CONFIG);
+		return 0;
+	}
 
 	printf("xboxctl harness\n");
 	printf("---------------\n");
@@ -1474,6 +1703,7 @@ int main(int argc, char **argv)
 	printf("[power]\n");        test_power();
 	printf("[config]\n");       test_config();
 	printf("[bindings]\n");     test_bindings();
+	printf("[control]\n");      test_control();
 	printf("[registration]\n"); test_driver_entry();
 
 	printf("---------------\n");

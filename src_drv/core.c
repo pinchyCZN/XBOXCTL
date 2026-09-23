@@ -106,12 +106,15 @@ static const u8 CORE_HID_DESCRIPTOR_BYTES[] = {
 	0x81, 0x02,             /*   Input (Data,Var,Abs)                  */
 
 	/*
-	 * Output and feature reports, inside this collection so no extra
-	 * devnode is created for them.
+	 * The rumble actuators, inside this collection so no extra devnode
+	 * is created for them.
 	 *
 	 *     ID 4  Output   2 bytes   left and right rumble actuator
-	 *     ID 5  Feature  4096      the configuration blob
-	 *     ID 6  Feature  7 bytes   signature and driver version
+	 *
+	 * NO FEATURE REPORTS ARE DECLARED. Configuration does not travel
+	 * over HID at all: it arrives on the private control device of
+	 * ../docs/driver-plan.txt section 7. One channel carries it, so
+	 * there is one place to validate it.
 	 */
 	0x06, 0x00, 0xFF,       /*   Usage Page (Vendor Defined FF00)      */
 	0x15, 0x00,             /*   Logical Minimum (0)                   */
@@ -122,16 +125,6 @@ static const u8 CORE_HID_DESCRIPTOR_BYTES[] = {
 	0x09, 0x01,             /*   Usage (Vendor 1)                      */
 	0x95, 0x02,             /*   Report Count (2)                      */
 	0x91, 0x02,             /*   Output (Data,Var,Abs) - rumble        */
-
-	0x85, 0x05,             /*   Report ID (5)                         */
-	0x09, 0x02,             /*   Usage (Vendor 2)                      */
-	0x96, 0x00, 0x10,       /*   Report Count (4096)                   */
-	0xB1, 0x02,             /*   Feature (Data,Var,Abs) - config blob  */
-
-	0x85, 0x06,             /*   Report ID (6)                         */
-	0x09, 0x03,             /*   Usage (Vendor 3)                      */
-	0x95, 0x07,             /*   Report Count (7)                      */
-	0xB1, 0x02,             /*   Feature (Data,Var,Abs) - version      */
 	0xC0,                   /* End Collection                          */
 
 	/* ---- Keyboard, report ID 2 --------------------------- 67 bytes */

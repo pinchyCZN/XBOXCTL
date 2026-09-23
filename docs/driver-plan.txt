@@ -142,7 +142,7 @@ Table of Contents
 
 4.1.  Collection Order And Report IDs
 
-   Three top-level application collections, 279 bytes, built as one array
+   Three top-level application collections, 271 bytes, built as one array
    in core.c. hidclass creates one child devnode per collection and
    numbers them in descriptor order.
 
@@ -158,18 +158,27 @@ Table of Contents
    THE GAMEPAD GOES FIRST because it is the collection a user re-binds
    inside a game, and Col01 is the obvious one to pick.
 
-   The output and feature reports live INSIDE the gamepad's application
-   collection rather than in a fourth top-level one, which would make
-   hidclass create a fourth devnode for something that is not an input
-   device:
+   The output report lives INSIDE the gamepad's application collection
+   rather than in a fourth top-level one, which would make hidclass
+   create a fourth devnode for something that is not an input device:
 
    +-----------+---------+--------+------------------------------------+
    | Report ID | Kind    | Bytes  | Contents                           |
    +===========+=========+========+====================================+
    |         4 | Output  |      2 | left and right rumble actuator     |
-   |         5 | Feature |   4096 | the configuration blob             |
-   |         6 | Feature |      7 | signature and driver version       |
    +-----------+---------+--------+------------------------------------+
+
+   THERE IS NO FEATURE REPORT, and IDs 5 and 6 are unassigned.
+   Configuration does not travel over HID at all; it arrives on the
+   private control device of section 7. A feature report would have
+   worked - it is the HID standard's own configuration channel, and what
+   XBCD uses - but it would be a SECOND way into the same state, with a
+   second place to get the validation right.
+
+   DROPPING IT ALSO DROPS A 4096-BYTE BUFFER. hidclass sizes its per-
+   collection buffers to the largest report declared, so a 4 KB feature
+   report is 4 KB reserved for a payload of about one, on a channel that
+   would then be used a handful of times per boot.
 
    Report ID 2 also carries an Output report, the five keyboard LEDs.
    Windows really does send Num Lock and Caps Lock changes down; they are
@@ -615,7 +624,7 @@ Table of Contents
    +-----------------------------------+-----------------------------------+
    | Built and covered by the harness  | Not yet built                     |
    +===================================+===================================+
-   | the 279-byte composite descriptor | the binding table and its         |
+   | the 271-byte composite descriptor | the binding table and its         |
    | and its structural self-check     | evaluation                        |
    | packet decode into 25 semiaxes    | layers, autofire, toggle, chords  |
    | the 64-bit radial math and the    | the stick curve, the accumulator  |

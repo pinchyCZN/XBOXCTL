@@ -208,6 +208,123 @@ typedef struct _XC_DEVEXT {
     (((PHID_DEVICE_EXTENSION)((DO)->DeviceExtension))->PhysicalDeviceObject)
 
 /* ======================================================================
+ * THE CONTROL DEVICE
+ *
+ * Configuration does not arrive over HID. User mode opens \\.\xboxctl
+ * with CreateFile and drives it with DeviceIoControl, which is the
+ * Adaptoid's arrangement and is specified in ../docs/driver-plan.txt
+ * section 7.
+ *
+ * EVERY CODE IS METHOD_BUFFERED, so the I/O manager copies the payload
+ * into system memory and a user-mode pointer is never dereferenced. Note
+ * that buffered I/O gives ONE buffer for both directions: the output
+ * overwrites the input, so a handler must finish reading before it
+ * starts writing.
+ *
+ * THE SECURITY BOUNDARY IS THE DEVICE ACL, NOTHING ELSE. Nothing in the
+ * payloads authenticates a caller. The mutating codes ask for
+ * FILE_WRITE_ACCESS so a read-only handle cannot reconfigure a pad.
+ * ====================================================================== */
+
+#define XC_DEVICE_TYPE          0xB9C0
+
+#define XC_IOCTL_READ(fn) \
+    CTL_CODE(XC_DEVICE_TYPE, 0x800 + (fn), METHOD_BUFFERED, \
+             FILE_ANY_ACCESS)
+#define XC_IOCTL_WRITE(fn) \
+    CTL_CODE(XC_DEVICE_TYPE, 0x800 + (fn), METHOD_BUFFERED, \
+             FILE_WRITE_ACCESS)
+
+#define IOCTL_XC_GET_VERSION    XC_IOCTL_READ(0)
+#define IOCTL_XC_GET_DEVICES    XC_IOCTL_READ(1)
+#define IOCTL_XC_GET_CONFIG     XC_IOCTL_READ(2)
+#define IOCTL_XC_GET_STATS      XC_IOCTL_READ(3)
+#define IOCTL_XC_SET_CONFIG     XC_IOCTL_WRITE(4)
+#define IOCTL_XC_RESET_CONFIG   XC_IOCTL_WRITE(5)
+
+/* More pads than anyone has. The array is walked, not searched. */
+#define XC_MAX_DEVICES          8
+
+/*
+ * The largest blob this build will accept. Sized to what it emits,
+ * with nothing spare: a bigger buffer only buys the chance to copy a
+ * bigger mistake.
+ */
+#define XC_CONFIG_BLOB_MAX \
+    ((ULONG)(sizeof(core_config_header) + \
+             sizeof(core_stick) * CORE_STICK_COUNT + \
+             sizeof(core_layout) * CORE_MAX_LAYOUTS))
+
+/*
+ * GET_VERSION. THE CONFIGURATOR ASKS BEFORE IT SENDS, so a build that
+ * accepts fewer layouts or a different blob version says so rather than
+ * rejecting the push with nothing to explain it.
+ */
+typedef struct _XC_VERSION_INFO {   /* 20 bytes */
+	u32 signature;          /* XC_CONFIG_SIGNATURE                  */
+	u16 driver_major;
+	u16 driver_minor;
+	u16 driver_patch;
+	u16 config_version;     /* CORE_CFG_VERSION                     */
+	u16 max_layouts;
+	u16 max_bindings;
+	u16 max_chords;
+	u16 blob_bytes;         /* the blob size this build emits       */
+} XC_VERSION_INFO;
+
+typedef struct _XC_DEVICE_ENTRY {   /* 12 bytes */
+	u32 index;              /* what the other codes take            */
+	u16 vendor_id;
+	u16 product_id;
+	u8  started;
+	u8  reserved[3];
+} XC_DEVICE_ENTRY;
+
+typedef struct _XC_DEVICE_LIST {
+	u32             count;
+	XC_DEVICE_ENTRY device[XC_MAX_DEVICES];
+} XC_DEVICE_LIST;
+
+typedef struct _XC_STATS {          /* 40 bytes */
+	u32 index;
+	u32 packets_accepted;
+	u32 packets_rejected;
+	u32 reports_emitted;
+	u32 reports_dropped;
+	u32 poll_errors;
+	u32 pipe_resets;
+	u32 poll_restarts;
+	u32 pending_reads;
+	u32 layer;              /* the live layer, 1-based              */
+} XC_STATS;
+
+/*
+ * SET_CONFIG, GET_CONFIG and RESET_CONFIG all begin with the index.
+ * SET_CONFIG carries the blob immediately after it; its length is
+ * InputBufferLength minus this header, NOT a field, because a length
+ * that can disagree with the buffer is a length that eventually does.
+ */
+typedef struct _XC_CONFIG_REQUEST {
+	u32 index;
+} XC_CONFIG_REQUEST;
+
+/*
+ * The commands, with the IRP plumbing stripped off. buffer is the single
+ * METHOD_BUFFERED buffer, in_len what arrived in it and out_len how much
+ * room there is for a reply; written receives the reply size.
+ *
+ * SPLIT OUT SO THE HARNESS CAN DRIVE EVERY COMMAND without an IRP, a
+ * device object or a symbolic link.
+ */
+NTSTATUS XcControlCommand(ULONG code, void *buffer, ULONG in_len,
+                          ULONG out_len, ULONG *written);
+
+/* The registry of live pads, which is what an index indexes. */
+void     XcDeviceRegister(PXC_DEVEXT DevExt);
+void     XcDeviceUnregister(PXC_DEVEXT DevExt);
+void     XcDeviceRegistryReset(void);
+
+/* ======================================================================
  * ENTRY POINTS
  * ====================================================================== */
 

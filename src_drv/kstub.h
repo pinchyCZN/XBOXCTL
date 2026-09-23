@@ -93,6 +93,9 @@ typedef unsigned long       ULONG_PTR;
 #define STATUS_DELETE_PENDING           ((NTSTATUS)0xC0000056L)
 #define STATUS_DEVICE_NOT_CONNECTED     ((NTSTATUS)0xC000009DL)
 #define STATUS_DEVICE_CONFIGURATION_ERROR ((NTSTATUS)0xC0000182L)
+#define STATUS_INVALID_DEVICE_REQUEST   ((NTSTATUS)0xC0000010L)
+#define STATUS_DEVICE_DOES_NOT_EXIST    ((NTSTATUS)0xC00000C0L)
+#define STATUS_REVISION_MISMATCH        ((NTSTATUS)0xC0000059L)
 
 #define NT_SUCCESS(s)                   (((NTSTATUS)(s)) >= 0)
 
@@ -356,6 +359,26 @@ typedef struct _HID_XFER_PACKET {
 
 #define HID_HID_DESCRIPTOR_TYPE     0x21
 #define HID_REPORT_DESCRIPTOR_TYPE  0x22
+
+/*
+ * CTL_CODE and its arguments, so wdm.h can spell the private control codes
+ * the same way in both builds rather than hard-coding two copies.
+ */
+#define METHOD_BUFFERED     0
+#define FILE_ANY_ACCESS     0
+#define FILE_READ_ACCESS    1
+#define FILE_WRITE_ACCESS   2
+#define CTL_CODE(DeviceType, Function, Method, Access)     (((DeviceType) << 16) | ((Access) << 14) | ((Function) << 2) | (Method))
+
+/*
+ * A fast mutex guards the device registry. The harness is single threaded,
+ * so these are shape only - but the shape has to exist, because the code
+ * that takes it is the code the driver runs.
+ */
+typedef struct _FAST_MUTEX { LONG Held; } FAST_MUTEX, *PFAST_MUTEX;
+void ExInitializeFastMutex(PFAST_MUTEX Mutex);
+void ExAcquireFastMutex(PFAST_MUTEX Mutex);
+void ExReleaseFastMutex(PFAST_MUTEX Mutex);
 
 /*
  * The real codes are CTL_CODE(FILE_DEVICE_KEYBOARD, fn, METHOD_NEITHER,
