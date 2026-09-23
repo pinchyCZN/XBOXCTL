@@ -262,15 +262,40 @@ typedef struct _sink_record {
 static sink_record g_Sink[SINK_MAX];
 static u32         g_SinkCount;
 
+/*
+ * TOTALS THAT THE RING CANNOT LOSE, and a count of what it did.
+ *
+ * g_Sink holds SINK_MAX records and silently drops the rest. A test that
+ * runs for a second at 250 Hz produces far more than that, so summing the
+ * ring measures the first 64 reports and calls it a second - it does not
+ * fail, it quietly reports a quarter of the right answer. Anything
+ * measuring a total over a long run must use these.
+ */
+static long g_MouseTotalX;
+static long g_MouseTotalY;
+static int  g_SinkDropped;
+
 static void sink_reset(void)
 {
+	g_MouseTotalX = 0;
+	g_MouseTotalY = 0;
+	g_SinkDropped = 0;
 	g_SinkCount = 0;
 }
 
 static void recording_sink(void *ctx, u8 id, const u8 *payload, u32 len)
 {
 	(void)ctx;
+
+	if (id == CORE_REPORT_ID_MOUSE && len > CORE_MS_Y + 1) {
+		g_MouseTotalX += (s16)(payload[CORE_MS_X] |
+		                       (payload[CORE_MS_X + 1] << 8));
+		g_MouseTotalY += (s16)(payload[CORE_MS_Y] |
+		                       (payload[CORE_MS_Y + 1] << 8));
+	}
+
 	if (g_SinkCount >= SINK_MAX) {
+		g_SinkDropped++;
 		return;
 	}
 	g_Sink[g_SinkCount].id = id;
@@ -1760,6 +1785,9 @@ static int test_autofire(void)
 	{
 		long presses = sink_button_presses(0x0001);
 
+		check_eq(g_SinkDropped, 0,
+		         "the report ring did not overflow, so the count below"
+		         " is of everything that happened");
 		check(presses >= 9 && presses <= 11,
 		      "holding A for a second at 10 Hz presses button 1 about"
 		      " ten times");
@@ -1967,6 +1995,241 @@ static int test_autofire(void)
 }
 
 /* ======================================================================
+ * THE STICK PIPELINE
+ *
+ * ../docs/analog-to-mouse.txt section 8. Every check here is aimed at one
+ * of the fixed-point traps that note names, because each of them produces
+ * motion that looks plausible and is wrong.
+ * ====================================================================== */
+
+/*
+ * Total pointer motion since the last sink_reset, taken from the running
+ * totals rather than the ring - see the note on g_MouseTotalX.
+ */
+static void sink_mouse_total(long *dx, long *dy)
+{
+	*dx = g_MouseTotalX;
+	*dy = g_MouseTotalY;
+}
+
+/* A configuration with the right stick driving the pointer, and nothing
+ * smoothed or accelerated, so the arithmetic is the only variable. */
+static void stick_config(core_config *cfg)
+{
+	core_config_defaults(cfg);
+	cfg->stick[1].mode        = CORE_STICK_MOUSE;
+	cfg->stick[1].smooth_ms   = 0;
+	cfg->stick[1].accel_rate  = 0;
+	cfg->stick[1].gain_x      = 128;
+	cfg->stick[1].gain_y      = 128;
+	cfg->stick[1].invert_x    = 0;
+	cfg->stick[1].invert_y    = 0;
+	core_config_suppress(cfg);
+}
+
+/* Hold the right stick at (x, y) for one second of 4ms packets. */
+static void stick_hold(core_state *cs, s16 x, s16 y, u64 *t, int packets)
+{
+	u8  packet[CORE_RAW_PACKET_BYTES];
+	int k;
+
+	make_packet(packet);
+	put_le16(&packet[CORE_RAW_RSTICK_X], x);
+	put_le16(&packet[CORE_RAW_RSTICK_Y], y);
+	for (k = 0; k < packets; k++) {
+		*t += 4 * CORE_100NS_PER_MS;
+		core_on_packet(cs, packet, CORE_RAW_PACKET_BYTES, *t);
+	}
+}
+
+static int test_sticks(void)
+{
+	static core_config cfg;
+	core_state         cs;
+	u8                 blob[4096];
+	u32                len;
+	u64                t = 1000;
+	long               dx, dy, dx2, dy2;
+
+	stick_config(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+
+	/* --- the stick takes the axes it drives ----------------------- */
+	core_init(&cs, recording_sink, NULL);
+	check_eq(core_set_config(&cs, blob, len, NULL), CORE_CFG_OK,
+	         "a pointer configuration installs");
+	check(cs.cfg.stick_claim & (1u << CORE_SA_RSTICK_XPOS),
+	      "a stick driving the pointer claims its own semiaxes");
+	check(!(cs.cfg.stick_claim & (1u << CORE_SA_LSTICK_XPOS)),
+	      "and leaves the other stick alone");
+
+	stick_hold(&cs, 32767, 0, &t, 2);
+	check_eq(cs.gp.axis[2], 0,
+	         "AND STOPS DRIVING Rx. A stick that aims and also moves the"
+	         " gamepad axis moves the crosshair twice");
+	check(cs.gp.axis[0] == 0, "the left stick is still centred");
+
+	/* --- the deadzone -------------------------------------------- */
+	core_init(&cs, recording_sink, NULL);
+	core_set_config(&cs, blob, len, NULL);
+	sink_reset();
+	stick_hold(&cs, 1200, 0, &t, 100);      /* about 1280 units */
+	sink_mouse_total(&dx, &dy);
+	check_eq(dx, 0, "inside the deadzone the pointer does not move");
+	check_eq(dy, 0, "on either axis");
+
+	/* --- full deflection runs at max_speed ------------------------ */
+	core_init(&cs, recording_sink, NULL);
+	core_set_config(&cs, blob, len, NULL);
+	stick_hold(&cs, 32767, 0, &t, 2);       /* prime the clock */
+	sink_reset();
+	stick_hold(&cs, 32767, 0, &t, 250);     /* one second */
+	sink_mouse_total(&dx, &dy);
+	check(dx > 2750 && dx < 2810,
+	      "a second at full deflection moves about max_speed pixels");
+	check_eq(dy, 0, "and nothing sideways");
+
+	/* --- THE ACCUMULATOR: no drift over time ---------------------- */
+	sink_reset();
+	stick_hold(&cs, 32767, 0, &t, 1000);    /* four seconds */
+	sink_mouse_total(&dx, &dy);
+	{
+		long expected = 4 * dx / 4;     /* silence unused warnings */
+
+		(void)expected;
+		check(dx > 4 * 2750 && dx < 4 * 2810,
+		      "FOUR SECONDS MOVES FOUR TIMES AS FAR. 11.2 pixels per"
+		      " tick truncated to 11 would lose 1.75 per cent, which"
+		      " is what carrying the remainder prevents");
+	}
+
+	/* --- truncation toward zero, not floor ------------------------ */
+	core_init(&cs, recording_sink, NULL);
+	core_set_config(&cs, blob, len, NULL);
+	stick_hold(&cs, -32767, 0, &t, 2);
+	sink_reset();
+	stick_hold(&cs, -32767, 0, &t, 1000);
+	sink_mouse_total(&dx2, &dy2);
+	check(dx2 < 0 && (-dx2 > dx - 8) && (-dx2 < dx + 8),
+	      "LEFT MOVES EXACTLY AS FAR AS RIGHT. A shift instead of a"
+	      " divide floors rather than truncating, and biases negative"
+	      " motion by one count every tick");
+
+	/* --- radial, not per-axis ------------------------------------- */
+	core_init(&cs, recording_sink, NULL);
+	core_set_config(&cs, blob, len, NULL);
+	stick_hold(&cs, 32767, 32767, &t, 2);
+	sink_reset();
+	stick_hold(&cs, 32767, 32767, &t, 250);
+	sink_mouse_total(&dx2, &dy2);
+	{
+		/* The magnitude of the diagonal, times 1000 to stay integer. */
+		long mag = (long)core_isqrt64((u64)((s64)dx2 * dx2 +
+		                                    (s64)dy2 * dy2));
+
+		check(mag > 2750 && mag < 2810,
+		      "A DIAGONAL IS NO FASTER THAN A CARDINAL. Per-axis"
+		      " deadzones and per-axis speed are what give the shipped"
+		      " Adaptoid profiles their dead cross and fast diagonals");
+		check(dx2 > 1900 && dx2 < 2050, "and it is evenly split");
+	}
+
+	/* --- the curve is consulted ----------------------------------- */
+	core_init(&cs, recording_sink, NULL);
+	stick_config(&cfg);
+	cfg.stick[1].deadzone = 0;
+	cfg.stick[1].outer    = CORE_MAX_VALUE;
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+	stick_hold(&cs, 16383, 0, &t, 2);
+	sink_reset();
+	stick_hold(&cs, 16383, 0, &t, 250);
+	sink_mouse_total(&dx, &dy);
+	check(dx > 1330 && dx < 1470,
+	      "with a linear curve, half deflection is half speed");
+
+	{
+		/* A quadratic curve: g = u*u, so half deflection is a
+		 * quarter of the speed. Built here the way the configurator
+		 * would, since the driver never evaluates one. */
+		int i;
+
+		for (i = 0; i < CORE_CURVE_POINTS; i++) {
+			long uu = (long)i * 65535 / (CORE_CURVE_POINTS - 1);
+
+			cfg.stick[1].curve[i] = (u16)((uu * uu) / 65535);
+		}
+		core_config_suppress(&cfg);
+		len = core_config_save(&cfg, blob, sizeof(blob));
+
+		core_init(&cs, recording_sink, NULL);
+		core_set_config(&cs, blob, len, NULL);
+		stick_hold(&cs, 16383, 0, &t, 2);
+		sink_reset();
+		stick_hold(&cs, 16383, 0, &t, 250);
+		sink_mouse_total(&dx, &dy);
+		check(dx > 640 && dx < 780,
+		      "and with a quadratic one it is a QUARTER - the table is"
+		      " read, not ignored");
+	}
+
+	/* --- which way is up ------------------------------------------ */
+	core_init(&cs, recording_sink, NULL);
+	stick_config(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+	stick_hold(&cs, 0, 32767, &t, 2);       /* pad Y is up-positive */
+	sink_reset();
+	stick_hold(&cs, 0, 32767, &t, 250);
+	sink_mouse_total(&dx, &dy);
+	check(dy < 0,
+	      "PUSHING THE STICK UP MOVES THE POINTER UP. Screen Y grows"
+	      " downward, so up is negative");
+
+	/* --- and which way is up WITH THE SHIPPED DEFAULTS ------------ */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	cfg.stick[1].mode = CORE_STICK_MOUSE;   /* and nothing else */
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+	stick_hold(&cs, 0, 32767, &t, 2);
+	sink_reset();
+	stick_hold(&cs, 0, 32767, &t, 250);
+	sink_mouse_total(&dx, &dy);
+	check(dy < 0,
+	      "UP IS UP UNDER THE BUILT-IN CONFIGURATION TOO. The decode"
+	      " already turns the pad's up-positive Y into HID's"
+	      " down-positive one, so inverting again here would aim the"
+	      " wrong way out of the box");
+
+	/* --- acceleration builds with time held ----------------------- */
+	core_init(&cs, recording_sink, NULL);
+	stick_config(&cfg);
+	cfg.stick[1].accel_threshold = 30000;
+	cfg.stick[1].accel_rate      = 256;     /* +1.0x per second */
+	cfg.stick[1].accel_max       = 512;
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+
+	stick_hold(&cs, 32767, 0, &t, 2);
+	sink_reset();
+	stick_hold(&cs, 32767, 0, &t, 250);     /* first second */
+	sink_mouse_total(&dx, &dy);
+	sink_reset();
+	stick_hold(&cs, 32767, 0, &t, 250);     /* second second */
+	sink_mouse_total(&dx2, &dy2);
+	check(dx2 > dx,
+	      "HELD AT THE EDGE, THE TURN KEEPS BUILDING. No curve of any"
+	      " shape can do this - it is a function of time held, not of"
+	      " deflection");
+
+	return 0;
+}
+
+/* ======================================================================
  * THE REGISTRATION CONTRACT
  * ====================================================================== */
 
@@ -2128,6 +2391,7 @@ int main(int argc, char **argv)
 	printf("[control]\n");      test_control();
 	printf("[chords]\n");       test_chords();
 	printf("[autofire]\n");     test_autofire();
+	printf("[sticks]\n");       test_sticks();
 	printf("[registration]\n"); test_driver_entry();
 
 	printf("---------------\n");

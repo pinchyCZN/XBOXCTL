@@ -182,7 +182,9 @@ class Stick(object):
         self.gain_x = 128
         self.gain_y = 54
         self.invert_x = 0
-        self.invert_y = 1
+        # 0: the decode already turns the pad's up-positive Y into
+        # HID's down-positive one. Set 1 only for inverted aiming.
+        self.invert_y = 0
         self.smooth_ms = 8
         self.curve = bezier_curve(*CURVE_PRESETS["linear"])
 

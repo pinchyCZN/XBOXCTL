@@ -946,6 +946,180 @@ static void core_apply_binding(core_state *cs, const core_binding *b,
 }
 
 /*
+ * ======================================================================
+ * THE STICK PIPELINE
+ *
+ * ../docs/analog-to-mouse.txt section 8, step for step. Steps 1 to 3 -
+ * the raw reads, the Y negate and the asymmetric scale - already happened
+ * in core_decode, so this starts from a pair of semiaxes in MAX_VALUE
+ * units with Y already down-positive.
+ * ====================================================================== */
+
+/* The four semiaxes of one stick, negative half first. */
+static const struct {
+	u8 xneg, xpos, yneg, ypos;
+} CORE_STICK_AXES[CORE_STICK_COUNT] = {
+	{ CORE_SA_LSTICK_XNEG, CORE_SA_LSTICK_XPOS,
+	  CORE_SA_LSTICK_YNEG, CORE_SA_LSTICK_YPOS },
+	{ CORE_SA_RSTICK_XNEG, CORE_SA_RSTICK_XPOS,
+	  CORE_SA_RSTICK_YNEG, CORE_SA_RSTICK_YPOS }
+};
+
+static void core_stick_run(core_state *cs, u32 index, u32 dt_us)
+{
+	const core_stick *cfg = &cs->cfg.stick[index];
+	core_stick_state *ss  = &cs->stick_state[index];
+	s32 x, y;
+	s32 r, rc, u, g;
+	s32 speed, vx, vy;
+	s32 step_x, step_y;
+	s32 i, f;
+
+	if (cfg->mode != CORE_STICK_MOUSE) {
+		return;
+	}
+
+	x = cs->semiaxis[CORE_STICK_AXES[index].xpos] -
+	    cs->semiaxis[CORE_STICK_AXES[index].xneg];
+	y = cs->semiaxis[CORE_STICK_AXES[index].ypos] -
+	    cs->semiaxis[CORE_STICK_AXES[index].yneg];
+
+	/*
+	 * STEP 4. SIXTY-FOUR BITS IS NOT OPTIONAL. Two axes at full scale
+	 * sum to 2.45e9, which does not fit a signed 32-bit integer; in 32
+	 * bits it wraps negative and the radius near full diagonal comes out
+	 * around 42900 instead of 49497.
+	 */
+	r = (s32)core_isqrt64((u64)((s64)x * x + (s64)y * y));
+
+	/* STEP 5. Radial deadzone, then rescale so the curve always sees a
+	 * full range whatever the deadzone is set to. */
+	if (r <= (s32)cfg->deadzone) {
+		ss->u_prev  = 0;
+		ss->boost   = 0;
+		ss->accum_x = 0;
+		ss->accum_y = 0;
+		return;
+	}
+
+	rc = (r < (s32)cfg->outer) ? r : (s32)cfg->outer;
+	u  = (s32)(((s64)(rc - cfg->deadzone) * 65535) /
+	           ((s32)cfg->outer - (s32)cfg->deadzone));
+
+	/*
+	 * STEP 6. RISE ONLY. Smoothing the fall would make the pointer
+	 * coast past where the stick stopped, which reads as the aim
+	 * overshooting rather than as anything smooth.
+	 */
+	if (cfg->smooth_ms != 0 && u > ss->u_prev) {
+		u32 tau_us = (u32)cfg->smooth_ms * 1000u;
+		u32 alpha  = (u32)(((u64)dt_us << 16) / (tau_us + dt_us));
+
+		u = ss->u_prev +
+		    (s32)((((s64)(u - ss->u_prev)) * alpha) >> 16);
+	}
+	ss->u_prev = u;
+
+	/* STEP 7. The table and a lerp - the driver never evaluates a
+	 * curve, it reads one the configurator computed. */
+	i = u >> 11;                            /* 0..31              */
+	f = u & 0x7FF;                          /* 11-bit fraction    */
+	if (i >= CORE_CURVE_POINTS - 1) {
+		i = CORE_CURVE_POINTS - 2;
+		f = 0x7FF;
+	}
+	g = (s32)cfg->curve[i] +
+	    (s32)((((s32)cfg->curve[i + 1] - (s32)cfg->curve[i]) * f) >> 11);
+
+	/* STEP 8. Deflection to pixels per second, then the time term. */
+	speed = (s32)(((s64)cfg->max_speed * g) >> 16);
+
+	if (cfg->accel_rate != 0) {
+		if (u >= (s32)cfg->accel_threshold) {
+			ss->boost += (s32)(((s64)cfg->accel_rate * dt_us) /
+			                   1000000);
+		} else {
+			ss->boost -= (s32)(((s64)cfg->accel_decay * dt_us) /
+			                   1000000);
+		}
+		ss->boost = core_clamp(ss->boost, 0, (s32)cfg->accel_max);
+		speed = (s32)(((s64)speed * (256 + ss->boost)) >> 8);
+	}
+
+	/*
+	 * STEP 9. PROJECT ALONG THE STICK, IN 64 BITS - speed times a full
+	 * scale axis reaches 6e10. Dividing by the radius is what makes this
+	 * radial: the speed is set by how far the stick is pushed and the
+	 * direction by where it points, so a diagonal is no faster than a
+	 * cardinal.
+	 */
+	vx = (s32)(((s64)speed * x) / r);
+	vy = (s32)(((s64)speed * y) / r);
+
+	/* STEP 10. */
+	vx = (s32)(((s64)vx * cfg->gain_x) >> 7);
+	vy = (s32)(((s64)vy * cfg->gain_y) >> 7);
+	if (cfg->invert_x) {
+		vx = -vx;
+	}
+	if (cfg->invert_y) {
+		vy = -vy;
+	}
+
+	/*
+	 * STEP 11. Carry the remainder rather than throwing it away.
+	 *
+	 * TRUNCATE TOWARD ZERO, WHICH IS WHAT C DIVISION DOES. A shift
+	 * would floor instead, and floor biases negative motion by one
+	 * count every tick - a pointer that drifts left and up.
+	 */
+	ss->accum_x += (s64)vx * dt_us;
+	ss->accum_y += (s64)vy * dt_us;
+
+	step_x = (s32)(ss->accum_x / 1000000);
+	step_y = (s32)(ss->accum_y / 1000000);
+
+	ss->accum_x -= (s64)step_x * 1000000;
+	ss->accum_y -= (s64)step_y * 1000000;
+
+	/* STEP 12. core_mouse_move emits nothing for a zero move. */
+	core_mouse_move(cs, step_x, step_y);
+}
+
+static void core_sticks(core_state *cs, u64 now_100ns)
+{
+	u64 elapsed;
+	u32 dt_us;
+	u32 i;
+
+	if (cs->last_stick_100ns == 0 || now_100ns < cs->last_stick_100ns) {
+		cs->last_stick_100ns = now_100ns;
+		return;
+	}
+
+	elapsed = now_100ns - cs->last_stick_100ns;
+	if (elapsed == 0) {
+		return;             /* two callers in the same instant */
+	}
+	cs->last_stick_100ns = now_100ns;
+
+	/*
+	 * CLAMP THE INTERVAL. A resume, a debugger break or DPC starvation
+	 * can hand this a gap of seconds, and multiplying that by a pointer
+	 * velocity flings the cursor across the desktop. Longer than the
+	 * clamp is a discontinuity, not motion.
+	 */
+	dt_us = (u32)(elapsed / 10);
+	if (dt_us > CORE_MAX_TICK_MS * 1000u) {
+		dt_us = CORE_MAX_TICK_MS * 1000u;
+	}
+
+	for (i = 0; i < CORE_STICK_COUNT; i++) {
+		core_stick_run(cs, i, dt_us);
+	}
+}
+
+/*
  * LAYER_HOLD IS RESOLVED AGAINST THE BASE LAYER, and that ordering is the
  * point rather than an accident: a hold binding evaluated in the layer it
  * switches to could be shadowed by that layer, and the pad would be stuck
@@ -1021,7 +1195,8 @@ static void core_evaluate(core_state *cs, u64 now_100ns)
 
 	core_zero(&cs->gp, (u32)sizeof(cs->gp));
 
-	core_fold_default(cs, cs->cfg.suppress[layer] | cs->hold_mask);
+	core_fold_default(cs, cs->cfg.suppress[layer] | cs->hold_mask |
+	                      cs->cfg.stick_claim);
 
 	for (i = 0; i < cs->cfg.binding_count; i++) {
 		core_binding *b = &cs->cfg.layout[layer].binding[i];
@@ -1032,6 +1207,8 @@ static void core_evaluate(core_state *cs, u64 now_100ns)
 		}
 		core_apply_binding(cs, b, &cs->bind[layer][i], now_100ns);
 	}
+
+	core_sticks(cs, now_100ns);
 }
 
 static void core_build_gamepad(core_state *cs, u8 *payload)
@@ -1316,6 +1493,11 @@ void core_release_all(core_state *cs)
 	 * was called does not come back mid hold-off. */
 	core_zero(cs->chord_value, (u32)sizeof(cs->chord_value));
 	cs->hold_mask = 0;
+
+	/* AND THE PENDING SUB-PIXEL MOTION. A remainder carried across a
+	 * configuration swap would move the pointer by something the new
+	 * configuration never asked for. */
+	core_zero(cs->stick_state, (u32)sizeof(cs->stick_state));
 }
 
 void core_on_packet(core_state *cs, const u8 *raw, u32 len, u64 now_100ns)
@@ -1439,7 +1621,15 @@ static void core_stick_defaults(core_stick *st)
 	st->gain_x          = 128;
 	st->gain_y          = 54;       /* 54/128 = 0.42, the shipped ratio */
 	st->invert_x        = 0;
-	st->invert_y        = 1;
+
+	/*
+	 * ZERO, AND THE OBVIOUS ARGUMENT FOR ONE IS ALREADY SPENT. The
+	 * pad reports Y up-positive and HID wants it down-positive, but
+	 * core_decode does that negation; doing it again here would aim
+	 * the wrong way out of the box. The flag stays for players who
+	 * want inverted aiming, which is a preference, not a fix.
+	 */
+	st->invert_y        = 0;
 	st->smooth_ms       = 8;
 	st->accel_threshold = 58000;
 	st->accel_rate      = 0;        /* off */
@@ -1587,6 +1777,22 @@ void core_config_suppress(core_config *cfg)
 		}
 		cfg->suppress[l]      = mask;
 		cfg->chord_members[l] = members;
+	}
+
+	/*
+	 * A stick driving the pointer stops driving the gamepad axes.
+	 * Sticks are global, so this mask is too.
+	 */
+	cfg->stick_claim = 0;
+	for (i = 0; i < CORE_STICK_COUNT; i++) {
+		if (cfg->stick[i].mode == CORE_STICK_OFF ||
+		    cfg->stick[i].mode == CORE_STICK_JOY) {
+			continue;
+		}
+		cfg->stick_claim |= 1u << CORE_STICK_AXES[i].xneg;
+		cfg->stick_claim |= 1u << CORE_STICK_AXES[i].xpos;
+		cfg->stick_claim |= 1u << CORE_STICK_AXES[i].yneg;
+		cfg->stick_claim |= 1u << CORE_STICK_AXES[i].ypos;
 	}
 }
 

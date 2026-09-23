@@ -689,9 +689,9 @@ Table of Contents
    |   | mouse paths, chords, layers,   | autofire runs at its configured  |
    |   | autofire                       | rate                             |
    +---+--------------------------------+----------------------------------+
-   | 6 | The stick: curve table,        | the FPS profile of               |
-   |   | accumulator, radial pipeline    | analog-to-mouse.txt section 9   |
-   |   |                                | is reproduced and feels right    |
+   | 6 | The stick: curve table,        | DONE. profiles/fps.txt aims,     |
+   |   | accumulator, radial pipeline,  | the pointer is radial, and the   |
+   |   | acceleration                   | velocity error is zero           |
    +---+--------------------------------+----------------------------------+
    | 7 | Repeat, toggle, layers, wheel, | the acceptance table in          |
    |   | mouse pulse                    | analog-to-mouse.txt section 9    |

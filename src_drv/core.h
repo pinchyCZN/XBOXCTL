@@ -403,6 +403,14 @@ typedef struct _core_config {
 	 * that keeps a chord from being preceded by its own members.
 	 */
 	u32         chord_members[CORE_MAX_LAYOUTS];
+
+	/*
+	 * The semiaxes a stick has taken for the pointer. A stick driving
+	 * the mouse must stop driving the gamepad axes as well, or every
+	 * aim moves the crosshair twice - section 4.1's rule, arrived at
+	 * from the other direction.
+	 */
+	u32         stick_claim;
 } core_config;
 
 /*
@@ -526,6 +534,27 @@ typedef struct _core_gamepad_out {
 	u8  reserved;
 } core_gamepad_out;
 
+/*
+ * What one stick carries between ticks. All three of these are why the
+ * pipeline needs a clock rather than just a deflection.
+ */
+typedef struct _core_stick_state {
+	s32 u_prev;             /* smoothing, 0..65535               */
+	s32 boost;              /* acceleration, Q8, added to 256    */
+
+	/*
+	 * THE SUB-PIXEL REMAINDER, and it is the whole reason the
+	 * Adaptoid needed threads. Velocity times elapsed time is
+	 * almost never a whole number of pixels; carrying what is left
+	 * over into the next tick makes the long-term velocity error
+	 * exactly zero instead of up to twenty per cent.
+	 *
+	 * Units are pixels times microseconds, so it takes 64 bits.
+	 */
+	s64 accum_x;
+	s64 accum_y;
+} core_stick_state;
+
 typedef struct _core_state {
 	/* --- seams --- */
 	core_report_fn  sink;
@@ -546,6 +575,18 @@ typedef struct _core_state {
 	u8              layer_base;     /* what CYCLE and SET latch */
 	u8              layer_pending;
 	u8              layer_pending_valid;
+
+	/* --- the stick pipeline --- */
+	core_stick_state stick_state[CORE_STICK_COUNT];
+
+	/*
+	 * WHEN THE STICKS WERE LAST ADVANCED, which is not the same as
+	 * when the last packet arrived. Both the packet path and the
+	 * periodic tick run the pipeline, and measuring from here rather
+	 * than from either clock is what stops the motion being counted
+	 * twice when both fire between one report and the next.
+	 */
+	u64             last_stick_100ns;
 
 	/* --- chords --- */
 	s32             chord_value[CORE_MAX_CHORDS];

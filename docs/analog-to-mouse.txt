@@ -573,8 +573,9 @@ Table of Contents
    | max_speed         | u16   | 2800     | px/s at full deflection            |
    | gain_x            | u8    | 128      | per-axis trim, 128 = 1.0           |
    | gain_y            | u8    | 54       | 54/128 = 0.42, the shipped ratio   |
-   | invert_x, invert_y| u8    | 0, 1     | Y inverted by default, HID down-   |
-   |                   |       |          | positive against pad up-positive   |
+   | invert_x, invert_y| u8    | 0, 0     | neither, by default: the decode    |
+   |                   |       |          | has already negated Y. Set for a   |
+   |                   |       |          | player who wants inverted aiming   |
    | smooth_ms         | u8    | 8        | rise-only one-pole time constant   |
    | accel_threshold   | u16   | 58000    | u above which boost accrues, Q16   |
    | accel_rate        | u16   | 0        | boost per second, Q8; 0 = off      |
@@ -666,9 +667,16 @@ Table of Contents
 
       12  if step_x or step_y is non-zero, emit a mouse report
 
-   TRUNCATE TOWARD ZERO IN STEP 11, not floor. C integer division
-   already does this; the point is not to substitute a shift, which
-   floors and therefore biases negative motion by one count per tick.
+   DIVIDE IN STEP 11, DO NOT SHIFT, and the reason is scale rather
+   than sign. A shift by 20 divides by 1048576 instead of 1000000, a
+   4.9 per cent error in every velocity.
+
+   A FLOOR DOES NOT BIAS THE MOTION, which is worth stating because it
+   is the obvious thing to fear. Measured: with the remainder carried
+   consistently, floor and truncation differ only in the range the
+   residual occupies - floor keeps it in [0, D) and truncation in
+   (-D, D) - and the long-run total is identical in both directions.
+   The carried remainder absorbs the difference.
 
 9.  Reproducing The Shipped Profiles
 
