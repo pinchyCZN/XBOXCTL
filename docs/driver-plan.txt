@@ -42,6 +42,8 @@ Table of Contents
    5.4.  Power
    6.  The Tick
    7.  The Configuration Transport
+   7.1.  Rumble
+   7.2.  What Will Never Drive It
    8.  The Configurator
    9.  State
    10. Work Order
@@ -553,6 +555,8 @@ Table of Contents
    | GET_STATS      | in: device index. out: the packet and report      |
    |                | counters, for diagnosis                           |
    +----------------+---------------------------------------------------+
+   | SET_RUMBLE     | in: device index, then two actuator levels        |
+   +----------------+---------------------------------------------------+
 
    HidRegisterMinidriver OVERWRITES THE DISPATCH TABLE, and that is the
    one awkward fact this design has to live with. A single driver object
@@ -592,6 +596,68 @@ Table of Contents
    Avoid the Adaptoid's arrangement entirely: saving the dispatch pointers
    hidclass installs, wrapping them, and triaging every IRP three ways is
    undocumented behaviour that a modern driver should not reproduce.
+
+7.1.  Rumble
+
+   The pad takes a six-byte interrupt OUT packet, and the layout is a
+   fact about the hardware taken from XBCD as the input packet was:
+
+       +0  0x00    report typ--------------+
+       +1  0x06    the length of this report
+       +2  0x0-----------------------------+
+       +3  left actuator,  0..25-----------+
+       +4  0x0-----------------------------+
+       +5  right actuator, 0..25-----------+
+
+   IT IS AN OUTPUT REPORT, NOT A FEATURE REPORT, and XBCD is the same:
+   its report ID 2 is an OUTPUT item carrying the two levels, while its
+   feature report is the configuration reload trigger. Dropping feature
+   reports from this descriptor therefore cost rumble nothing.
+
+   The path is the ordinary HID one. An application writes the output
+   report, hidclass turns it into IOCTL_HID_WRITE_REPORT, and the
+   minidriver builds the packet above and submits it on the OUT pipe.
+
+   RUMBLE IS A LEVEL, NOT A MESSAGE, which decides what happens to a
+   request arriving while a transfer is in flight: the newest values are
+   kept and sent when the current transfer completes. Queueing them
+   would replay a burst the caller has already moved on from; dropping
+   them would leave the motors at a level nobody asked for.
+
+   THE TRANSFER IS REFERENCE COUNTED like the poll slots, and cancelled
+   with them, so an outstanding write on a pad being unplugged does not
+   hold the teardown open until the bus gives up on it.
+
+   A PAD WITH NO OUT ENDPOINT SIMPLY DOES NOT RUMBLE. Some third-party
+   pads have none; the driver reports STATUS_NOT_SUPPORTED rather than
+   failing to start.
+
+7.2.  What Will Never Drive It
+
+   NO GAME WILL EVER SEND THAT OUTPUT REPORT, and this is worth stating
+   plainly because the feature otherwise looks finished.
+
+   A vendor-defined output report can only be driven by software written
+   for this exact report. The three routes a game would use instead are
+   each a project rather than a detail:
+
+   -  DIRECTINPUT FORCE FEEDBACK needs HID PID descriptors - effect
+      blocks, a parameter state machine, a large usage page. It is
+      comparable in size to the whole binding engine, and modern games
+      have largely abandoned the API.
+
+   -  XINPUT binds only to devices exposing the 360 pad's XUSB vendor
+      interface. That is a different device class, not a HID minidriver;
+      reaching it would mean impersonating that interface wholesale.
+
+   -  A VENDOR PATH - the control device's SET_RUMBLE, or a raw HID
+      write - works for this project's own tools and for anything
+      written against them, and for nothing else.
+
+   XBCD had the same limitation: its rumble was driven by its own setup
+   utility, not by games. SET_RUMBLE exists so the hardware path can be
+   exercised at all, which is the only way it will be.
+
 
 8.  The Configurator
 
@@ -693,9 +759,9 @@ Table of Contents
    |   | accumulator, radial pipeline,  | the pointer is radial, and the   |
    |   | acceleration                   | velocity error is zero           |
    +---+--------------------------------+----------------------------------+
-   | 7 | Repeat, toggle, layers, wheel, | the acceptance table in          |
-   |   | mouse pulse                    | analog-to-mouse.txt section 9    |
-   |   |                                | passes end to end                |
+   | 7 | Rumble: the OUT packet, the    | DONE. xbctl.ps1 rumble shakes    |
+   |   | HID output report, SET_RUMBLE  | the pad; no game can, and 7.2    |
+   |   |                                | says why                         |
    +---+--------------------------------+----------------------------------+
    | 8 | Rumble and the LED report      | force feedback works in a game   |
    +---+--------------------------------+----------------------------------+

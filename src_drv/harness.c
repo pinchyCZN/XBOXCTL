@@ -2230,6 +2230,130 @@ static int test_sticks(void)
 }
 
 /* ======================================================================
+ * RUMBLE
+ *
+ * ../docs/driver-plan.txt section 8. Rumble is a LEVEL, not a message, so
+ * the interesting case is not sending one packet - it is what happens to
+ * a level that arrives while a transfer is already in flight.
+ * ====================================================================== */
+
+void XcRumbleCompleteForTest(PXC_DEVEXT DevExt);
+
+static int test_rumble(void)
+{
+	static XC_DEVEXT  devext;
+	static u8         buffer[256];
+	XC_RUMBLE_REQUEST rr;
+	XC_STATS          stats;
+	ULONG             written;
+	NTSTATUS          status;
+
+	XcDeviceRegistryReset();
+	XcDevExtInit(&devext);
+	XcStartDevice((PDEVICE_OBJECT)&devext, NULL);
+
+	/* --- the packet the pad expects ------------------------------- */
+	XcRumbleSet(&devext, 200, 100);
+	check(devext.Rumble.Active, "a level submits a transfer");
+	check_eq(devext.Rumble.Buffer[0], 0x00, "byte 0 is the report type");
+	check_eq(devext.Rumble.Buffer[1], XC_RUMBLE_PACKET_BYTES,
+	         "byte 1 is the length, six");
+	check_eq(devext.Rumble.Buffer[2], 0x00, "byte 2 is zero");
+	check_eq(devext.Rumble.Buffer[3], 200, "byte 3 is the left actuator");
+	check_eq(devext.Rumble.Buffer[4], 0x00, "byte 4 is zero");
+	check_eq(devext.Rumble.Buffer[5], 100, "byte 5 is the right actuator");
+	check_eq((long)devext.Rumble.Sent, 1, "one transfer so far");
+
+	/* --- THE NEWEST LEVEL WINS -------------------------------------- */
+	XcRumbleSet(&devext, 10, 10);
+	XcRumbleSet(&devext, 20, 20);
+	XcRumbleSet(&devext, 30, 30);
+	check_eq((long)devext.Rumble.Sent, 1,
+	         "levels arriving during a transfer do not queue behind it");
+	check(devext.Rumble.Dirty, "they are remembered");
+	check_eq(devext.Rumble.Buffer[3], 200,
+	         "and the transfer in flight is left alone");
+
+	XcRumbleCompleteForTest(&devext);
+	check_eq((long)devext.Rumble.Sent, 2, "the completion sends again");
+	check_eq(devext.Rumble.Buffer[3], 30,
+	         "WITH THE NEWEST LEVEL, not the oldest. Queueing would"
+	         " replay a burst the caller has already moved on from");
+	check_eq(devext.Rumble.Buffer[5], 30, "on both actuators");
+
+	XcRumbleCompleteForTest(&devext);
+	check(!devext.Rumble.Active,
+	      "and with nothing new pending it stops");
+	check_eq((long)devext.Rumble.Sent, 2, "having sent exactly twice");
+
+	/* --- an unchanged level is not news --------------------------- */
+	XcRumbleSet(&devext, 30, 30);
+	check_eq((long)devext.Rumble.Sent, 2,
+	         "setting the level it is already at sends nothing");
+
+	/* --- stop is a level like any other --------------------------- */
+	XcRumbleSet(&devext, 0, 0);
+	check_eq((long)devext.Rumble.Sent, 3, "stopping is a transfer too");
+	check_eq(devext.Rumble.Buffer[3], 0, "with both actuators at zero");
+	XcRumbleCompleteForTest(&devext);
+
+	/* --- the control device drives the same path ------------------ */
+	rr.index = 0;
+	rr.left  = 77;
+	rr.right = 88;
+	memcpy(buffer, &rr, sizeof(rr));
+	status = XcControlCommand(IOCTL_XC_SET_RUMBLE, buffer, sizeof(rr),
+	                          sizeof(buffer), &written);
+	check_eq(status, STATUS_SUCCESS, "SET_RUMBLE is accepted");
+	check_eq(devext.Rumble.Buffer[3], 77,
+	         "and reaches the same transfer the HID report does");
+	check_eq(devext.Rumble.Buffer[5], 88, "on both actuators");
+	XcRumbleCompleteForTest(&devext);
+
+	/* A request too short to hold the levels is refused. */
+	memcpy(buffer, &rr, sizeof(rr));
+	status = XcControlCommand(IOCTL_XC_SET_RUMBLE, buffer, 4,
+	                          sizeof(buffer), &written);
+	check_eq(status, STATUS_INVALID_PARAMETER,
+	         "a truncated SET_RUMBLE is refused");
+
+	/* --- the counters reach GET_STATS ----------------------------- */
+	{
+		XC_CONFIG_REQUEST req;
+
+		req.index = 0;
+		memcpy(buffer, &req, sizeof(req));
+		XcControlCommand(IOCTL_XC_GET_STATS, buffer, sizeof(req),
+		                 sizeof(buffer), &written);
+		memcpy(&stats, buffer, sizeof(stats));
+		check_eq((long)stats.rumble_sent, (long)devext.Rumble.Sent,
+		         "GET_STATS reports the transfers sent");
+		check_eq((long)stats.rumble_errors, 0, "and none failed");
+	}
+
+	/* --- teardown does not strand a transfer ---------------------- */
+	XcRumbleSet(&devext, 255, 255);
+	check(devext.Rumble.Active, "a transfer is in flight");
+	XcRemoveDevice(&devext);
+	check(!devext.Rumble.Active,
+	      "REMOVAL ACCOUNTS FOR IT. A write left outstanding holds the"
+	      " drain open until the bus gives up on a pad that has gone");
+	check_eq(devext.IoCount, 0, "and the reference count reaches zero");
+
+	/* --- a pad with no OUT endpoint just does not rumble ---------- */
+	XcDevExtInit(&devext);
+	XcStartDevice((PDEVICE_OBJECT)&devext, NULL);
+	devext.HasOutPipe = FALSE;
+	devext.Rumble.Sent = 0;
+	XcRumbleSet(&devext, 200, 200);
+	check_eq((long)devext.Rumble.Sent, 0,
+	         "a pad with no OUT endpoint is not asked to rumble");
+	XcRemoveDevice(&devext);
+
+	return 0;
+}
+
+/* ======================================================================
  * THE REGISTRATION CONTRACT
  * ====================================================================== */
 
@@ -2371,6 +2495,8 @@ int main(int argc, char **argv)
 		       (unsigned long)IOCTL_XC_SET_CONFIG);
 		printf("RESET_CONFIG  0x%08lX\n",
 		       (unsigned long)IOCTL_XC_RESET_CONFIG);
+		printf("SET_RUMBLE    0x%08lX\n",
+		       (unsigned long)IOCTL_XC_SET_RUMBLE);
 		return 0;
 	}
 
@@ -2392,6 +2518,7 @@ int main(int argc, char **argv)
 	printf("[chords]\n");       test_chords();
 	printf("[autofire]\n");     test_autofire();
 	printf("[sticks]\n");       test_sticks();
+	printf("[rumble]\n");       test_rumble();
 	printf("[registration]\n"); test_driver_entry();
 
 	printf("---------------\n");

@@ -25,3 +25,5 @@ powershell -ExecutionPolicy Bypass -File hidread.ps1 -Buttons
 powershell -ExecutionPolicy Bypass -File hidread.ps1 -nosticks
 
 powershell -ExecutionPolicy Bypass -File xbctl.ps1 set -Path arcade.bin
+
+powershell -ExecutionPolicy Bypass -File xbctl.ps1 set rumble 200 200

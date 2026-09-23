@@ -1,0 +1,52 @@
+# XBOXCTL profile - FPS, right stick drives the pointer.
+#
+#   python tools/mkconfig.py profiles/fps.txt -o fps.bin
+#   B:\xboxctl\xbctl.ps1 set -Path fps.bin
+#
+# A STICK IN MOUSE MODE STOPS DRIVING ITS GAMEPAD AXES. Rx and Ry read
+# centred here, because a stick that aims and also moves the axis moves
+# the crosshair twice.
+#
+# The curve is computed here and shipped as a 33-entry table; the driver
+# never evaluates one. Two numbers describe it - see analog-to-mouse.txt
+# section 4.1 - and the presets below cover the shipped Adaptoid profiles.
+
+[global]
+tick_hz = 250
+
+# The left stick stays a joystick: WASD-style movement wants the axes.
+[stick left]
+mode = off
+
+[stick right]
+mode = mouse
+deadzone = 7000         # radial, in 35000ths. Raise if the stick drifts
+outer = 33000           # deflection treated as full
+max_speed = 2800        # pixels per second at full deflection
+curve = quad            # linear | quad | cubic | smoothstep | <y1> <y2>
+gain_x = 128            # 128 = 1.0
+gain_y = 54             # 54/128 = 0.42, slower vertical, as shipped
+invert_y = 0            # 1 for inverted aiming
+smooth_ms = 8           # rise-only smoothing
+
+# Turn acceleration: hold the stick at the edge and the turn keeps
+# building. No curve of any shape can do this - it is a function of time
+# held, not of deflection. accel_rate 0 turns it off.
+accel_threshold = 58000
+accel_rate = 0
+accel_max = 512
+accel_decay = 1024
+
+[layer 1]
+start+back -> layer_cycle 1
+ltrigger -> mouse_button 2      # aim
+rtrigger -> mouse_button 1      # fire
+a -> key space                  # jump
+b -> key lctrl                  # crouch
+x -> key r                      # reload
+y -> key e                      # use
+lthumb -> key lshift            # sprint
+
+[layer 2]
+start+back -> layer_cycle 1
+rtrigger -> mouse_button 1 repeat 10

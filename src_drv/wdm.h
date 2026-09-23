@@ -87,6 +87,43 @@ typedef struct _XC_POLL_SLOT {
 	PVOID       DevExt;         /* back pointer, for the completion */
 } XC_POLL_SLOT;
 
+/* ======================================================================
+ * RUMBLE
+ *
+ * The pad takes a six-byte interrupt OUT packet. The layout is a fact
+ * about the hardware, taken from XBCD the same way the input packet was:
+ *
+ *     +0  0x00    report type
+ *     +1  0x06    the length of this report
+ *     +2  0x00
+ *     +3  left actuator,  0..255
+ *     +4  0x00
+ *     +5  right actuator, 0..255
+ *
+ * RUMBLE IS A STATE, NOT AN EVENT, which decides how a request that
+ * arrives while a transfer is in flight is handled: the newest values
+ * are kept and sent when the current transfer completes. Queueing them
+ * would replay a burst the caller has already moved on from, and
+ * dropping them would leave the motors on a value nobody asked for.
+ * ====================================================================== */
+
+#define XC_RUMBLE_PACKET_BYTES  6
+
+typedef struct _XC_RUMBLE {
+	PIRP    Irp;
+	PURB    Urb;
+	u8      Buffer[XC_RUMBLE_PACKET_BYTES];
+	BOOLEAN Active;         /* a transfer is in flight           */
+	BOOLEAN Dirty;          /* newer values arrived during it    */
+	u8      Left;           /* what was last asked for           */
+	u8      Right;
+	u8      SentLeft;       /* what is actually on the wire      */
+	u8      SentRight;
+	ULONG   Sent;           /* transfers submitted, for the stats */
+	ULONG   Errors;
+	PVOID   DevExt;         /* back pointer, for the completion  */
+} XC_RUMBLE;
+
 /* Bits of DevExt->PollStopMask. Polling runs only while the mask is zero. */
 #define XC_STOP_NOT_STARTED     0x01
 #define XC_STOP_REMOVING        0x02
@@ -170,6 +207,9 @@ typedef struct _XC_DEVEXT {
 	ULONG               PollRestartRequests;
 	ULONG               PipeResets;
 
+	/* --- rumble --- */
+	XC_RUMBLE           Rumble;
+
 	/* --- the report queue and the pending reads --- */
 	XC_REPORT_NODE      ReportQueue[XC_REPORT_QUEUE_MAX];
 	ULONG               ReportHead;
@@ -241,6 +281,7 @@ typedef struct _XC_DEVEXT {
 #define IOCTL_XC_GET_STATS      XC_IOCTL_READ(3)
 #define IOCTL_XC_SET_CONFIG     XC_IOCTL_WRITE(4)
 #define IOCTL_XC_RESET_CONFIG   XC_IOCTL_WRITE(5)
+#define IOCTL_XC_SET_RUMBLE     XC_IOCTL_WRITE(6)
 
 /* More pads than anyone has. The array is walked, not searched. */
 #define XC_MAX_DEVICES          8
@@ -296,6 +337,8 @@ typedef struct _XC_STATS {          /* 40 bytes */
 	u32 poll_restarts;
 	u32 pending_reads;
 	u32 layer;              /* the live layer, 1-based              */
+	u32 rumble_sent;
+	u32 rumble_errors;
 } XC_STATS;
 
 /*
@@ -307,6 +350,21 @@ typedef struct _XC_STATS {          /* 40 bytes */
 typedef struct _XC_CONFIG_REQUEST {
 	u32 index;
 } XC_CONFIG_REQUEST;
+
+/*
+ * SET_RUMBLE. The same index, then the two actuator levels.
+ *
+ * THIS EXISTS BECAUSE THE HID OUTPUT REPORT REACHES NOBODY. A vendor
+ * output report can only be driven by software written for this exact
+ * report; no game will ever send one. Both paths end in the same
+ * XcRumbleSet, so the hardware path is exercised either way.
+ */
+typedef struct _XC_RUMBLE_REQUEST {
+	u32 index;
+	u8  left;
+	u8  right;
+	u8  reserved[2];
+} XC_RUMBLE_REQUEST;
 
 /*
  * The commands, with the IRP plumbing stripped off. buffer is the single
@@ -351,6 +409,13 @@ void     XcDevExtInit(PXC_DEVEXT DevExt);
 void     XcReportSink(void *ctx, u8 report_id, const u8 *payload, u32 len);
 
 /* Queue management, split out so both halves are testable without an IRP. */
+/*
+ * Ask for a pair of actuator levels. Safe to call from anywhere the
+ * write path runs, and safe to call faster than the pad can keep up:
+ * the newest values win and the rest are never put on the wire.
+ */
+void     XcRumbleSet(PXC_DEVEXT DevExt, u8 Left, u8 Right);
+
 void     XcQueueReport(PXC_DEVEXT DevExt, u8 report_id,
                        const u8 *payload, u32 len);
 int      XcDequeueReport(PXC_DEVEXT DevExt, XC_REPORT_NODE *out);

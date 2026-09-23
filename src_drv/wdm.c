@@ -583,6 +583,22 @@ static NTSTATUS XcPollAllocate(PXC_DEVEXT DevExt)
 			return STATUS_INSUFFICIENT_RESOURCES;
 		}
 	}
+
+	/*
+	 * THE RUMBLE TRANSFER IS NOT FATAL IF IT CANNOT BE ALLOCATED. A pad
+	 * that reads and maps but does not shake is a working pad; failing
+	 * the start would leave it with no driver at all.
+	 */
+	DevExt->Rumble.DevExt = DevExt;
+	DevExt->Rumble.Irp =
+	        IoAllocateIrp(DevExt->LowerDeviceObject->StackSize, FALSE);
+	if (DevExt->Rumble.Irp != NULL) {
+		DevExt->Rumble.Urb = (PURB)ExAllocatePoolWithTag(
+		        NonPagedPool,
+		        sizeof(struct _URB_BULK_OR_INTERRUPT_TRANSFER),
+		        XC_POOL_TAG);
+	}
+
 	return STATUS_SUCCESS;
 }
 
@@ -606,6 +622,15 @@ static void XcPollFree(PXC_DEVEXT DevExt)
 			IoFreeIrp(DevExt->Poll[i].Irp);
 			DevExt->Poll[i].Irp = NULL;
 		}
+	}
+
+	if (DevExt->Rumble.Urb != NULL) {
+		ExFreePoolWithTag(DevExt->Rumble.Urb, XC_POOL_TAG);
+		DevExt->Rumble.Urb = NULL;
+	}
+	if (DevExt->Rumble.Irp != NULL) {
+		IoFreeIrp(DevExt->Rumble.Irp);
+		DevExt->Rumble.Irp = NULL;
 	}
 }
 
@@ -715,6 +740,13 @@ void XcPollStop(PXC_DEVEXT DevExt, ULONG Reason)
 			IoCancelIrp(DevExt->Poll[i].Irp);
 		}
 	}
+
+	/* THE RUMBLE TRANSFER IS COUNTED TOO, so the drain waits on it. A
+	 * write left outstanding on a pad being unplugged would hold the
+	 * teardown open until the bus gave up on it. */
+	if (DevExt->Rumble.Active && DevExt->Rumble.Irp != NULL) {
+		IoCancelIrp(DevExt->Rumble.Irp);
+	}
 #else
 	/* The driver build drops each transfer's reference from
 	 * XcPollComplete when the cancelled transfer comes back. There is no
@@ -724,6 +756,11 @@ void XcPollStop(PXC_DEVEXT DevExt, ULONG Reason)
 			DevExt->Poll[i].Active = FALSE;
 			XcIoRelease(DevExt);
 		}
+	}
+	if (DevExt->Rumble.Active) {
+		DevExt->Rumble.Active = FALSE;
+		DevExt->Rumble.Dirty = FALSE;
+		XcIoRelease(DevExt);
 	}
 #endif
 }
@@ -915,9 +952,25 @@ NTSTATUS NTAPI XcInternalDeviceControl(PDEVICE_OBJECT Fdo, PIRP Irp)
 	 * Reporting success on the LED write is what stops Windows deciding
 	 * the keyboard is broken.
 	 */
+	/*
+	 * THE HID OUTPUT REPORT. hidclass hands it over as a HID_XFER_PACKET
+	 * whose reportBuffer begins with the report ID, so two actuator
+	 * levels arrive as three bytes.
+	 */
 	case IOCTL_HID_WRITE_REPORT:
+	{
+		PHID_XFER_PACKET packet = (PHID_XFER_PACKET)Irp->UserBuffer;
+
 		info = stack->Parameters.DeviceIoControl.InputBufferLength;
+
+		if (packet != NULL && packet->reportBuffer != NULL &&
+			packet->reportId == CORE_REPORT_ID_RUMBLE &&
+			packet->reportBufferLen >= 3) {
+			XcRumbleSet(DevExt, packet->reportBuffer[1],
+				        packet->reportBuffer[2]);
+		}
 		break;
+	}
 
 	case IOCTL_HID_SET_FEATURE:
 	case IOCTL_HID_GET_FEATURE:
@@ -1363,6 +1416,10 @@ NTSTATUS XcStartDevice(PDEVICE_OBJECT Fdo, PIRP Irp)
 
 	DevExt->Started = TRUE;
 
+	/* The real start finds this by walking the pipe list; a pad without
+	 * an OUT endpoint simply does not rumble. */
+	DevExt->HasOutPipe = TRUE;
+
 	/* Visible to the configurator only now that it can be configured. */
 	XcDeviceRegister(DevExt);
 
@@ -1430,6 +1487,190 @@ NTSTATUS NTAPI XcClose(PDEVICE_OBJECT Fdo, PIRP Irp)
 	Irp->IoStatus.Information = 0;
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 	return STATUS_SUCCESS;
+}
+
+/* ======================================================================
+ * RUMBLE
+ *
+ * wdm.h gives the packet. The state machine here exists because rumble is
+ * a level rather than a message: a request arriving while a transfer is in
+ * flight must replace the pending one, not queue behind it.
+ * ====================================================================== */
+
+#ifndef XBOXCTL_USERMODE
+
+static NTSTATUS XcRumbleSubmit(PXC_DEVEXT DevExt);
+
+static NTSTATUS NTAPI XcRumbleComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
+                                       PVOID Context)
+{
+	PXC_DEVEXT DevExt = (PXC_DEVEXT)Context;
+	KIRQL      irql;
+	BOOLEAN    again = FALSE;
+
+	(void)DeviceObject;
+
+	if (!NT_SUCCESS(Irp->IoStatus.Status)) {
+		DevExt->Rumble.Errors++;
+	}
+
+	KeAcquireSpinLock(&DevExt->PollLock, &irql);
+	DevExt->Rumble.Active = FALSE;
+	if (DevExt->Rumble.Dirty && !DevExt->Removed) {
+		DevExt->Rumble.Dirty = FALSE;
+		again = TRUE;
+	}
+	KeReleaseSpinLock(&DevExt->PollLock, irql);
+
+	/*
+	 * RESUBMIT AFTER RELEASING THE REFERENCE, not before. Submitting
+	 * while this transfer's reference is still held would let the count
+	 * never reach zero under a caller that keeps changing the level, and
+	 * teardown waits on that count.
+	 */
+	XcIoRelease(DevExt);
+
+	if (again) {
+		(void)XcRumbleSubmit(DevExt);
+	}
+
+	/* The IRP is ours and is reused; the I/O manager must not touch it. */
+	return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+static NTSTATUS XcRumbleSubmit(PXC_DEVEXT DevExt)
+{
+	XC_RUMBLE         *r = &DevExt->Rumble;
+	PIO_STACK_LOCATION stack;
+	KIRQL              irql;
+
+	if (r->Irp == NULL || r->Urb == NULL || !DevExt->HasOutPipe) {
+		return STATUS_NOT_SUPPORTED;
+	}
+
+	if (!XcIoAcquire(DevExt)) {
+		return STATUS_DELETE_PENDING;
+	}
+
+	KeAcquireSpinLock(&DevExt->PollLock, &irql);
+	r->Active    = TRUE;
+	r->SentLeft  = r->Left;
+	r->SentRight = r->Right;
+	KeReleaseSpinLock(&DevExt->PollLock, irql);
+
+	r->Buffer[0] = 0x00;
+	r->Buffer[1] = XC_RUMBLE_PACKET_BYTES;
+	r->Buffer[2] = 0x00;
+	r->Buffer[3] = r->SentLeft;
+	r->Buffer[4] = 0x00;
+	r->Buffer[5] = r->SentRight;
+
+	UsbBuildInterruptOrBulkTransferRequest(
+	        r->Urb,
+	        (USHORT)sizeof(struct _URB_BULK_OR_INTERRUPT_TRANSFER),
+	        DevExt->OutPipe,
+	        r->Buffer,
+	        NULL,
+	        XC_RUMBLE_PACKET_BYTES,
+	        USBD_TRANSFER_DIRECTION_OUT | USBD_SHORT_TRANSFER_OK,
+	        NULL);
+
+	IoSetCompletionRoutine(r->Irp, XcRumbleComplete, DevExt, TRUE, TRUE, TRUE);
+
+	stack = IoGetNextIrpStackLocation(r->Irp);
+	stack->MajorFunction = IRP_MJ_INTERNAL_DEVICE_CONTROL;
+	stack->Parameters.DeviceIoControl.IoControlCode =
+	        IOCTL_INTERNAL_USB_SUBMIT_URB;
+	stack->Parameters.Others.Argument1 = r->Urb;
+
+	r->Irp->Cancel = FALSE;
+	r->Sent++;
+
+	return IoCallDriver(DevExt->LowerDeviceObject, r->Irp);
+}
+
+#else   /* XBOXCTL_USERMODE */
+
+/*
+ * The harness has no bus to submit to, so the transfer completes at once.
+ * What it does model is the part worth testing: whether a level that
+ * arrives mid-transfer reaches the pad afterwards, or is lost.
+ */
+static NTSTATUS XcRumbleSubmit(PXC_DEVEXT DevExt)
+{
+	XC_RUMBLE *r = &DevExt->Rumble;
+
+	if (!DevExt->HasOutPipe) {
+		return STATUS_NOT_SUPPORTED;
+	}
+	if (!XcIoAcquire(DevExt)) {
+		return STATUS_DELETE_PENDING;
+	}
+
+	r->Active    = TRUE;
+	r->SentLeft  = r->Left;
+	r->SentRight = r->Right;
+
+	r->Buffer[0] = 0x00;
+	r->Buffer[1] = XC_RUMBLE_PACKET_BYTES;
+	r->Buffer[2] = 0x00;
+	r->Buffer[3] = r->SentLeft;
+	r->Buffer[4] = 0x00;
+	r->Buffer[5] = r->SentRight;
+	r->Sent++;
+
+	return STATUS_SUCCESS;
+}
+
+/* Stands in for the completion the bus would deliver. */
+void XcRumbleCompleteForTest(PXC_DEVEXT DevExt)
+{
+	BOOLEAN again;
+
+	if (!DevExt->Rumble.Active) {
+		return;
+	}
+	DevExt->Rumble.Active = FALSE;
+	again = DevExt->Rumble.Dirty;
+	DevExt->Rumble.Dirty = FALSE;
+
+	XcIoRelease(DevExt);
+
+	if (again && !DevExt->Removed) {
+		(void)XcRumbleSubmit(DevExt);
+	}
+}
+
+#endif  /* XBOXCTL_USERMODE */
+
+void XcRumbleSet(PXC_DEVEXT DevExt, u8 Left, u8 Right)
+{
+	BOOLEAN submit = FALSE;
+	KIRQL   irql;
+
+	if (DevExt->Removed || !DevExt->HasOutPipe) {
+		return;
+	}
+
+	KeAcquireSpinLock(&DevExt->PollLock, &irql);
+	DevExt->Rumble.Left  = Left;
+	DevExt->Rumble.Right = Right;
+
+	if (DevExt->Rumble.Active) {
+		/* THE NEWEST LEVEL WINS. Dirty is a flag and not a queue on
+		 * purpose; the values it refers to have already been
+		 * overwritten above. */
+		DevExt->Rumble.Dirty = TRUE;
+	} else if (Left != DevExt->Rumble.SentLeft ||
+	           Right != DevExt->Rumble.SentRight ||
+	           DevExt->Rumble.Sent == 0) {
+		submit = TRUE;
+	}
+	KeReleaseSpinLock(&DevExt->PollLock, irql);
+
+	if (submit) {
+		(void)XcRumbleSubmit(DevExt);
+	}
 }
 
 /* ======================================================================
@@ -1660,6 +1901,8 @@ static NTSTATUS XcCmdGetStats(PXC_DEVEXT dev, ULONG index, void *buffer,
 	stats.poll_restarts    = dev->PollRestartRequests;
 	stats.pending_reads    = dev->PendingReadCount;
 	stats.layer            = (u32)dev->Core.layout + 1;
+	stats.rumble_sent      = dev->Rumble.Sent;
+	stats.rumble_errors    = dev->Rumble.Errors;
 
 	RtlCopyMemory(buffer, &stats, sizeof(stats));
 	*written = (ULONG)sizeof(stats);
@@ -1731,6 +1974,7 @@ NTSTATUS XcControlCommand(ULONG code, void *buffer, ULONG in_len,
 	case IOCTL_XC_GET_STATS:
 	case IOCTL_XC_RESET_CONFIG:
 	case IOCTL_XC_SET_CONFIG:
+	case IOCTL_XC_SET_RUMBLE:
 		if (in_len < sizeof(request)) {
 			status = STATUS_INVALID_PARAMETER;
 			break;
@@ -1761,6 +2005,24 @@ NTSTATUS XcControlCommand(ULONG code, void *buffer, ULONG in_len,
 		}
 		if (code == IOCTL_XC_RESET_CONFIG) {
 			core_set_config_default(&dev->Core);
+			status = STATUS_SUCCESS;
+			break;
+		}
+		if (code == IOCTL_XC_SET_RUMBLE) {
+			XC_RUMBLE_REQUEST rr;
+
+			if (in_len < sizeof(rr)) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			RtlCopyMemory(&rr, buffer, sizeof(rr));
+			if (!dev->HasOutPipe) {
+				/* The pad has no OUT endpoint, which some third
+				 * party pads genuinely do not. */
+				status = STATUS_NOT_SUPPORTED;
+				break;
+			}
+			XcRumbleSet(dev, rr.left, rr.right);
 			status = STATUS_SUCCESS;
 			break;
 		}

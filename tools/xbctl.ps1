@@ -10,6 +10,16 @@
         xbctl.ps1 get   -Path out.bin  read the live blob back
         xbctl.ps1 set   -Path in.bin   install a blob
         xbctl.ps1 reset                back to the built-in default
+        xbctl.ps1 rumble 200 100       shake it: left, right, 0..255
+        xbctl.ps1 rumble 0 0           stop
+
+    RUMBLE IS A LEVEL, NOT A PULSE. It runs until something sets it back
+    to zero, this script included, so "rumble 0 0" is how it stops.
+
+    NO GAME WILL EVER DRIVE THIS. A vendor HID output report can only be
+    sent by software written for this exact report; getting rumble out of
+    an existing game needs HID PID force feedback, which is a project of
+    its own. See ../docs/driver-plan.txt section 8.
 
     Build a blob on the host with tools/mkconfig.py, copy it over, and
     push it with "set". Nothing here needs a replug: SET_CONFIG swaps the
@@ -17,13 +27,75 @@
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('version', 'devices', 'stats', 'get', 'set', 'reset')]
+    [ValidateSet('version', 'devices', 'stats', 'get', 'set', 'reset',
+                 'rumble')]
     [string]$Command = 'version',
+
+    # TAKEN AS TEXT, NOT AS NUMBERS. Typing a command where a level
+    # belongs - "set rumble 200 200" - would otherwise fail inside
+    # PowerShell's parameter binder, which reports a type conversion
+    # error naming a parameter the caller never mentioned. Collect
+    # whatever arrives and say something useful about it below.
+    [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
+    [string[]]$Rest,
+
     [string]$Path,
     [int]$Index = 0
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Show-Usage
+{
+    Write-Host "  usage:"
+    Write-Host "    xbctl.ps1 version"
+    Write-Host "    xbctl.ps1 devices"
+    Write-Host "    xbctl.ps1 stats   [-Index 0]"
+    Write-Host "    xbctl.ps1 get     -Path out.bin"
+    Write-Host "    xbctl.ps1 set     -Path in.bin"
+    Write-Host "    xbctl.ps1 reset"
+    Write-Host "    xbctl.ps1 rumble  <left 0-255> <right 0-255>"
+}
+
+# Check the arguments before opening anything, so a typo does not need a
+# handle to the driver to be told about.
+if ($Command -eq 'rumble') {
+    if ($null -eq $Rest -or $Rest.Count -ne 2) {
+        Write-Host "  rumble takes two levels, 0 to 255."
+        Write-Host "  'rumble 200 200' to shake, 'rumble 0 0' to stop."
+        Show-Usage
+        exit 2
+    }
+    $parsedLeft = 0
+    $parsedRight = 0
+    if (-not [int]::TryParse($Rest[0], [ref]$parsedLeft) -or
+        -not [int]::TryParse($Rest[1], [ref]$parsedRight)) {
+        Write-Host ("  '{0} {1}' is not a pair of numbers." -f
+                    $Rest[0], $Rest[1])
+        Show-Usage
+        exit 2
+    }
+    if ($parsedLeft -lt 0 -or $parsedLeft -gt 255 -or
+        $parsedRight -lt 0 -or $parsedRight -gt 255) {
+        Write-Host "  actuator levels are 0 to 255."
+        exit 2
+    }
+} elseif ($null -ne $Rest -and $Rest.Count -gt 0) {
+    Write-Host ("  '{0}' takes no extra arguments, but got: {1}" -f
+                $Command, ($Rest -join ' '))
+    if ($Rest -contains 'rumble') {
+        Write-Host "  Did you mean just 'rumble 200 200'? 'set' pushes a"
+        Write-Host "  configuration blob and wants -Path."
+    }
+    Show-Usage
+    exit 2
+}
+
+if (($Command -eq 'set' -or $Command -eq 'get') -and -not $Path) {
+    Write-Host ("  {0} needs -Path" -f $Command)
+    Show-Usage
+    exit 2
+}
 
 Add-Type -TypeDefinition @"
 using System;
@@ -72,6 +144,7 @@ $IOCTL = @{
     stats   = Ctl (0x800 + 3) $FILE_ANY_ACCESS
     set     = Ctl (0x800 + 4) $FILE_WRITE_ACCESS
     reset   = Ctl (0x800 + 5) $FILE_WRITE_ACCESS
+    rumble  = Ctl (0x800 + 6) $FILE_WRITE_ACCESS
 }
 
 # DECIMAL ON PURPOSE. PowerShell types the literal 0x80000000 as a SIGNED
@@ -113,6 +186,10 @@ function Invoke-Ctl([uint32]$code, [byte[]]$inBuf, [int]$outLen)
                                        [IntPtr]::Zero)
     if (-not $ok) {
         $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        if ($err -eq 50) {
+            throw ("the pad reports no OUT endpoint, so it cannot" +
+                   " rumble (error 50)")
+        }
         throw "DeviceIoControl failed: error $err"
     }
     return ,@($outBuf, $returned)
@@ -171,14 +248,12 @@ try {
     }
 
     'get' {
-        if (-not $Path) { throw "get needs -Path" }
         $r = Invoke-Ctl $IOCTL.get (Index-Bytes $Index) 8192
         [IO.File]::WriteAllBytes($Path, $r[0][0..($r[1] - 1)])
         Write-Host ("  {0}, {1} bytes" -f $Path, $r[1])
     }
 
     'set' {
-        if (-not $Path) { throw "set needs -Path" }
         $blob = [IO.File]::ReadAllBytes($Path)
         $buf = New-Object byte[] (4 + $blob.Length)
         [Array]::Copy((Index-Bytes $Index), 0, $buf, 0, 4)
@@ -191,6 +266,21 @@ try {
     'reset' {
         $null = Invoke-Ctl $IOCTL.reset (Index-Bytes $Index) 16
         Write-Host ("  index {0} is back on the built-in default" -f $Index)
+    }
+
+    'rumble' {
+        # XC_RUMBLE_REQUEST: u32 index, u8 left, u8 right, 2 reserved.
+        $buf = New-Object byte[] 8
+        [Array]::Copy((Index-Bytes $Index), 0, $buf, 0, 4)
+        $buf[4] = [byte]$parsedLeft
+        $buf[5] = [byte]$parsedRight
+        $null = Invoke-Ctl $IOCTL.rumble $buf 16
+        if ($parsedLeft -eq 0 -and $parsedRight -eq 0) {
+            Write-Host "  stopped"
+        } else {
+            Write-Host ("  left {0}, right {1}" -f $parsedLeft, $parsedRight)
+            Write-Host "  runs until you set it back to 0 0"
+        }
     }
 
     }
