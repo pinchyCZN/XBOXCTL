@@ -40,45 +40,7 @@ Table of Contents
    5.2.  The Report Queue
    5.3.  Coalescing
    5.4.  Power
-   5.4.  Power
-
-   A DEVICE POWER TRANSITION IS HANDLED IN BOTH DIRECTIONS AND THE ORDER
-   IS ASYMMETRIC. Going down, the work happens BEFORE the IRP is
-   forwarded: once the bus has taken the device's power away, submitting
-   to it is meaningless. Coming up, it happens AFTER, in a completion
-   routine, because the hardware is not powered until the stack below has
-   finished with the IRP.
-
-   Going down: stop the poll engine with XC_STOP_POWER_DOWN, and RELEASE
-   EVERYTHING BEING HELD.
-
-   THE RELEASE IS THE HALF THAT IS EASY TO FORGET, and it is the one a
-   user would notice. A key or a mouse button asserted at the moment the
-   device suspends has nothing to release it: the release would have come
-   from a packet saying the control came back up, and no more packets are
-   coming. Without it the host holds that key down for the whole of the
-   suspend and after it.
-
-   NOT A DRAIN. The IRPs are cancelled but not freed and the device object
-   survives, so nothing can complete into freed memory. Waiting would also
-   be wrong - a power IRP can arrive at DISPATCH_LEVEL, where a wait is
-   not allowed.
-
-   Coming up: clear the bit and restart. A slot whose cancel has not
-   landed yet is still marked active, so it is skipped here; its
-   completion arrives with STATUS_CANCELLED, which is a failure, so it
-   asks the recovery worker for a restart and the worker resubmits it.
-   Polling resumes either way.
-
-   NOT VERIFIED ON HARDWARE. The logic above is covered by the harness,
-   including that a key held at the moment of suspend is released. The
-   IRP plumbing is not: the test VM's hypervisor advertises only S5, so
-   no sleep state can be entered and no device power IRP is ever
-   delivered. See kernel-debugging.txt section 7.6, which also records
-   why the extradata keys that appear to enable S1 or S4 must not be
-   tried on VirtualBox 7.0.4.
-
-6.  The Tick
+   6.  The Tick
    7.  The Configuration Transport
    8.  The Configurator
    9.  State
@@ -451,6 +413,44 @@ Table of Contents
    Mouse motion could in principle be summed into a queued report, but not
    across a button change, so it is not merged.
 
+5.4.  Power
+
+   A DEVICE POWER TRANSITION IS HANDLED IN BOTH DIRECTIONS AND THE ORDER
+   IS ASYMMETRIC. Going down, the work happens BEFORE the IRP is
+   forwarded: once the bus has taken the device's power away, submitting
+   to it is meaningless. Coming up, it happens AFTER, in a completion
+   routine, because the hardware is not powered until the stack below has
+   finished with the IRP.
+
+   Going down: stop the poll engine with XC_STOP_POWER_DOWN, and RELEASE
+   EVERYTHING BEING HELD.
+
+   THE RELEASE IS THE HALF THAT IS EASY TO FORGET, and it is the one a
+   user would notice. A key or a mouse button asserted at the moment the
+   device suspends has nothing to release it: the release would have come
+   from a packet saying the control came back up, and no more packets are
+   coming. Without it the host holds that key down for the whole of the
+   suspend and after it.
+
+   NOT A DRAIN. The IRPs are cancelled but not freed and the device object
+   survives, so nothing can complete into freed memory. Waiting would also
+   be wrong - a power IRP can arrive at DISPATCH_LEVEL, where a wait is
+   not allowed.
+
+   Coming up: clear the bit and restart. A slot whose cancel has not
+   landed yet is still marked active, so it is skipped here; its
+   completion arrives with STATUS_CANCELLED, which is a failure, so it
+   asks the recovery worker for a restart and the worker resubmits it.
+   Polling resumes either way.
+
+   NOT VERIFIED ON HARDWARE. The logic above is covered by the harness,
+   including that a key held at the moment of suspend is released. The
+   IRP plumbing is not: the test VM's hypervisor advertises only S5, so
+   no sleep state can be entered and no device power IRP is ever
+   delivered. See kernel-debugging.txt section 7.6, which also records
+   why the extradata keys that appear to enable S1 or S4 must not be
+   tried on VirtualBox 7.0.4.
+
 6.  The Tick
 
    Autofire deadlines and the mouse velocity accumulator both need a clock
@@ -483,30 +483,76 @@ Table of Contents
 
 7.  The Configuration Transport
 
-   Persistence and delivery are separate and both hand the same bytes to
-   the same validator.
+   THE DRIVER READS NO PERSISTENT STORE. It holds one configuration in
+   memory, put there by a user-mode client over a private channel, and
+   runs the built-in default until one arrives. Persistence belongs to
+   the configurator, which keeps profiles as ordinary files and pushes
+   the chosen one when a pad appears.
 
-       DELIVER   the configurator sends the blob as FEATURE REPORT 5.
-                 HidD_SetFeature on an ordinary handle to the device
-                 interface reaches it - no private device object, no
-                 symbolic link, no IOCTL codes, no dispatch-table games,
-                 and no pointer-width problem.
+   This is the Adaptoid's arrangement rather than XBCD's. XBCD reads a
+   REG_BINARY value from its own hardware key at StartDevice; nothing
+   here does, and no code in this driver opens a registry key for
+   configuration at all.
 
-       PERSIST   the configurator writes the same blob as one REG_BINARY
-                 value under the device's own hardware key, reached with
-                 IoOpenDeviceRegistryKey and PLUGPLAY_REGKEY_DEVICE. Read
-                 at StartDevice.
+   THE PRICE OF THE MODEL, STATED PLAINLY: between a pad arriving and
+   the configurator noticing, the pad runs the built-in default. A
+   remapped profile is not in force during boot, at the logon screen, or
+   in a recovery console. Anything that has to work with no user-mode
+   process running must be expressible in the default map.
 
-   ONE FUNCTION PARSES AND VALIDATES. StartDevice calls it with the
-   registry bytes and the feature handler calls it with the report bytes.
+   THE CHANNEL IS A PRIVATE CONTROL DEVICE.
+
+       \Device\xboxctl, with a \DosDevices\xboxctl symbolic link, so
+       user mode opens \\.\xboxctl with CreateFile and drives it with
+       DeviceIoControl. One control device for the whole driver, created
+       on the first device arrival and reference counted, as the
+       Adaptoid's is - ../../ADAPTOID/docs/ioctl-surface.txt section 1.2.
+
+       EVERY CODE IS METHOD_BUFFERED, so the I/O manager copies the
+       payload and the transfer method itself raises no pointer-width
+       question. The payloads are still explicit fixed-width structures:
+       a 32-bit configurator talks to a 64-bit driver.
+
+   +----------------+---------------------------------------------------+
+   | Command        | Payload                                           |
+   +================+===================================================+
+   | GET_VERSION    | out: driver version, blob version, and the        |
+   |                | layout and binding ceilings this build accepts    |
+   +----------------+---------------------------------------------------+
+   | GET_DEVICES    | out: how many pads, and for each an index and     |
+   |                | its USB product id                                |
+   +----------------+---------------------------------------------------+
+   | SET_CONFIG     | in: device index, then the blob                   |
+   +----------------+---------------------------------------------------+
+   | GET_CONFIG     | in: device index. out: the blob now running       |
+   +----------------+---------------------------------------------------+
+   | RESET_CONFIG   | in: device index. Restores the built-in default   |
+   +----------------+---------------------------------------------------+
+   | GET_STATS      | in: device index. out: the packet and report      |
+   |                | counters, for diagnosis                           |
+   +----------------+---------------------------------------------------+
+
+   HidRegisterMinidriver OVERWRITES THE DISPATCH TABLE, and that is the
+   one awkward fact this design has to live with. A single driver object
+   serves the control device and every HID device, so after registration
+   the driver saves the hidclass entry points and installs its own
+   IRP_MJ_CREATE, IRP_MJ_CLOSE and IRP_MJ_DEVICE_CONTROL wrappers over
+   them. Each wrapper asks one question - is this the control device? -
+   and either handles the IRP or calls the saved hidclass handler.
+
+   THE TRIAGE IS A POINTER COMPARISON, NOT A FILE NAME. The Adaptoid
+   also claims opens of the HID interface path carrying a "\q" suffix,
+   which works only because it sees IRP_MJ_CREATE before hidclass and
+   tests a single character of the name. Comparing the device object
+   against the control device is unambiguous and costs nothing.
+
+   COMMANDS CARRY A DEVICE INDEX. The Adaptoid's button map is
+   driver-wide, so with two adapters plugged in, configuring one
+   configures both; ioctl-surface.txt section 8 records that as a defect
+   not to reproduce. Two pads get two configurations here.
+
+   ONE FUNCTION PARSES AND VALIDATES, whatever the bytes arrived on.
    There is no second implementation to drift.
-
-   THE HARDWARE KEY IS THE RIGHT STORE. It is per-device by construction,
-   so two pads have two configurations, and PLUGPLAY_REGKEY_DEVICE
-   resolves under Enum rather than under Software - so it is IMMUNE TO
-   WOW64 REDIRECTION. The Adaptoid reads its settings from
-   Software\Wish Technologies\Adaptoid, where a 32-bit configurator's
-   writes land in Wow6432Node and the driver never sees them.
 
    VALIDATE EVERY FIELD AND FALL BACK TO A DEFAULT. Reject on a bad
    signature or an unknown version, clamp every count, reject a release
@@ -553,12 +599,13 @@ Table of Contents
    -  THE RAW PACKET IS IN THE INPUT REPORT, at bytes 20..39 of report 1.
       "Press the control you want to bind" needs no second channel.
 
-   -  A LIVE CURVE PAGE. Push the blob on every drag through feature
-      report 5, draw the curve, show the resulting velocity in pixels per
-      second beside it. Curve tuning by numbers alone is miserable; by
-      feel it takes a minute. Persist only when the user says so - a page
-      that writes a 4.6 KB registry value on every mouse-move is not a
-      tuning page.
+   -  A LIVE CURVE PAGE. Push the blob on every drag with SET_CONFIG,
+      draw the curve, show the resulting velocity in pixels per second
+      beside it. Curve tuning by numbers alone is miserable; by feel it
+      takes a minute. SET_CONFIG costs nothing but a copy and a
+      validation pass, so pushing on every drag is reasonable; writing
+      the profile to its file is not, and should wait for the user to
+      say so.
 
 9.  State
 
@@ -611,9 +658,9 @@ Table of Contents
    |   | interval                       | names it                         |
    +---+--------------------------------+----------------------------------+
    | 4 | The config blob: parse,        | a hand-built blob delivered by   |
-   |   | validate, feature report 5,    | feature report changes a         |
-   |   | registry, harness tests for    | binding with no replug           |
-   |   | every malformed case           |                                  |
+   |   | validate, the control device   | DeviceIoControl changes a        |
+   |   | and its commands, harness      | binding with no replug           |
+   |   | tests for every malformed case |                                  |
    +---+--------------------------------+----------------------------------+
    | 5 | The binding engine: activation,| one binding types into Notepad,  |
    |   | hysteresis, the keyboard and    | and into a game that reads Raw  |

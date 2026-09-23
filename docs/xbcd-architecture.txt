@@ -208,8 +208,10 @@ Table of Contents
    Unlike the Adaptoid, XBCD does NOT save and re-wrap the dispatch
    pointers hidclass installs over its own. It has no private control
    device and no user-mode channel; all configuration arrives through the
-   registry and a HID feature report. That is a simpler and better
-   behaved arrangement than the Adaptoid's, and section 8 records it.
+   registry and a HID feature report, and section 8 records it. THE
+   REPLACEMENT TAKES THE ADAPTOID'S ARRANGEMENT HERE, not this one: a
+   control device reached by CreateFile and DeviceIoControl, and no
+   registry key at all.
 
 4.2.  AddDevice
 
@@ -878,12 +880,11 @@ Table of Contents
       real full scale, no floating point anywhere, percentages and 0..255
       slider values converted on the way in.
 
-   -  THE FEATURE-REPORT RELOAD HANDSHAKE, signature and all. Extend the
-      payload; keep the mechanism.
-
-   -  IoOpenDeviceRegistryKey(PLUGPLAY_REGKEY_DEVICE) as the config
-      store. Per-device by construction, and immune to WOW64
-      redirection.
+   -  THE SIGNATURE AND VERSION AT THE HEAD OF THE CONFIGURATION, and
+      the habit of validating every field against a default rather than
+      trusting the sender. The transport is not taken: configuration
+      reaches this driver over a private control device, and it reads no
+      registry key - driver-plan.txt section 7.
 
    -  MULTIPLE LAYOUTS SWITCHED FROM THE PAD ITSELF, with the edge latch
       in LayoutSwitch so holding the combination advances once, and the

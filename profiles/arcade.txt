@@ -1,0 +1,38 @@
+# XBOXCTL profile - arcade, two layers.
+#
+#   python tools/mkconfig.py profiles/arcade.txt -o arcade.bin
+#   src_drv/build/x64/Release/xboxctl.exe --load arcade.bin
+#
+# Layer 1 is the plain pad. Layer 2 is the same pad with the face buttons
+# autofiring. Start plus Back flips between them: over two layouts a cycle
+# of 1 wraps immediately, so it behaves as a toggle and no finger is held.
+#
+# A SOURCE YOU DO NOT NAME KEEPS ITS DEFAULT GAMEPAD CONTROL. Binding one
+# REPLACES that default - mapping-engine.txt section 4.1 - so layer 2 below
+# does not produce a steady press and a pulsing one at the same time. Add
+# the word "passthrough" to a binding to get both.
+
+[global]
+tick_hz = 250
+
+# Both sticks stay plain joystick axes. Set mode = mouse to hand a stick to
+# the pointer pipeline instead; the curve is computed here and shipped as a
+# 33-entry table, so the driver never evaluates one.
+[stick left]
+mode = off
+deadzone = 2000
+
+[stick right]
+mode = off
+deadzone = 2000
+curve = linear          # linear | quad | cubic | smoothstep | <y1> <y2>
+
+[layer 1]
+start+back -> layer_cycle 1
+
+[layer 2]
+start+back -> layer_cycle 1
+a -> joy_button 1 repeat 12
+b -> joy_button 2 repeat 12
+x -> joy_button 3 repeat 12
+y -> joy_button 4 repeat 12

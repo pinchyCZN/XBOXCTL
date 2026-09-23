@@ -937,6 +937,405 @@ static int test_power(void)
 }
 
 /* ======================================================================
+ * CONFIGURATION
+ *
+ * The blob arrives from user mode and is parsed at DISPATCH_LEVEL. There is
+ * no second chance and no way to ask the sender what it meant, so every
+ * check below is a check the driver makes before it trusts a byte.
+ * ====================================================================== */
+
+static u32 cfg_blob_len(const core_config *cfg)
+{
+	(void)cfg;
+	return (u32)sizeof(core_config_header) +
+	       (u32)sizeof(core_stick) * CORE_STICK_COUNT +
+	       (u32)sizeof(core_layout) * CORE_MAX_LAYOUTS;
+}
+
+static int test_config(void)
+{
+	static core_config cfg;
+	static core_config back;
+	static u8          blob[4096];
+	u32                len, repaired;
+	int                rc;
+	u32                i;
+
+	/* --- the wire format is the size the document states --------- */
+	check_eq((long)sizeof(core_binding), 12, "BINDING is 12 bytes");
+	check_eq((long)sizeof(core_chord), 4, "CHORD is 4 bytes");
+	check_eq((long)sizeof(core_stick), 88, "STICK is 88 bytes");
+	check_eq((long)sizeof(core_layout), 420, "LAYOUT is 420 bytes");
+	check_eq((long)sizeof(core_config_header), 32, "HEADER is 32 bytes");
+
+	/* --- defaults ------------------------------------------------ */
+	core_config_defaults(&cfg);
+	check(cfg.valid, "the built-in configuration is valid");
+	check_eq(cfg.layout_count, 2, "two layouts, not eight");
+	check_eq(cfg.tick_hz, 250, "ticking at the measured poll rate");
+
+	check_eq(cfg.layout[0].chord[0].member[0], CORE_SA_START,
+	         "chord 0 is Start");
+	check_eq(cfg.layout[0].chord[0].member[1], CORE_SA_BACK,
+	         "plus Back");
+	check_eq(cfg.layout[0].binding[0].action, CORE_ACT_LAYER_CYCLE,
+	         "which cycles the layer");
+	check_eq(cfg.layout[1].binding[0].action, CORE_ACT_LAYER_CYCLE,
+	         "IN BOTH LAYOUTS, or there is no way back");
+
+	check_eq(cfg.layout[1].binding[1].source, CORE_SA_A,
+	         "layer 2 binds A");
+	check(cfg.layout[1].binding[1].flags & CORE_BF_REPEAT,
+	      "with autofire");
+	check_eq(cfg.layout[1].binding[1].repeat_hz, 12, "at 12 Hz");
+
+	/* --- the suppression mask, section 4.1 ------------------------ */
+	check_eq((long)cfg.suppress[0], 0,
+	         "layer 1 suppresses nothing - the pad is stock");
+	check(cfg.suppress[1] & (1u << CORE_SA_A),
+	      "layer 2 suppresses A, whose binding replaces its default");
+	check(!(cfg.suppress[1] & (1u << CORE_SA_START)),
+	      "BUT NOT START: a chord member keeps its own button");
+	check(!(cfg.suppress[1] & (1u << CORE_SA_BLACK)),
+	      "nor Black, which nothing binds");
+
+	/* PASSTHROUGH takes a source back out of the mask. */
+	cfg.layout[1].binding[1].flags |= CORE_BF_PASSTHROUGH;
+	core_config_suppress(&cfg);
+	check(!(cfg.suppress[1] & (1u << CORE_SA_A)),
+	      "PASSTHROUGH keeps the default gamepad output as well");
+	cfg.layout[1].binding[1].flags &= (u8)~CORE_BF_PASSTHROUGH;
+	core_config_suppress(&cfg);
+
+	/* --- round trip ----------------------------------------------- */
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	check_eq((long)len, (long)cfg_blob_len(&cfg),
+	         "a saved blob is 1048 bytes");
+	check_eq((long)core_config_save(&cfg, blob, len - 1), 0,
+	         "and refuses to write into a buffer one byte short");
+
+	rc = core_config_load(&back, blob, len, &repaired);
+	check_eq(rc, CORE_CFG_OK, "it loads again");
+	check_eq((long)repaired, 0, "with nothing to repair");
+	check_eq((long)back.suppress[1], (long)cfg.suppress[1],
+	         "and the mask is rebuilt identically");
+	check_eq(back.layout[1].binding[1].repeat_hz, 12,
+	         "load(save(x)) == x");
+
+	/* --- structural rejection ------------------------------------- */
+	check_eq(core_config_load(&back, blob, 8, NULL), CORE_CFG_ERR_SHORT,
+	         "a blob shorter than a header is refused");
+
+	blob[0] ^= 0xFF;
+	check_eq(core_config_load(&back, blob, len, NULL),
+	         CORE_CFG_ERR_SIGNATURE, "a bad signature is refused");
+	blob[0] ^= 0xFF;
+
+	blob[4] = 0; blob[5] = 0;              /* version 0 */
+	check_eq(core_config_load(&back, blob, len, NULL),
+	         CORE_CFG_ERR_VERSION, "an older version is refused");
+	blob[4] = CORE_CFG_VERSION;
+
+	blob[8] = 1; blob[9] = 0;              /* layout_bytes = 1 */
+	check_eq(core_config_load(&back, blob, len, NULL),
+	         CORE_CFG_ERR_STRIDE, "a stride below the structure is refused");
+	blob[8] = (u8)(sizeof(core_layout) & 0xFF);
+	blob[9] = (u8)(sizeof(core_layout) >> 8);
+
+	blob[12] = 8;                          /* layout_count = 8 */
+	check_eq(core_config_load(&back, blob, len, NULL),
+	         CORE_CFG_ERR_COUNT,
+	         "eight layouts is REFUSED, not silently clamped to two");
+	blob[12] = 2;
+
+	check_eq(core_config_load(&back, blob, len - 1, NULL),
+	         CORE_CFG_ERR_TRUNCATED,
+	         "a blob that ends before its own header says is refused");
+
+	/*
+	 * A REJECTED BLOB MUST NOT DISTURB A RUNNING MAP. back still holds
+	 * the good configuration from the round trip above.
+	 */
+	check_eq(back.layout[1].binding[1].repeat_hz, 12,
+	         "and none of those rejections touched the loaded config");
+
+	/* --- a newer blob still loads, by its strides ------------------ */
+	memset(blob, 0, sizeof(blob));
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	blob[4] = 99;                          /* version 99 */
+	check_eq(core_config_load(&back, blob, len, &repaired), CORE_CFG_OK,
+	         "A NEWER VERSION LOADS: forward compatibility runs on the"
+	         " strides, not on the version");
+
+	/* --- value repair, not rejection ------------------------------- */
+	core_config_defaults(&cfg);
+	cfg.layout[0].binding[2].source    = CORE_SA_A;
+	cfg.layout[0].binding[2].action    = CORE_ACT_JOY_BUTTON;
+	cfg.layout[0].binding[2].code      = 900;      /* only 16 buttons */
+	cfg.layout[0].binding[3].source    = CORE_SA_B;
+	cfg.layout[0].binding[3].action    = CORE_ACT_KEY;
+	cfg.layout[0].binding[3].code      = 0x0300;   /* not a usage */
+	cfg.layout[0].binding[4].source    = CORE_SA_X;
+	cfg.layout[0].binding[4].action    = CORE_ACT_JOY_BUTTON;
+	cfg.layout[0].binding[4].code      = 1;
+	cfg.layout[0].binding[4].on_at     = 100;
+	cfg.layout[0].binding[4].off_at    = 30000;    /* above on_at */
+	cfg.layout[0].binding[5].source    = CORE_SA_Y;
+	cfg.layout[0].binding[5].action    = CORE_ACT_JOY_BUTTON;
+	cfg.layout[0].binding[5].code      = 1;
+	cfg.layout[0].binding[5].repeat_hz = 200;      /* above tick/2 */
+	cfg.stick[0].outer                 = 1000;
+	cfg.stick[0].deadzone              = 2000;     /* inverted */
+	cfg.stick[1].curve[10]             = 0;        /* non-monotone */
+
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	rc  = core_config_load(&back, blob, len, &repaired);
+	check_eq(rc, CORE_CFG_OK, "a blob full of bad VALUES still loads");
+	check(repaired >= 6, "with every one of them repaired");
+
+	check_eq(back.layout[0].binding[2].code, CORE_GP_BUTTON_COUNT,
+	         "a button of 900 is clamped to the descriptor's 16");
+	check_eq(back.layout[0].binding[3].action, CORE_ACT_NONE,
+	         "a key that is not a usage is dropped, not clamped");
+	check(back.layout[0].binding[4].off_at <=
+	      back.layout[0].binding[4].on_at,
+	      "off_at is never above on_at");
+	check_eq(back.layout[0].binding[5].repeat_hz, 125,
+	         "autofire is capped at half the tick rate");
+	check(back.stick[0].outer > back.stick[0].deadzone,
+	      "outer is pushed above deadzone so the rescale cannot"
+	      " divide by zero");
+	for (i = 1; i < CORE_CURVE_POINTS; i++) {
+		if (back.stick[1].curve[i] < back.stick[1].curve[i - 1]) {
+			break;
+		}
+	}
+	check_eq((long)i, CORE_CURVE_POINTS,
+	         "and the curve is monotone again");
+
+	/* An out-of-range source cannot be left able to fire. */
+	core_config_defaults(&cfg);
+	cfg.layout[0].binding[2].source = 200;
+	cfg.layout[0].binding[2].action = CORE_ACT_JOY_BUTTON;
+	cfg.layout[0].binding[2].code   = 1;
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_config_load(&back, blob, len, &repaired);
+	check_eq(back.layout[0].binding[2].action, CORE_ACT_NONE,
+	         "a source that names nothing real is disarmed");
+
+	return 0;
+}
+
+/* ======================================================================
+ * BINDINGS
+ *
+ * mapping-engine.txt sections 4.1, 5 and 9. The pad's face buttons are
+ * analog, so every "button" here is really a threshold with hysteresis,
+ * and the tests below are written against pressures rather than presses.
+ * ====================================================================== */
+
+/* Install a configuration built in memory rather than parsed from a blob,
+ * so a test can state exactly one binding and nothing else. */
+static void bind_install(core_state *cs, core_config *cfg)
+{
+	u8  blob[4096];
+	u32 len;
+
+	core_config_suppress(cfg);
+	len = core_config_save(cfg, blob, sizeof(blob));
+	check(len > 0, "the test configuration serialises");
+	check_eq(core_set_config(cs, blob, len, NULL), CORE_CFG_OK,
+	         "and installs");
+}
+
+/* A configuration with one layout, no chords and a single binding. */
+static void bind_one(core_config *cfg, u8 source, u8 action, u16 code,
+                     u8 flags)
+{
+	core_config_defaults(cfg);
+	cfg->layout[0].binding[0].source = source;
+	cfg->layout[0].binding[0].action = action;
+	cfg->layout[0].binding[0].code   = code;
+	cfg->layout[0].binding[0].flags  = flags;
+}
+
+/*
+ * Total wheel movement across every mouse report since the last
+ * sink_reset. IT CANNOT BE READ OFF cs.ms.wheel: movement is relative,
+ * so the accumulator is zeroed the instant it is reported.
+ */
+static long sink_wheel_total(void)
+{
+	long total = 0;
+	int  i;
+
+	for (i = 0; i < g_SinkCount; i++) {
+		if (g_Sink[i].id == CORE_REPORT_ID_MOUSE) {
+			total += (s8)g_Sink[i].payload[CORE_MS_WHEEL];
+		}
+	}
+	return total;
+}
+
+/* Drive one analog face button to a pressure and deliver the packet. */
+static void bind_press(core_state *cs, u8 *packet, int analog_index,
+                       int pressure, u64 when)
+{
+	packet[CORE_RAW_ANALOG_BASE + analog_index] = (u8)pressure;
+	core_on_packet(cs, packet, CORE_RAW_PACKET_BYTES, when);
+}
+
+static int test_bindings(void)
+{
+	static core_config cfg;
+	core_state         cs;
+	u8                 packet[CORE_RAW_PACKET_BYTES];
+	u64                t = 1000;
+
+	/* --- a key binding, and the hysteresis around it --------------- */
+	core_init(&cs, recording_sink, NULL);
+	bind_one(&cfg, CORE_SA_A, CORE_ACT_KEY, 0x1A, 0);   /* A -> W */
+	cfg.layout[0].binding[0].on_at  = CORE_MAX_VALUE / 2;
+	cfg.layout[0].binding[0].off_at = CORE_MAX_VALUE / 4;
+	bind_install(&cs, &cfg);
+
+	make_packet(packet);
+	sink_reset();
+	bind_press(&cs, packet, 0, 0, t += 4000);
+	check_eq(cs.kb.count, 0, "at rest no key is held");
+
+	bind_press(&cs, packet, 0, 100, t += 4000);     /* ~39 per cent */
+	check_eq(cs.kb.count, 0, "below on_at the key stays up");
+
+	bind_press(&cs, packet, 0, 200, t += 4000);     /* ~78 per cent */
+	check_eq(cs.kb.count, 1, "past on_at the key goes down");
+	check_eq(cs.kb.keys[0], 0x1A, "and it is W");
+
+	/*
+	 * THE POINT OF TWO THRESHOLDS. Back off to a pressure BELOW on_at
+	 * but above off_at: a single-threshold design releases here, and a
+	 * finger resting near the boundary then chatters at the packet rate.
+	 */
+	bind_press(&cs, packet, 0, 100, t += 4000);
+	check_eq(cs.kb.count, 1, "between the thresholds the key STAYS down");
+
+	bind_press(&cs, packet, 0, 40, t += 4000);      /* ~16 per cent */
+	check_eq(cs.kb.count, 0, "below off_at it releases");
+
+	/* --- suppression, section 4.1 ---------------------------------- */
+	check(!(cs.gp.buttons & 0x0001),
+	      "A drives no gamepad button while bound to a key");
+	bind_press(&cs, packet, 0, 255, t += 4000);
+	check_eq(cs.kb.count, 1, "A at full pressure types W");
+	check(!(cs.gp.buttons & 0x0001),
+	      "AND STILL DRIVES NO BUTTON - the binding replaced the"
+	      " default, it did not add to it");
+	check(cs.gp.buttons == 0, "nothing else is pressed either");
+
+	/* --- PASSTHROUGH puts the default back ------------------------- */
+	core_init(&cs, recording_sink, NULL);
+	bind_one(&cfg, CORE_SA_A, CORE_ACT_KEY, 0x1A, CORE_BF_PASSTHROUGH);
+	bind_install(&cs, &cfg);
+	make_packet(packet);
+	bind_press(&cs, packet, 0, 255, t += 4000);
+	check_eq(cs.kb.count, 1, "PASSTHROUGH still types the key");
+	check(cs.gp.buttons & 0x0001, "and keeps gamepad button 1 as well");
+
+	/* --- an unbound source is untouched ---------------------------- */
+	bind_press(&cs, packet, 1, 255, t += 4000);     /* B */
+	check(cs.gp.buttons & 0x0002,
+	      "B, which nothing binds, drives button 2 as always");
+
+	/* --- remapping one gamepad button to another ------------------- */
+	core_init(&cs, recording_sink, NULL);
+	bind_one(&cfg, CORE_SA_A, CORE_ACT_JOY_BUTTON, 5, 0);
+	bind_install(&cs, &cfg);
+	make_packet(packet);
+	bind_press(&cs, packet, 0, 255, t += 4000);
+	check(cs.gp.buttons & 0x0010, "A pressed reads as button 5");
+	check(!(cs.gp.buttons & 0x0001), "and no longer as button 1");
+
+	/* --- TOGGLE latches on the rising edge ------------------------- */
+	core_init(&cs, recording_sink, NULL);
+	bind_one(&cfg, CORE_SA_A, CORE_ACT_KEY, 0x1A, CORE_BF_TOGGLE);
+	bind_install(&cs, &cfg);
+	make_packet(packet);
+
+	bind_press(&cs, packet, 0, 255, t += 4000);
+	check_eq(cs.kb.count, 1, "a toggle press latches the key down");
+	bind_press(&cs, packet, 0, 0, t += 4000);
+	check_eq(cs.kb.count, 1, "AND RELEASING THE BUTTON DOES NOT LIFT IT");
+	bind_press(&cs, packet, 0, 255, t += 4000);
+	check_eq(cs.kb.count, 0, "the second press lets go");
+
+	/* --- a wheel detent is an event, not a state ------------------- */
+	core_init(&cs, recording_sink, NULL);
+	bind_one(&cfg, CORE_SA_A, CORE_ACT_MOUSE_WHEEL, 1, 0);
+	bind_install(&cs, &cfg);
+	make_packet(packet);
+	sink_reset();
+
+	bind_press(&cs, packet, 0, 255, t += 4000);
+	check_eq(sink_wheel_total(), 1, "holding A scrolls one detent");
+	bind_press(&cs, packet, 0, 254, t += 4000);
+	bind_press(&cs, packet, 0, 253, t += 4000);
+	check_eq(sink_wheel_total(), 1,
+	         "AND KEEPS SCROLLING NO FURTHER while it is held - a"
+	         " per-packet detent would scroll at 250 Hz");
+	bind_press(&cs, packet, 0, 0, t += 4000);
+	bind_press(&cs, packet, 0, 255, t += 4000);
+	check_eq(sink_wheel_total(), 2,
+	         "releasing and pressing scrolls again");
+
+	/* --- a mouse button is held, not pulsed ------------------------ */
+	core_init(&cs, recording_sink, NULL);
+	bind_one(&cfg, CORE_SA_A, CORE_ACT_MOUSE_BUTTON, 1, 0);
+	bind_install(&cs, &cfg);
+	make_packet(packet);
+	bind_press(&cs, packet, 0, 255, t += 4000);
+	check_eq(cs.ms.buttons, 1, "A holds the left mouse button");
+	bind_press(&cs, packet, 0, 0, t += 4000);
+	check_eq(cs.ms.buttons, 0, "and releases it");
+
+	/* --- a trigger driving an axis, pressure and all --------------- */
+	core_init(&cs, recording_sink, NULL);
+	bind_one(&cfg, CORE_SA_LTRIGGER, CORE_ACT_JOY_AXIS, 0,
+	         CORE_BF_ANALOG);
+	cfg.layout[0].binding[0].on_at = 1;
+	bind_install(&cs, &cfg);
+	make_packet(packet);
+	packet[CORE_RAW_ANALOG_BASE + 6] = 255;         /* left trigger */
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+	check(cs.gp.axis[0] > CORE_MAX_VALUE - 200,
+	      "ANALOG passes the trigger's pressure to the axis");
+
+	/* --- a configuration swap lets go of what was held ------------- */
+	core_init(&cs, recording_sink, NULL);
+	bind_one(&cfg, CORE_SA_A, CORE_ACT_KEY, 0x1A, 0);
+	bind_install(&cs, &cfg);
+	make_packet(packet);
+	bind_press(&cs, packet, 0, 255, t += 4000);
+	check_eq(cs.kb.count, 1, "a key is held under the old map");
+
+	sink_reset();
+	bind_one(&cfg, CORE_SA_B, CORE_ACT_KEY, 0x04, 0);
+	bind_install(&cs, &cfg);
+	check_eq(cs.kb.count, 0,
+	         "INSTALLING A NEW MAP RELEASES IT - no binding in the new"
+	         " table has ever heard of that key");
+
+	/* --- a rejected blob changes nothing --------------------------- */
+	bind_press(&cs, packet, 1, 255, t += 4000);     /* B -> A key */
+	check_eq(cs.kb.count, 1, "the new map is live");
+	check_eq(core_set_config(&cs, packet, 8, NULL), CORE_CFG_ERR_SHORT,
+	         "a rubbish blob is refused");
+	check_eq(cs.kb.count, 1,
+	         "and the refusal did not disturb what was held");
+
+	return 0;
+}
+
+/* ======================================================================
  * THE REGISTRATION CONTRACT
  * ====================================================================== */
 
@@ -960,10 +1359,106 @@ static int test_driver_entry(void)
 
 /* ====================================================================== */
 
+/*
+ * --save-default FILE writes the built-in configuration as a blob.
+ *
+ * IT EXISTS TO CROSS-CHECK tools/mkconfig.py. Two independent
+ * implementations of one wire format drift silently; comparing the
+ * bytes they each produce for the same configuration catches a padding
+ * or field-order difference immediately, and that is exactly the class
+ * of bug that would otherwise surface as corrupted bindings on one
+ * build only.
+ */
+static int save_default(const char *path)
+{
+	static core_config cfg;
+	static u8          blob[4096];
+	u32                len;
+	FILE              *out;
+
+	core_config_defaults(&cfg);
+	len = core_config_save(&cfg, blob, (u32)sizeof(blob));
+	if (len == 0) {
+		printf("  core_config_save refused\n");
+		return 1;
+	}
+
+	out = fopen(path, "wb");
+	if (!out) {
+		printf("  cannot write %s\n", path);
+		return 1;
+	}
+	fwrite(blob, 1, len, out);
+	fclose(out);
+
+	printf("  %s, %u bytes\n", path, (unsigned)len);
+	return 0;
+}
+
+/*
+ * --load FILE runs a blob through the real validator and says what it
+ * made of it. This is how a profile is checked before it is pushed to
+ * a driver that parses it at DISPATCH_LEVEL with no way to complain.
+ */
+static int load_blob(const char *path)
+{
+	static core_config cfg;
+	static u8          blob[8192];
+	static const char *WHY[] = {
+		"ok", "shorter than a header", "bad signature",
+		"version older than this build", "stride below the structure",
+		"a count past its ceiling", "ends before its header says"
+	};
+	u32   len, repaired = 0;
+	int   rc;
+	u32   l, i, active;
+	FILE *in;
+
+	in = fopen(path, "rb");
+	if (!in) {
+		printf("  cannot read %s\n", path);
+		return 1;
+	}
+	len = (u32)fread(blob, 1, sizeof(blob), in);
+	fclose(in);
+
+	rc = core_config_load(&cfg, blob, len, &repaired);
+	if (rc != CORE_CFG_OK) {
+		printf("  REJECTED: %s (%d)\n", WHY[rc], rc);
+		return 1;
+	}
+
+	printf("  %s: %u bytes, %u layout(s), tick %u Hz\n",
+	       path, (unsigned)len, cfg.layout_count, cfg.tick_hz);
+	if (repaired) {
+		printf("  %u field(s) REPAIRED - the blob was accepted but\n"
+		       "  not as written; dump it to see what changed\n",
+		       (unsigned)repaired);
+	}
+
+	for (l = 0; l < cfg.layout_count; l++) {
+		active = 0;
+		for (i = 0; i < cfg.binding_count; i++) {
+			if (cfg.layout[l].binding[i].action !=
+			    CORE_ACT_NONE) {
+				active++;
+			}
+		}
+		printf("  layer %u: %u binding(s), suppress mask %08X\n",
+		       (unsigned)l + 1, (unsigned)active,
+		       (unsigned)cfg.suppress[l]);
+	}
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
-	(void)argc;
-	(void)argv;
+	if (argc == 3 && strcmp(argv[1], "--save-default") == 0) {
+		return save_default(argv[2]);
+	}
+	if (argc == 3 && strcmp(argv[1], "--load") == 0) {
+		return load_blob(argv[2]);
+	}
 
 	printf("xboxctl harness\n");
 	printf("---------------\n");
@@ -977,6 +1472,8 @@ int main(int argc, char **argv)
 	printf("[transport]\n");    test_transport();
 	printf("[teardown]\n");     test_teardown();
 	printf("[power]\n");        test_power();
+	printf("[config]\n");       test_config();
+	printf("[bindings]\n");     test_bindings();
 	printf("[registration]\n"); test_driver_entry();
 
 	printf("---------------\n");

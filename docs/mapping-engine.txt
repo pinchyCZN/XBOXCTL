@@ -35,6 +35,7 @@ Table of Contents
    2.2.  Chords
    3.  Actions
    4.  The Binding Record
+   4.1.  Binding A Source Suppresses Its Default
    5.  Activation
    5.1.  Threshold And Hysteresis
    5.2.  Toggle
@@ -144,9 +145,10 @@ Table of Contents
    the chord must not have emitted - which is why chords are evaluated
    before ordinary bindings in section 9.
 
-   Chords are a phase-two item. The rule is recorded now because a design
-   that does not anticipate the suppression pass has to be rearranged to
-   accept it later.
+   MEMBER SUPPRESSION IS NOT THE SAME AS SECTION 4.1. A chord is its own
+   source, so naming Start and Back as members does not bind Start or
+   Back, and both keep their default gamepad buttons. They are held back
+   only for the packets in which the chord itself is active.
 
 3.  Actions
 
@@ -157,8 +159,8 @@ Table of Contents
    |    1 | KEY              | HID usage 0x04..0xA4, or a modifier 0xE0..0xE7 |
    |    2 | MOUSE_BUTTON     | 1..5                                           |
    |    3 | MOUSE_WHEEL      | signed detents per activation or repeat        |
-   |    4 | JOY_BUTTON       | 1..24, the gamepad collection                  |
-   |    5 | JOY_AXIS         | axis 0..6 in the low bits, sign in the high    |
+   |    4 | JOY_BUTTON       | 1..16, the gamepad collection                  |
+   |    5 | JOY_AXIS         | axis 0..5 in the low bits, sign in the high    |
    |    6 | JOY_POV          | direction 0..3                                 |
    |    7 | MOUSE_PULSE      | signed dx in the low byte, dy in the high;     |
    |      |                  | emitted per activation or per repeat           |
@@ -213,6 +215,9 @@ Table of Contents
                              JOY_AXIS and MOUSE_PULSE
            0x08  NO_REPEAT_FIRST  the first repeat interval is the only
                              one; used to make a delayed single shot
+           0x10  PASSTHROUGH keep the source driving its default gamepad
+                             control as well as performing the action;
+                             section 4.1
 
    FIXED WIDTH TYPES, NOT int. The sibling project's notes call this out
    for the Adaptoid's IOCTL payloads and it applies with more force here,
@@ -223,6 +228,34 @@ Table of Contents
    A layout is a fixed array of 32 bindings, terminated early by a
    source of 0xFF. 32 slots against 25 sources leaves room for a source
    bound twice and for a few chords.
+
+4.1.  Binding A Source Suppresses Its Default
+
+   Every source has a default gamepad destination: the sixteen buttons
+   and six axes of the default map in core.c. A BINDING ON A SOURCE
+   REPLACES THAT DEFAULT. Bind A to a key and A stops reporting as
+   gamepad button 1.
+
+   That is the right default because a game seeing live gamepad input
+   while the pad drives the keyboard flips its on-screen button prompts
+   back and forth between the two. Suppression makes a remapped pad look
+   like the device it is pretending to be.
+
+   Set PASSTHROUGH on the binding to keep both.
+
+   THE MASK IS BUILT ONCE, AT CONFIG LOAD, NEVER PER PACKET. Walk the
+   layout and set one bit per bound source in a u32 - twenty-five
+   sources fit with room over - leaving the bit clear for any binding
+   carrying PASSTHROUGH. Evaluation then costs one AND against the
+   default map, in the step added to section 9.
+
+   The mask is per layout, so a source may drive the gamepad on one
+   layer and be consumed on the other.
+
+   A SOURCE BOUND ONLY TO A LAYER ACTION IS STILL SUPPRESSED. Holding a
+   shoulder button to reach the autofire layer should not also press
+   that shoulder button in the game. One rule and one way to override it
+   beats a table of exceptions.
 
 5.  Activation
 
@@ -331,12 +364,32 @@ Table of Contents
 
 7.  Layers
 
+   THIS BUILD SHIPS TWO LAYERS, not XBCD's eight. The intended use is an
+   arcade profile: one layer with plain buttons, one with the same
+   buttons autofiring, and a single control to flip between them. Two is
+   what a player can hold in their head mid-game; eight is a menu nobody
+   remembers the shape of. layout_count remains a header field, so
+   raising the ceiling later is a configurator change and one bounds
+   constant, not a redesign.
+
    XBCD has eight layouts and one way to change them: hold Start and
    Back, or the Guide button on a 360 pad, and the edge latch in
    LayoutSwitch advances one step per press. The 360 LED ring shows
    which is live. All of that is worth keeping and none of it needs to
    be special-cased in the engine once layer changes are ordinary
    actions.
+
+   THE SHIPPED DEFAULT IS LAYER_CYCLE WITH A STEP OF 1, BOUND TO A CHORD
+   OF START AND BACK - XBCD's own gesture, and one no game uses, because
+   both buttons are already committed elsewhere. Over two layouts a step
+   of 1 wraps immediately, so cycle IS a toggle here: press to reach
+   autofire, press again to come back. No finger is held, which matters
+   when the whole point of the second layer is to keep firing.
+
+   THE CYCLE BINDING MUST APPEAR IN BOTH LAYOUTS. It is the only way
+   back; a layer that omits it is a layer you cannot leave without
+   unplugging the pad. This is the same rule stated for LAYER_HOLD
+   below, and the configurator should enforce it for both.
 
    Three actions cover every case:
 
@@ -349,8 +402,8 @@ Table of Contents
 
    LAYER_HOLD IS THE ONE THAT IS ACTUALLY NEW and it is what a keyboard
    user expects. Hold the left trigger and the face buttons become a
-   different set: the shift key of a gamepad. Without it, eight layouts
-   are eight modes you cycle through blind.
+   different set: the shift key of a gamepad. Without it, a layer is a
+   mode you cycle into blind and have to look away to confirm.
 
    THE HOLD BINDING MUST LIVE IN EVERY LAYER IT CAN RETURN FROM, or the
    layer it switches to has no binding holding it and it releases
@@ -447,11 +500,13 @@ Table of Contents
        6  walk the binding list of the effective layer: activation,
           toggle, repeat deadlines, and fold each active binding into
           the three output states
-       7  run the stick vector path for each stick, producing mouse
+       7  fold the default gamepad map for every source the layout's
+          suppression mask leaves clear (section 4.1)
+       8  run the stick vector path for each stick, producing mouse
           deltas or joystick axes per its mode
-       8  compare each output state against the last submitted; queue a
+       9  compare each output state against the last submitted; queue a
           report for each that changed
-       9  drain the queue into pending HID reads
+      10  drain the queue into pending HID reads
 
    STEP 4 IS ORDERED THAT WAY ON PURPOSE. Resolving holds against the
    base layer means a hold binding cannot be shadowed by the layer it
@@ -468,45 +523,63 @@ Table of Contents
 
 10. The Configuration Blob
 
-   One versioned structure, written by the configurator, read by the
-   driver. Carried both ways - persisted in the registry and pushed live
-   over a feature report. See replacement-plan.txt section 6 for the
-   transport.
+   One versioned structure, written by the configurator and pushed to
+   the driver over the private control device of driver-plan.txt section
+   7. THE DRIVER NEVER PERSISTS IT AND NEVER READS IT BACK FROM
+   ANYWHERE; the configurator owns the file and pushes it when a pad
+   appears.
 
        struct CONFIG_HEADER {       /* 32 bytes */
            u32 signature;           /* 'XBSU', as XBCD */
            u16 version;             /* bump on any layout change */
            u16 header_bytes;
            u16 layout_bytes;        /* stride of one layout */
-           u8  layout_count;        /* 1..8 */
+           u16 stick_bytes;         /* stride of one stick */
+           u8  layout_count;        /* 1..2, section 7 */
            u8  binding_count;       /* per layout, <= 32 */
            u8  chord_count;
            u8  collections;         /* bit 0 gamepad, 1 keyboard,
-                                       2 mouse - see section 11 of
-                                       replacement-plan.txt */
+                                       2 mouse - driver-plan.txt 4.3 */
            u16 tick_hz;
-           u8  reserved[14];
+           u8  reserved[12];
        };
+
+       then, once and not per layout,
+
+       STICK stick[2];              /* 176 bytes, analog-to-mouse s7 */
 
        then layout_count copies of
 
        struct LAYOUT {
            BINDING  binding[32];    /* 384 bytes */
            CHORD    chord[8];       /*  32 bytes */
-           STICK    stick[2];       /* 156 bytes, analog-to-mouse s7  */
            u8       led;            /* 360 LED pattern for this layer */
            u8       reserved[3];
        };
 
-   Around 4.6 KB in total for eight full layouts.
+   Two layouts is 32 + 176 + 840 = 1048 bytes in total.
+
+   THE STICKS ARE GLOBAL, OUTSIDE THE LAYOUT ARRAY. Pointer feel does
+   not change when the layer does, which is what the arcade profile of
+   section 7 wants and what keeps a layer switch from having to carry,
+   or discard, the mouse accumulator and the acceleration boost. See
+   analog-to-mouse.txt section 7.1 for what that forecloses.
 
    VALIDATE EVERY FIELD AND FALL BACK TO A DEFAULT, which is what
    XBCDReadConfig already does value by value and is why a fresh install
-   with no registry data works. Extend the discipline to the blob:
+   with nothing stored still works. Extend the discipline to the blob:
    reject on a bad signature or an unknown version, clamp every count,
    reject off_at above on_at, reject a source index that is not in the
    enumeration, and repair a non-monotone curve table rather than
-   trusting it. THE BLOB ARRIVES FROM USER MODE AND IS PARSED AT
+   trusting it.
+
+   CLAMP EVERY ACTION CODE TO THE DESCRIPTOR. A JOY_BUTTON index above
+   sixteen, or a JOY_AXIS above five, is an out-of-range write into a
+   report buffer at DISPATCH_LEVEL - the descriptor is the bound, and
+   section 3 is the list. Clamp repeat_hz to tick_hz / 2 as well: a
+   repeat cycle needs one tick to assert and one to release, so a rate
+   above half the tick rate cannot be represented and silently becomes
+   something else. THE BLOB ARRIVES FROM USER MODE AND IS PARSED AT
    DISPATCH_LEVEL; there is no second chance.
 
    THE STRIDE IS IN THE HEADER SO THE DRIVER NEVER COMPUTES IT. A

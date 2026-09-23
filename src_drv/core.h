@@ -256,6 +256,196 @@ typedef signed   long long  s64;
 #define CORE_MS_PAN             6
 
 /* ======================================================================
+ * CONFIGURATION
+ *
+ * The wire format the configurator writes and the driver reads. Layouts
+ * are in ../docs/mapping-engine.txt section 10; the stick parameters are
+ * in ../docs/analog-to-mouse.txt section 7.
+ *
+ * FIXED WIDTH THROUGHOUT, NO BITFIELDS, NO ENUMS, NO POINTERS. A 32-bit
+ * configurator writes this and a 64-bit driver reads it, and the harness
+ * compiles it a third way. Every struct below is laid out so that no
+ * compiler needs to insert padding to satisfy alignment.
+ * ====================================================================== */
+
+/* 'XBSU' as it appears in the byte stream, which is how XBCD wrote it. */
+#define CORE_CFG_SIGNATURE      0x55534258u
+#define CORE_CFG_VERSION        1
+
+#define CORE_MAX_LAYOUTS        2       /* mapping-engine.txt section 7 */
+#define CORE_MAX_BINDINGS       32      /* per layout */
+#define CORE_MAX_CHORDS         8
+#define CORE_CHORD_MEMBERS      3
+#define CORE_CURVE_POINTS       33
+#define CORE_STICK_COUNT        2
+
+/* Chord N is visible to the binding table as this source index plus N. */
+#define CORE_SA_CHORD_BASE      64
+
+/* --- actions, mapping-engine.txt section 3 --------------------------- */
+#define CORE_ACT_NONE           0
+#define CORE_ACT_KEY            1   /* code = HID usage                   */
+#define CORE_ACT_MOUSE_BUTTON   2   /* code = 1..5                        */
+#define CORE_ACT_MOUSE_WHEEL    3   /* code = signed detents              */
+#define CORE_ACT_JOY_BUTTON     4   /* code = 1..CORE_GP_BUTTON_COUNT     */
+#define CORE_ACT_JOY_AXIS       5   /* code = axis in low bits, sign high */
+#define CORE_ACT_JOY_POV        6   /* code = direction 0..3              */
+#define CORE_ACT_MOUSE_PULSE    7   /* code = dx low byte, dy high byte   */
+#define CORE_ACT_LAYER_HOLD     8   /* code = layer index                 */
+#define CORE_ACT_LAYER_SET      9   /* code = layer index                 */
+#define CORE_ACT_LAYER_CYCLE    10  /* code = signed step                 */
+#define CORE_ACT_COUNT          11
+
+/* --- binding flags, mapping-engine.txt sections 4, 4.1, 5 and 6 ------ */
+#define CORE_BF_REPEAT          0x01
+#define CORE_BF_TOGGLE          0x02
+#define CORE_BF_ANALOG          0x04
+#define CORE_BF_NO_REPEAT_FIRST 0x08
+#define CORE_BF_PASSTHROUGH     0x10    /* keep the default gamepad out */
+#define CORE_BF_KNOWN           0x1F
+
+/* --- stick modes, analog-to-mouse.txt section 7 ---------------------- */
+#define CORE_STICK_OFF          0
+#define CORE_STICK_MOUSE        1   /* relative pointer */
+#define CORE_STICK_ABSOLUTE     2
+#define CORE_STICK_JOY          3   /* drives the gamepad axes */
+#define CORE_STICK_WHEEL        4
+#define CORE_STICK_MODE_COUNT   5
+
+typedef struct _core_binding {      /* 12 bytes */
+	u8  source;             /* semiaxis, or CORE_SA_CHORD_BASE + N  */
+	u8  action;             /* CORE_ACT_*                           */
+	u16 code;               /* per action                           */
+	u16 on_at;              /* activation, CORE_MAX_VALUE units     */
+	u16 off_at;             /* release, <= on_at                    */
+	u8  flags;              /* CORE_BF_*                            */
+	u8  repeat_hz;          /* 0 = no repeat                        */
+	u16 repeat_delay_ms;    /* before the first repeat              */
+} core_binding;
+
+typedef struct _core_chord {        /* 4 bytes */
+	u8  member[CORE_CHORD_MEMBERS]; /* sources, CORE_SA_NONE unused */
+	u8  flags;
+} core_chord;
+
+/*
+ * THE u16 FIELDS COME FIRST so the curve table lands on an even offset
+ * without padding on any of the three compilers this is built by.
+ */
+typedef struct _core_stick {        /* 88 bytes */
+	u16 deadzone;           /* radial, CORE_MAX_VALUE units         */
+	u16 outer;              /* deflection treated as full           */
+	u16 max_speed;          /* px/s at full deflection              */
+	u16 accel_threshold;    /* u above which boost accrues, Q16     */
+	u16 accel_rate;         /* boost per second, Q8; 0 = off        */
+	u16 accel_max;          /* boost ceiling, Q8                    */
+	u16 accel_decay;        /* boost lost per second, Q8            */
+	u8  mode;               /* CORE_STICK_*                         */
+	u8  gain_x;             /* per-axis trim, 128 = 1.0             */
+	u8  gain_y;
+	u8  invert_x;
+	u8  invert_y;
+	u8  smooth_ms;          /* rise-only one-pole time constant     */
+	u8  reserved[2];
+	u16 curve[CORE_CURVE_POINTS];   /* g sampled at 33 points       */
+} core_stick;
+
+typedef struct _core_layout {       /* 420 bytes */
+	core_binding binding[CORE_MAX_BINDINGS];
+	core_chord   chord[CORE_MAX_CHORDS];
+	u8           led;       /* 360 LED pattern for this layer       */
+	u8           reserved[3];
+} core_layout;
+
+typedef struct _core_config_header {    /* 32 bytes */
+	u32 signature;
+	u16 version;
+	u16 header_bytes;
+	u16 layout_bytes;       /* stride of one layout                 */
+	u16 stick_bytes;        /* stride of one stick                  */
+	u8  layout_count;       /* 1..CORE_MAX_LAYOUTS                  */
+	u8  binding_count;      /* per layout                           */
+	u8  chord_count;
+	u8  collections;        /* bit 0 gamepad, 1 keyboard, 2 mouse   */
+	u16 tick_hz;
+	u8  reserved[14];
+} core_config_header;
+
+/*
+ * The parsed, validated, in-memory form. NOT the wire format: the blob is
+ * walked by the strides in its header, which a newer configurator may
+ * have grown, and copied field by field into this.
+ */
+typedef struct _core_config {
+	u8          valid;
+	u8          layout_count;
+	u8          binding_count;
+	u8          chord_count;
+	u8          collections;
+	u16         tick_hz;
+	core_stick  stick[CORE_STICK_COUNT];    /* global, not per layer */
+	core_layout layout[CORE_MAX_LAYOUTS];
+
+	/*
+	 * One bit per source whose default gamepad output this layout
+	 * replaces - mapping-engine.txt section 4.1. Built once, here, so
+	 * evaluation costs one AND rather than a search.
+	 */
+	u32         suppress[CORE_MAX_LAYOUTS];
+} core_config;
+
+/*
+ * Load outcomes.
+ *
+ * STRUCTURE IS REJECTED, VALUES ARE REPAIRED. A blob whose signature,
+ * version or strides do not describe something walkable is refused
+ * outright, because guessing at its shape reads memory that is not there.
+ * A blob that is shaped correctly but holds a nonsense threshold or an
+ * out-of-range key is loaded with that field clamped, because the
+ * alternative is that one bad byte costs the user every binding they have.
+ */
+#define CORE_CFG_OK             0
+#define CORE_CFG_ERR_SHORT      1   /* smaller than a header            */
+#define CORE_CFG_ERR_SIGNATURE  2
+#define CORE_CFG_ERR_VERSION    3
+#define CORE_CFG_ERR_STRIDE     4   /* a stride smaller than its struct */
+#define CORE_CFG_ERR_COUNT      5   /* a count past its ceiling         */
+#define CORE_CFG_ERR_TRUNCATED  6   /* strides and counts overrun len   */
+
+/*
+ * Parse and validate a blob into cfg. On any non-zero return cfg is left
+ * untouched, so a rejected push never disturbs a running map. repaired,
+ * if given, receives the number of fields that were clamped.
+ */
+int core_config_load(core_config *cfg, const u8 *blob, u32 len,
+                     u32 *repaired);
+
+/*
+ * The built-in configuration: layer 1 the plain pad, layer 2 the same
+ * with the four face buttons autofiring, and Start plus Back cycling
+ * between them.
+ *
+ * THIS IS WHAT THE PAD RUNS UNTIL A CONFIGURATOR PUSHES SOMETHING ELSE.
+ * The driver reads no store of its own - see ../docs/driver-plan.txt
+ * section 7 - so this is also what is live during boot and at the logon
+ * screen, where no user-mode process is running to push a profile.
+ */
+void core_config_defaults(core_config *cfg);
+
+/*
+ * Rebuild the per-layout suppression masks. Called by load and by
+ * defaults; exposed so a caller that edits a binding in place can
+ * refresh them without a round trip through the blob.
+ */
+void core_config_suppress(core_config *cfg);
+
+/*
+ * Serialise cfg into a blob. Returns the byte count written, or 0 if len
+ * is too small. The harness uses it to prove load(save(x)) == x.
+ */
+u32 core_config_save(const core_config *cfg, u8 *blob, u32 len);
+
+/* ======================================================================
  * THE SEAMS
  * ====================================================================== */
 
@@ -297,6 +487,32 @@ typedef struct _core_mouse_state {
 	s32 pan;
 } core_mouse_state;
 
+/*
+ * Per-binding runtime state. One of these for every slot in every
+ * layout, so a binding that is holding something keeps holding it while
+ * another layer is live and can be released deliberately.
+ */
+typedef struct _core_bind_state {
+	u8  active;             /* the source is past its threshold  */
+	u8  latched;            /* TOGGLE output, independent of it  */
+	u8  reserved[2];
+} core_bind_state;
+
+/*
+ * The gamepad the bindings and the default map fold into, before it is
+ * serialised into a report.
+ *
+ * IT IS AN ACCUMULATOR, NOT A COPY OF THE PAD. Two bindings may drive
+ * one button, and a binding may drive an axis the default map is also
+ * driving, so axes sum and buttons OR rather than overwrite.
+ */
+typedef struct _core_gamepad_out {
+	s32 axis[CORE_GP_AXIS_COUNT];   /* CORE_MAX_VALUE units      */
+	u16 buttons;
+	u8  hat_index;          /* bit 0 up, 1 down, 2 left, 3 right */
+	u8  reserved;
+} core_gamepad_out;
+
 typedef struct _core_state {
 	/* --- seams --- */
 	core_report_fn  sink;
@@ -316,6 +532,11 @@ typedef struct _core_state {
 	u8                   layout;
 	core_keyboard_state  kb;
 	core_mouse_state     ms;
+
+	/* --- configuration and the state it drives --- */
+	core_config     cfg;
+	core_bind_state bind[CORE_MAX_LAYOUTS][CORE_MAX_BINDINGS];
+	core_gamepad_out gp;
 
 	/* Last gamepad payload submitted, for the emit-on-change test. */
 	u8              gp_last[CORE_GAMEPAD_PAYLOAD];
@@ -357,6 +578,20 @@ void core_tick(core_state *cs, u64 now_100ns);
  * binding that is holding something could vanish underneath it.
  */
 void core_release_all(core_state *cs);
+
+/*
+ * Install a configuration from a blob. Returns a CORE_CFG_* code; on
+ * anything but CORE_CFG_OK the running configuration is untouched.
+ *
+ * A SUCCESSFUL SWAP RELEASES EVERY ASSERTED OUTPUT FIRST. The bindings
+ * that were holding a key down may not exist in the new table, and
+ * nothing else would ever release it.
+ */
+int core_set_config(core_state *cs, const u8 *blob, u32 len,
+                    u32 *repaired);
+
+/* The built-in configuration, installed the same way. */
+void core_set_config_default(core_state *cs);
 
 /* --- radial helpers, exposed for the harness ------------------------- */
 

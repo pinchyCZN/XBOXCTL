@@ -505,44 +505,238 @@ static const struct {
 	{ CORE_SA_NONE,        CORE_SA_RTRIGGER    }    /* Rz right trigger */
 };
 
-static void core_build_gamepad(core_state *cs, u8 *payload)
-{
-	int i;
-	int hat_index;
+/* ======================================================================
+ * EVALUATION
+ *
+ * Once per packet: fold the default map for every source no binding has
+ * claimed, then walk the bindings. ../docs/mapping-engine.txt section 9
+ * gives the order and says why it is that order.
+ * ====================================================================== */
 
-	core_zero(payload, CORE_GAMEPAD_PAYLOAD);
+/*
+ * A source that is not a semiaxis reads as inactive. Nothing may index
+ * cs->semiaxis with a value that came off the wire without this check -
+ * the enumeration stops at CORE_SEMIAXIS_COUNT and chord indices start
+ * well past it.
+ */
+static s32 core_source_value(const core_state *cs, u8 source)
+{
+	if (source < CORE_SEMIAXIS_COUNT) {
+		return cs->semiaxis[source];
+	}
+	return 0;
+}
+
+static int core_suppressed(u32 mask, u8 source)
+{
+	if (source >= CORE_SEMIAXIS_COUNT) {
+		return 0;
+	}
+	return (mask & (1u << source)) != 0;
+}
+
+/*
+ * The pad's own controls, for every source the layout has not claimed.
+ * mapping-engine.txt section 4.1: a binding REPLACES the default rather
+ * than adding to it, unless it carries PASSTHROUGH.
+ */
+static void core_fold_default(core_state *cs, u32 suppress)
+{
+	static const u8 DPAD[4] = {
+		CORE_SA_DPAD_UP, CORE_SA_DPAD_DOWN,
+		CORE_SA_DPAD_LEFT, CORE_SA_DPAD_RIGHT
+	};
+	int i;
 
 	for (i = 0; i < 12; i++) {
-		if (cs->semiaxis[CORE_DEFAULT_BUTTONS[i]] >= CORE_DEFAULT_BUTTON_ON) {
-			payload[CORE_GP_BUTTONS + (i >> 3)] |= (u8)(1u << (i & 7));
+		u8 src = CORE_DEFAULT_BUTTONS[i];
+
+		if (core_suppressed(suppress, src)) {
+			continue;
+		}
+		if (cs->semiaxis[src] >= CORE_DEFAULT_BUTTON_ON) {
+			cs->gp.buttons |= (u16)(1u << i);
 		}
 	}
 
 	for (i = 0; i < CORE_GP_AXIS_COUNT; i++) {
+		u8  pos_src = CORE_DEFAULT_AXES[i].pos;
+		u8  neg_src = CORE_DEFAULT_AXES[i].neg;
 		s32 pos = 0;
 		s32 neg = 0;
-		s32 value;
 
-		if (CORE_DEFAULT_AXES[i].pos != CORE_SA_NONE) {
-			pos = cs->semiaxis[CORE_DEFAULT_AXES[i].pos];
+		if (pos_src != CORE_SA_NONE &&
+		    !core_suppressed(suppress, pos_src)) {
+			pos = cs->semiaxis[pos_src];
 		}
-		if (CORE_DEFAULT_AXES[i].neg != CORE_SA_NONE) {
-			neg = cs->semiaxis[CORE_DEFAULT_AXES[i].neg];
+		if (neg_src != CORE_SA_NONE &&
+		    !core_suppressed(suppress, neg_src)) {
+			neg = cs->semiaxis[neg_src];
 		}
+		cs->gp.axis[i] += pos - neg;
+	}
 
-		value = (s32)(((s64)(pos - neg) * CORE_OUT_AXIS_SCALE)
+	for (i = 0; i < 4; i++) {
+		if (core_suppressed(suppress, DPAD[i])) {
+			continue;
+		}
+		if (cs->semiaxis[DPAD[i]] > 0) {
+			cs->gp.hat_index |= (u8)(1u << i);
+		}
+	}
+}
+
+/*
+ * on says whether the binding is asserting; edge says whether it became so
+ * in this packet. Held actions use the first, pulse actions the second.
+ */
+static void core_apply_action(core_state *cs, const core_binding *b,
+                              s32 value, int on, int edge)
+{
+	u32 axis;
+	s32 magnitude;
+
+	switch (b->action) {
+	case CORE_ACT_KEY:
+		core_key_event(cs, (u8)b->code, on);
+		break;
+
+	case CORE_ACT_MOUSE_BUTTON:
+		core_mouse_button(cs, (u8)b->code, on);
+		break;
+
+	case CORE_ACT_JOY_BUTTON:
+		if (on && b->code >= 1 && b->code <= CORE_GP_BUTTON_COUNT) {
+			cs->gp.buttons |= (u16)(1u << (b->code - 1));
+		}
+		break;
+
+	case CORE_ACT_JOY_AXIS:
+		axis = (u32)(b->code & 0x7FFF);
+		if (axis >= CORE_GP_AXIS_COUNT) {
+			break;
+		}
+		/*
+		 * ANALOG PASSES THE PRESSURE THROUGH instead of thresholding
+		 * it, which is what turns a trigger into an axis rather than
+		 * into a button that happens to be analog.
+		 */
+		if (b->flags & CORE_BF_ANALOG) {
+			magnitude = value;
+		} else {
+			magnitude = on ? CORE_MAX_VALUE : 0;
+		}
+		if (b->code & 0x8000) {
+			magnitude = -magnitude;
+		}
+		cs->gp.axis[axis] += magnitude;
+		break;
+
+	case CORE_ACT_JOY_POV:
+		if (on && b->code <= 3) {
+			cs->gp.hat_index |= (u8)(1u << b->code);
+		}
+		break;
+
+	case CORE_ACT_MOUSE_WHEEL:
+		/* A DETENT IS AN EVENT, NOT A STATE. Emitting one per packet
+		 * while the source is held would scroll at the packet rate. */
+		if (edge) {
+			core_mouse_wheel(cs, (s32)(s16)b->code, 0);
+		}
+		break;
+
+	case CORE_ACT_MOUSE_PULSE:
+		if (edge) {
+			core_mouse_move(cs, (s32)(s8)(b->code & 0xFF),
+			                (s32)(s8)(b->code >> 8));
+		}
+		break;
+
+	default:
+		break;
+	}
+}
+
+static void core_apply_binding(core_state *cs, const core_binding *b,
+                               core_bind_state *st)
+{
+	s32 value;
+	int active;
+	int edge;
+	int asserted;
+
+	if (b->action == CORE_ACT_NONE) {
+		return;
+	}
+
+	value = core_source_value(cs, b->source);
+
+	/*
+	 * TWO THRESHOLDS, NOT ONE. The face buttons on this pad are analog,
+	 * so a single threshold chatters for as long as a finger rests near
+	 * it. Rise above on_at to activate; stay active until the value
+	 * falls below off_at.
+	 *
+	 * A VALUE OF ZERO IS NEVER ACTIVE, whatever on_at says. A binding
+	 * configured with on_at of 0 would otherwise assert permanently,
+	 * including for every source nothing is touching.
+	 */
+	if (st->active) {
+		active = (value > (s32)b->off_at);
+	} else {
+		active = (value > 0 && value >= (s32)b->on_at);
+	}
+
+	edge = (active && !st->active);
+	if (edge && (b->flags & CORE_BF_TOGGLE)) {
+		st->latched = (u8)(!st->latched);
+	}
+	st->active = (u8)active;
+
+	asserted = (b->flags & CORE_BF_TOGGLE) ? st->latched : active;
+
+	core_apply_action(cs, b, value, asserted, edge);
+}
+
+static void core_evaluate(core_state *cs)
+{
+	u32 layer = cs->layout;
+	u32 i;
+
+	if (layer >= cs->cfg.layout_count) {
+		layer = 0;
+	}
+
+	core_zero(&cs->gp, (u32)sizeof(cs->gp));
+
+	core_fold_default(cs, cs->cfg.suppress[layer]);
+
+	for (i = 0; i < cs->cfg.binding_count; i++) {
+		core_apply_binding(cs, &cs->cfg.layout[layer].binding[i],
+		                   &cs->bind[layer][i]);
+	}
+}
+
+static void core_build_gamepad(core_state *cs, u8 *payload)
+{
+	int i;
+
+	core_zero(payload, CORE_GAMEPAD_PAYLOAD);
+
+	payload[CORE_GP_BUTTONS]     = (u8)(cs->gp.buttons & 0xFF);
+	payload[CORE_GP_BUTTONS + 1] = (u8)(cs->gp.buttons >> 8);
+
+	for (i = 0; i < CORE_GP_AXIS_COUNT; i++) {
+		s32 value = core_clamp(cs->gp.axis[i], -CORE_MAX_VALUE,
+		                       CORE_MAX_VALUE);
+
+		value = (s32)(((s64)value * CORE_OUT_AXIS_SCALE)
 		              / CORE_MAX_VALUE);
-		value = core_clamp(value, -CORE_OUT_AXIS_SCALE,
-		                   CORE_OUT_AXIS_SCALE);
 		core_put16(&payload[CORE_GP_AXES + i * 2], value);
 	}
 
-	hat_index = 0;
-	if (cs->semiaxis[CORE_SA_DPAD_UP] > 0)    { hat_index |= 1; }
-	if (cs->semiaxis[CORE_SA_DPAD_DOWN] > 0)  { hat_index |= 2; }
-	if (cs->semiaxis[CORE_SA_DPAD_LEFT] > 0)  { hat_index |= 4; }
-	if (cs->semiaxis[CORE_SA_DPAD_RIGHT] > 0) { hat_index |= 8; }
-	payload[CORE_GP_HAT] = CORE_HAT_TABLE[hat_index];
+	payload[CORE_GP_HAT] = CORE_HAT_TABLE[cs->gp.hat_index & 0x0F];
 
 	payload[CORE_GP_LAYOUT] = (u8)(cs->layout + 1);
 
@@ -764,6 +958,11 @@ void core_init(core_state *cs, core_report_fn sink, void *sink_ctx)
 	core_zero(cs, (u32)sizeof(*cs));
 	cs->sink = sink;
 	cs->sink_ctx = sink_ctx;
+
+	/* THE ENGINE IS NEVER WITHOUT A CONFIGURATION. Evaluation
+	 * indexes the layout array on every packet, and a zeroed one
+	 * would have no layers at all. */
+	core_config_defaults(&cs->cfg);
 }
 
 void core_release_all(core_state *cs)
@@ -787,6 +986,15 @@ void core_release_all(core_state *cs)
 	cs->ms.dy = 0;
 	cs->ms.wheel = 0;
 	cs->ms.pan = 0;
+
+	/*
+	 * AND FORGET EVERY BINDING'S OWN STATE. Leaving active set means
+	 * the next packet sees no rising edge and never re-asserts;
+	 * leaving a TOGGLE latched means the output comes back by itself
+	 * one packet later, having just been released on purpose.
+	 */
+	core_zero(cs->bind, (u32)sizeof(cs->bind));
+	core_zero(&cs->gp, (u32)sizeof(cs->gp));
 }
 
 void core_on_packet(core_state *cs, const u8 *raw, u32 len, u64 now_100ns)
@@ -808,6 +1016,7 @@ void core_on_packet(core_state *cs, const u8 *raw, u32 len, u64 now_100ns)
 	}
 
 	core_decode(cs);
+	core_evaluate(cs);
 	core_emit_gamepad(cs);
 }
 
@@ -844,4 +1053,592 @@ void core_tick(core_state *cs, u64 now_100ns)
 	 * ../docs/analog-to-mouse.txt section 3.2.
 	 */
 	(void)elapsed_ms;
+}
+
+/* ======================================================================
+ * CONFIGURATION
+ *
+ * Parsing, validation and the built-in default map.
+ * ../docs/mapping-engine.txt section 10 specifies the blob.
+ * ====================================================================== */
+
+/*
+ * THE STRUCTURES MUST BE THE SIZES THE DOCUMENT STATES, on all three of the
+ * compilers this source is built by. A compiler that inserts padding changes
+ * the wire format silently, and the first symptom is a configurator that
+ * works on one build and corrupts bindings on another. Fail at compile time
+ * instead: this declares an array of length -1 if any size is wrong.
+ */
+typedef char core_cfg_size_check[
+    (sizeof(core_binding)       == 12  &&
+     sizeof(core_chord)         == 4   &&
+     sizeof(core_stick)         == 88  &&
+     sizeof(core_layout)        == 420 &&
+     sizeof(core_config_header) == 32) ? 1 : -1];
+
+#define CORE_CFG_DEFAULT_TICK_HZ    250
+#define CORE_CFG_DEFAULT_ON         (CORE_MAX_VALUE * 2 / 5)
+#define CORE_CFG_DEFAULT_OFF        (CORE_MAX_VALUE / 4)
+#define CORE_CFG_DEFAULT_AUTOFIRE   12      /* Hz */
+
+static u32 core_cfg_blob_bytes(u32 layout_count)
+{
+	return (u32)sizeof(core_config_header) +
+	       (u32)sizeof(core_stick) * CORE_STICK_COUNT +
+	       (u32)sizeof(core_layout) * layout_count;
+}
+
+/* --- defaults -------------------------------------------------------- */
+
+static void core_stick_defaults(core_stick *st)
+{
+	int i;
+
+	core_zero(st, (u32)sizeof(*st));
+
+	/*
+	 * MODE OFF MEANS THE STICK IS NOT HIJACKED, not that it is dead. The
+	 * default gamepad map still drives X/Y and Rx/Ry from it; mode only
+	 * decides whether the pointer pipeline claims it instead.
+	 */
+	st->mode            = CORE_STICK_OFF;
+	st->deadzone        = 2000;
+	st->outer           = 33000;
+	st->max_speed       = 2800;
+	st->gain_x          = 128;
+	st->gain_y          = 54;       /* 54/128 = 0.42, the shipped ratio */
+	st->invert_x        = 0;
+	st->invert_y        = 1;
+	st->smooth_ms       = 8;
+	st->accel_threshold = 58000;
+	st->accel_rate      = 0;        /* off */
+	st->accel_max       = 512;
+	st->accel_decay     = 1024;
+
+	/* Linear, so a stick that is not tuned behaves like one that is not
+	 * curved rather than like one that is broken. */
+	for (i = 0; i < CORE_CURVE_POINTS; i++) {
+		/* ROUND, DO NOT TRUNCATE. tools/mkconfig.py computes the
+		 * same table in floating point and rounds; truncating here
+		 * puts the two one LSB apart and the cross-check in the
+		 * harness stops meaning anything. */
+		st->curve[i] = (u16)(((u32)i * 65535u +
+		                      (CORE_CURVE_POINTS - 1) / 2) /
+		                     (CORE_CURVE_POINTS - 1));
+	}
+}
+
+static void core_binding_clear(core_binding *b)
+{
+	core_zero(b, (u32)sizeof(*b));
+	b->source = CORE_SA_NONE;
+	b->action = CORE_ACT_NONE;
+	b->on_at  = CORE_CFG_DEFAULT_ON;
+	b->off_at = CORE_CFG_DEFAULT_OFF;
+}
+
+void core_config_defaults(core_config *cfg)
+{
+	static const u8 FACE[4] = {
+		CORE_SA_A, CORE_SA_B, CORE_SA_X, CORE_SA_Y
+	};
+	u32 l, i;
+
+	core_zero(cfg, (u32)sizeof(*cfg));
+
+	cfg->valid         = 1;
+	cfg->layout_count  = CORE_MAX_LAYOUTS;
+	cfg->binding_count = CORE_MAX_BINDINGS;
+	cfg->chord_count   = CORE_MAX_CHORDS;
+	cfg->collections   = 0x07;      /* gamepad, keyboard, mouse */
+	cfg->tick_hz       = CORE_CFG_DEFAULT_TICK_HZ;
+
+	core_stick_defaults(&cfg->stick[0]);
+	core_stick_defaults(&cfg->stick[1]);
+
+	for (l = 0; l < CORE_MAX_LAYOUTS; l++) {
+		core_layout *lay = &cfg->layout[l];
+
+		for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+			core_binding_clear(&lay->binding[i]);
+		}
+		for (i = 0; i < CORE_MAX_CHORDS; i++) {
+			lay->chord[i].member[0] = CORE_SA_NONE;
+			lay->chord[i].member[1] = CORE_SA_NONE;
+			lay->chord[i].member[2] = CORE_SA_NONE;
+			lay->chord[i].flags     = 0;
+		}
+		lay->led = (u8)l;
+
+		/*
+		 * Chord 0 is Start plus Back - XBCD's own gesture, and the
+		 * one control combination no game claims.
+		 */
+		lay->chord[0].member[0] = CORE_SA_START;
+		lay->chord[0].member[1] = CORE_SA_BACK;
+
+		/*
+		 * THE CYCLE BINDING GOES IN EVERY LAYOUT. It is the only way
+		 * back; a layer without it is a layer you cannot leave
+		 * without unplugging the pad.
+		 */
+		lay->binding[0].source = CORE_SA_CHORD_BASE + 0;
+		lay->binding[0].action = CORE_ACT_LAYER_CYCLE;
+		lay->binding[0].code   = 1;
+	}
+
+	/*
+	 * Layer 2 is layer 1 with the four face buttons autofiring. Binding
+	 * them to the buttons they already drive means the suppression rule
+	 * of section 4.1 replaces the steady press with the pulsing one
+	 * rather than producing both.
+	 */
+	for (i = 0; i < 4; i++) {
+		core_binding *b = &cfg->layout[1].binding[1 + i];
+
+		b->source    = FACE[i];
+		b->action    = CORE_ACT_JOY_BUTTON;
+		b->code      = (u16)(1 + i);   /* buttons 1..4, XBCD order */
+		b->flags     = CORE_BF_REPEAT;
+		b->repeat_hz = CORE_CFG_DEFAULT_AUTOFIRE;
+	}
+
+	core_config_suppress(cfg);
+}
+
+/* --- the suppression mask, mapping-engine.txt section 4.1 ------------ */
+
+void core_config_suppress(core_config *cfg)
+{
+	u32 l, i;
+
+	for (l = 0; l < CORE_MAX_LAYOUTS; l++) {
+		u32 mask = 0;
+
+		if (l < cfg->layout_count) {
+			for (i = 0; i < cfg->binding_count; i++) {
+				const core_binding *b =
+				    &cfg->layout[l].binding[i];
+
+				if (b->action == CORE_ACT_NONE) {
+					continue;
+				}
+				if (b->flags & CORE_BF_PASSTHROUGH) {
+					continue;
+				}
+				/*
+				 * A CHORD SOURCE SUPPRESSES NOTHING. Its
+				 * members are held back only while the
+				 * chord is active - section 2.2 - and keep
+				 * their own defaults otherwise.
+				 */
+				if (b->source < CORE_SEMIAXIS_COUNT) {
+					mask |= 1u << b->source;
+				}
+			}
+		}
+		cfg->suppress[l] = mask;
+	}
+}
+
+/* --- validation ------------------------------------------------------ */
+
+static int core_cfg_key_ok(u16 code)
+{
+	return (code >= CORE_KEY_FIRST && code <= CORE_KEY_LAST) ||
+	       (code >= CORE_KEY_MOD_FIRST && code <= CORE_KEY_MOD_LAST);
+}
+
+/* Clamp v into 1..hi. Returns non-zero if it had to change anything. */
+static int core_cfg_clamp16(u16 *v, u16 lo, u16 hi)
+{
+	if (*v < lo) {
+		*v = lo;
+		return 1;
+	}
+	if (*v > hi) {
+		*v = hi;
+		return 1;
+	}
+	return 0;
+}
+
+static u32 core_cfg_fix_binding(core_binding *b, u8 layout_count,
+                                u8 chord_count, u16 tick_hz)
+{
+	u32 fixed = 0;
+	u16 axis;
+
+	if (b->action >= CORE_ACT_COUNT) {
+		b->action = CORE_ACT_NONE;
+		fixed++;
+	}
+
+	/* A source that names nothing real can only misfire. */
+	if (b->source >= CORE_SEMIAXIS_COUNT &&
+	    !(b->source >= CORE_SA_CHORD_BASE &&
+	      b->source <  CORE_SA_CHORD_BASE + chord_count)) {
+		if (b->action != CORE_ACT_NONE) {
+			b->action = CORE_ACT_NONE;
+			fixed++;
+		}
+	}
+
+	if (b->flags & ~(u8)CORE_BF_KNOWN) {
+		b->flags &= (u8)CORE_BF_KNOWN;
+		fixed++;
+	}
+
+	/* Thresholds: on_at within range, off_at never above it. */
+	if (b->on_at > CORE_MAX_VALUE) {
+		b->on_at = CORE_MAX_VALUE;
+		fixed++;
+	}
+	if (b->off_at > b->on_at) {
+		b->off_at = b->on_at;
+		fixed++;
+	}
+
+	/*
+	 * THE CODE IS BOUNDED BY THE DESCRIPTOR, NOT BY ITS FIELD WIDTH. A
+	 * JOY_BUTTON of 900 written into the report bitmap is an out-of-range
+	 * write at DISPATCH_LEVEL, which is a bugcheck at best.
+	 */
+	switch (b->action) {
+	case CORE_ACT_KEY:
+		if (!core_cfg_key_ok(b->code)) {
+			b->action = CORE_ACT_NONE;
+			fixed++;
+		}
+		break;
+	case CORE_ACT_MOUSE_BUTTON:
+		fixed += (u32)core_cfg_clamp16(&b->code, 1, CORE_MOUSE_BUTTONS);
+		break;
+	case CORE_ACT_JOY_BUTTON:
+		fixed += (u32)core_cfg_clamp16(&b->code, 1,
+		                               CORE_GP_BUTTON_COUNT);
+		break;
+	case CORE_ACT_JOY_AXIS:
+		axis = (u16)(b->code & 0x7FFF);
+		if (axis >= CORE_GP_AXIS_COUNT) {
+			b->code = (u16)((b->code & 0x8000) |
+			                (CORE_GP_AXIS_COUNT - 1));
+			fixed++;
+		}
+		break;
+	case CORE_ACT_JOY_POV:
+		if (b->code > 3) {
+			b->code = 3;
+			fixed++;
+		}
+		break;
+	case CORE_ACT_LAYER_HOLD:
+	case CORE_ACT_LAYER_SET:
+		if (b->code >= layout_count) {
+			b->code = (u16)(layout_count - 1);
+			fixed++;
+		}
+		break;
+	default:
+		break;
+	}
+
+	/*
+	 * A REPEAT CYCLE NEEDS A TICK TO ASSERT AND A TICK TO RELEASE, so a
+	 * rate above half the tick rate cannot be represented and would
+	 * silently become something else.
+	 */
+	if (b->repeat_hz > tick_hz / 2) {
+		b->repeat_hz = (u8)(tick_hz / 2);
+		fixed++;
+	}
+
+	return fixed;
+}
+
+static u32 core_cfg_fix_stick(core_stick *st)
+{
+	u32 fixed = 0;
+	int i;
+
+	if (st->mode >= CORE_STICK_MODE_COUNT) {
+		st->mode = CORE_STICK_OFF;
+		fixed++;
+	}
+
+	/*
+	 * THE PIPELINE DIVIDES BY (outer - deadzone). A configurator that
+	 * sends them equal, or inverted, would divide by zero or by a
+	 * negative in the rescale of analog-to-mouse.txt section 8 step 5.
+	 */
+	if (st->deadzone >= CORE_MAX_VALUE) {
+		st->deadzone = CORE_MAX_VALUE - 1;
+		fixed++;
+	}
+	if (st->outer <= st->deadzone) {
+		st->outer = (u16)(st->deadzone + 1);
+		fixed++;
+	}
+
+	if (st->gain_x == 0 && st->gain_y == 0) {
+		st->gain_x = 128;
+		st->gain_y = 128;
+		fixed++;
+	}
+
+	/*
+	 * REPAIR A NON-MONOTONE CURVE RATHER THAN TRUSTING IT. A table that
+	 * dips backwards makes the pointer reverse mid-deflection, which
+	 * reads as a hardware fault and is impossible to diagnose from the
+	 * outside.
+	 */
+	for (i = 1; i < CORE_CURVE_POINTS; i++) {
+		if (st->curve[i] < st->curve[i - 1]) {
+			st->curve[i] = st->curve[i - 1];
+			fixed++;
+		}
+	}
+
+	return fixed;
+}
+
+/* --- load ------------------------------------------------------------ */
+
+int core_config_load(core_config *cfg, const u8 *blob, u32 len,
+                     u32 *repaired)
+{
+	core_config_header hdr;
+	u32 fixed = 0;
+	u32 need, off, l, i;
+
+	if (repaired) {
+		*repaired = 0;
+	}
+	if (!cfg || !blob || len < sizeof(core_config_header)) {
+		return CORE_CFG_ERR_SHORT;
+	}
+
+	/* COPY, DO NOT CAST. The blob arrives as bytes from user mode and
+	 * nothing promises it is aligned for a u32 read. */
+	core_copy(&hdr, blob, (u32)sizeof(hdr));
+
+	if (hdr.signature != CORE_CFG_SIGNATURE) {
+		return CORE_CFG_ERR_SIGNATURE;
+	}
+
+	/*
+	 * A NEWER BLOB IS FINE, AN OLDER ONE IS NOT. Forward compatibility
+	 * runs on the strides: a configurator built against a later version
+	 * grows a structure, this walks it by the stride in the header and
+	 * ignores the tail. A stride SMALLER than the structure means fields
+	 * this build needs are simply absent, and there is nothing to read.
+	 */
+	if (hdr.version < CORE_CFG_VERSION) {
+		return CORE_CFG_ERR_VERSION;
+	}
+	if (hdr.header_bytes < sizeof(core_config_header) ||
+	    hdr.layout_bytes < sizeof(core_layout) ||
+	    hdr.stick_bytes  < sizeof(core_stick)) {
+		return CORE_CFG_ERR_STRIDE;
+	}
+
+	/*
+	 * COUNTS ARE REJECTED, NOT CLAMPED. Clamping eight layouts to two
+	 * would load silently and throw away six the user can still see in
+	 * their configurator.
+	 */
+	if (hdr.layout_count < 1 || hdr.layout_count > CORE_MAX_LAYOUTS ||
+	    hdr.binding_count > CORE_MAX_BINDINGS ||
+	    hdr.chord_count > CORE_MAX_CHORDS) {
+		return CORE_CFG_ERR_COUNT;
+	}
+
+	/* Does the blob actually contain what the header describes? Built up
+	 * in steps so the arithmetic cannot overflow past the check. */
+	need = hdr.header_bytes;
+	if (need > len) {
+		return CORE_CFG_ERR_TRUNCATED;
+	}
+	for (i = 0; i < CORE_STICK_COUNT; i++) {
+		if (hdr.stick_bytes > len - need) {
+			return CORE_CFG_ERR_TRUNCATED;
+		}
+		need += hdr.stick_bytes;
+	}
+	for (i = 0; i < hdr.layout_count; i++) {
+		if (hdr.layout_bytes > len - need) {
+			return CORE_CFG_ERR_TRUNCATED;
+		}
+		need += hdr.layout_bytes;
+	}
+
+	/*
+	 * EVERY STRUCTURAL CHECK IS NOW PAST, so from here nothing can fail
+	 * and cfg may be written directly. That is what keeps the promise
+	 * that a rejected blob leaves a running configuration untouched,
+	 * without staging a kilobyte of copy on a DISPATCH_LEVEL stack.
+	 */
+	core_zero(cfg, (u32)sizeof(*cfg));
+
+	cfg->layout_count  = hdr.layout_count;
+	cfg->binding_count = hdr.binding_count;
+	cfg->chord_count   = hdr.chord_count;
+	cfg->collections   = (u8)(hdr.collections & 0x07);
+	cfg->tick_hz       = hdr.tick_hz;
+
+	if (cfg->tick_hz < 8 || cfg->tick_hz > 1000) {
+		cfg->tick_hz = CORE_CFG_DEFAULT_TICK_HZ;
+		fixed++;
+	}
+
+	off = hdr.header_bytes;
+	for (i = 0; i < CORE_STICK_COUNT; i++) {
+		core_copy(&cfg->stick[i], blob + off, (u32)sizeof(core_stick));
+		off += hdr.stick_bytes;
+		fixed += core_cfg_fix_stick(&cfg->stick[i]);
+	}
+
+	for (l = 0; l < hdr.layout_count; l++) {
+		core_layout *lay = &cfg->layout[l];
+
+		core_copy(lay, blob + off, (u32)sizeof(core_layout));
+		off += hdr.layout_bytes;
+
+		for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+			if (i >= cfg->binding_count) {
+				core_binding_clear(&lay->binding[i]);
+				continue;
+			}
+			fixed += core_cfg_fix_binding(&lay->binding[i],
+			                              cfg->layout_count,
+			                              cfg->chord_count,
+			                              cfg->tick_hz);
+		}
+		for (i = 0; i < CORE_MAX_CHORDS; i++) {
+			core_chord *ch = &lay->chord[i];
+			int m;
+
+			if (i >= cfg->chord_count) {
+				ch->member[0] = CORE_SA_NONE;
+				ch->member[1] = CORE_SA_NONE;
+				ch->member[2] = CORE_SA_NONE;
+				ch->flags     = 0;
+				continue;
+			}
+			for (m = 0; m < CORE_CHORD_MEMBERS; m++) {
+				if (ch->member[m] >= CORE_SEMIAXIS_COUNT &&
+				    ch->member[m] != CORE_SA_NONE) {
+					ch->member[m] = CORE_SA_NONE;
+					fixed++;
+				}
+			}
+		}
+	}
+
+	cfg->valid = 1;
+	core_config_suppress(cfg);
+
+	if (repaired) {
+		*repaired = fixed;
+	}
+	return CORE_CFG_OK;
+}
+
+/* --- save, for the harness round trip -------------------------------- */
+
+u32 core_config_save(const core_config *cfg, u8 *blob, u32 len)
+{
+	core_config_header hdr;
+	u32 need, off, i, l;
+
+	if (!cfg || !blob) {
+		return 0;
+	}
+
+	need = core_cfg_blob_bytes(cfg->layout_count);
+	if (len < need) {
+		return 0;
+	}
+
+	core_zero(&hdr, (u32)sizeof(hdr));
+	hdr.signature    = CORE_CFG_SIGNATURE;
+	hdr.version      = CORE_CFG_VERSION;
+	hdr.header_bytes = (u16)sizeof(core_config_header);
+	hdr.layout_bytes = (u16)sizeof(core_layout);
+	hdr.stick_bytes  = (u16)sizeof(core_stick);
+	hdr.layout_count = cfg->layout_count;
+	hdr.binding_count = cfg->binding_count;
+	hdr.chord_count  = cfg->chord_count;
+	hdr.collections  = cfg->collections;
+	hdr.tick_hz      = cfg->tick_hz;
+
+	core_copy(blob, &hdr, (u32)sizeof(hdr));
+	off = (u32)sizeof(hdr);
+
+	for (i = 0; i < CORE_STICK_COUNT; i++) {
+		core_copy(blob + off, &cfg->stick[i],
+		          (u32)sizeof(core_stick));
+		off += (u32)sizeof(core_stick);
+	}
+	for (l = 0; l < cfg->layout_count; l++) {
+		core_copy(blob + off, &cfg->layout[l],
+		          (u32)sizeof(core_layout));
+		off += (u32)sizeof(core_layout);
+	}
+
+	return off;
+}
+
+/*
+ * Installing a configuration is not the same as parsing one. The parse may
+ * fail and must leave the running map alone; the install always succeeds
+ * and must first let go of everything the outgoing map was holding.
+ */
+static void core_config_installed(core_state *cs)
+{
+	/*
+	 * RELEASE BEFORE, NOT AFTER. The bindings that are holding a key
+	 * down may not exist in the new table, and once it is installed
+	 * there is nothing left that knows the key was ever pressed.
+	 */
+	core_release_all(cs);
+
+	/*
+	 * A LAYER THAT NO LONGER EXISTS WOULD INDEX PAST THE ARRAY. The
+	 * incoming configuration may carry fewer layouts than the one being
+	 * replaced, and the live layer is not part of the blob.
+	 */
+	if (cs->layout >= cs->cfg.layout_count) {
+		cs->layout = 0;
+	}
+
+	/* The next packet must look like the first one, or an unchanged
+	 * payload under a new map would be suppressed as "not news". */
+	cs->gp_last_valid = 0;
+}
+
+int core_set_config(core_state *cs, const u8 *blob, u32 len, u32 *repaired)
+{
+	int rc;
+
+	if (!cs) {
+		return CORE_CFG_ERR_SHORT;
+	}
+
+	rc = core_config_load(&cs->cfg, blob, len, repaired);
+	if (rc != CORE_CFG_OK) {
+		return rc;
+	}
+
+	core_config_installed(cs);
+	return CORE_CFG_OK;
+}
+
+void core_set_config_default(core_state *cs)
+{
+	if (!cs) {
+		return;
+	}
+	core_config_defaults(&cs->cfg);
+	core_config_installed(cs);
 }

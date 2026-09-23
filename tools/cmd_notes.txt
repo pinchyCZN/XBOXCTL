@@ -5,6 +5,8 @@ verifier /standard /driver xboxctl.sys
 
 verifier /standard /faults 2000 /driver xboxctl.sys
 
+verifier /flags 0x20BBB /driver xboxctl.sys
+
 verifier /query
 
 verifier /querysettings

@@ -52,6 +52,7 @@ Table of Contents
    6.1.  The Defect In The Shipped Profiles
    6.2.  The Rule
    7.  The Parameter Set
+   7.1.  Why Global, And What It Costs
    8.  The Fixed-Point Pipeline
    9.  Reproducing The Shipped Profiles
    10. Absolute Mouse Mode
@@ -557,8 +558,9 @@ Table of Contents
 
 7.  The Parameter Set
 
-   Per stick, per layout. Every field is an integer; nothing here needs
-   floating point at run time.
+   Per stick, and GLOBAL - one set for the whole configuration, not one
+   per layer. Every field is an integer; nothing here needs floating
+   point at run time.
 
    +-------------------+-------+----------+------------------------------------+
    | Field             | Type  | Default  | Meaning                            |
@@ -580,13 +582,38 @@ Table of Contents
    | accel_decay       | u16   | 1024     | boost lost per second, Q8          |
    +-------------------+-------+----------+------------------------------------+
 
-   That is 78 bytes per stick with the table, or 12 without it. Two
-   sticks and eight layouts is 1.2 KB - a rounding error next to a
-   bytecode image.
+   That is 88 bytes per stick - 22 of scalars and padding, 66 of table -
+   so 176 for the pair, and that is the whole of it. A rounding error
+   next to a bytecode image.
 
    The defaults reproduce the FPS profile: quadratic X at 2812 px/s,
    linear-equivalent Y at 42 per cent of it, small deadzone, no
    acceleration.
+
+7.1.  Why Global, And What It Costs
+
+   A layer switch changes buttons only. The sticks keep their deadzone,
+   curve, speed and mode across it.
+
+   THE REASON IS NOT THE 156 BYTES. It is that the pipeline of section 8
+   carries state between ticks - the residual accumulator, the
+   rise-only smoothing term, and the acceleration boost. Per-layer stick
+   parameters would make a layer switch either discard that state, which
+   puts a visible hitch in the pointer exactly when the player is doing
+   something deliberate, or carry it across a change of scale, which
+   makes the first tick after the switch move by the wrong distance.
+   Global parameters make the question disappear rather than answering
+   it.
+
+   WHAT IT FORECLOSES is a precision layer: hold a button, keep the same
+   buttons, and have the pointer slow down. That is a real thing people
+   want from an FPS profile.
+
+   It is recoverable without per-layer sticks if it is ever wanted. A
+   binding action that scales max_speed while its source is active
+   multiplies one number in step 8 of the pipeline and leaves every
+   other parameter, and all of the carried state, untouched. That is the
+   route to take; per-layer parameter sets are not.
 
 8.  The Fixed-Point Pipeline
 
