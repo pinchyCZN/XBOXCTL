@@ -58,7 +58,7 @@ rtrigger -> mouse_button 1 repeat 12 hard 69%
 # caps a repeat at half the tick rate, and a key going down and up a
 # hundred times a second floods the keyboard path for no benefit.
 a -> joy_button 1 repeat 50 hard 75%
-b -> key b repeat 50 hard 50%          # press to latch down, press again to lift
+b -> key b repeat 50 hard 50%
 x -> key r
 y -> mouse_wheel 1             # one detent per press
 white -> mouse_wheel -1

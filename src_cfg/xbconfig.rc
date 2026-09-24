@@ -1,0 +1,99 @@
+/*
+ * xbconfig.rc - the dialogs.
+ *
+ * THE PAD CONTROL BUTTONS ARE NOT HERE. They are created at runtime
+ * from a table keyed by the CORE_SA_* constants, so a button cannot
+ * exist on the dialog without a source in core.h to drive it, and
+ * adding a control to the pad is one table entry rather than an edit in
+ * two files that can drift apart.
+ */
+
+#include <windows.h>
+#include "resource.h"
+
+IDD_MAIN DIALOGEX 0, 0, 420, 262
+STYLE DS_SETFONT | DS_CENTER | WS_MINIMIZEBOX | WS_POPUP | WS_CAPTION |
+      WS_SYSMENU
+CAPTION "XBOXCTL Configurator"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "&Profile", IDC_PROFILEGROUP, 7, 7, 40, 8
+    LISTBOX         IDC_PROFILES, 7, 18, 124, 186,
+                    LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+    PUSHBUTTON      "&Add Config...", IDC_ADD, 7, 208, 60, 14
+    PUSHBUTTON      "A&pply to Pad", IDC_APPLY, 71, 208, 60, 14
+
+    LTEXT           "&Layer", IDC_LAYERLABEL, 7, 229, 24, 8
+    COMBOBOX        IDC_LAYER, 32, 226, 99, 60,
+                    CBS_DROPDOWNLIST | WS_TABSTOP
+
+    GROUPBOX        "Controls", IDC_PADGROUP, 138, 3, 275, 201
+    PUSHBUTTON      "&Sticks...", IDC_STICKS, 138, 208, 60, 14
+
+    LTEXT           "", IDC_STATUS, 138, 230, 275, 18
+    DEFPUSHBUTTON   "Close", IDCANCEL, 363, 208, 50, 14
+END
+
+IDD_BIND DIALOGEX 0, 0, 266, 214
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION |
+      WS_SYSMENU
+CAPTION "Binding"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_CONTROL, 7, 7, 252, 8
+    LTEXT           "&Action", -1, 7, 22, 40, 8
+    LISTBOX         IDC_ACTION, 7, 33, 110, 106,
+                    LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "&Value", IDC_CODELABEL, 125, 22, 60, 8
+    EDITTEXT        IDC_CODE, 125, 33, 80, 13, ES_AUTOHSCROLL
+    PUSHBUTTON      "&Capture...", IDC_CAPTURE, 209, 33, 50, 13
+
+    CONTROL         "&Repeat (autofire)", IDC_REPEAT, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 125, 54, 100, 10
+    CONTROL         "&Toggle (latch)", IDC_TOGGLE, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 125, 67, 100, 10
+    CONTROL         "A&nalog (pass pressure)", IDC_ANALOG, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 125, 80, 100, 10
+    CONTROL         "Pass&through (keep pad button)", IDC_PASSTHROUGH,
+                    "Button", BS_AUTOCHECKBOX | WS_TABSTOP,
+                    125, 93, 130, 10
+
+    LTEXT           "Rate (Hz)", IDC_HZLABEL, 125, 110, 40, 8
+    EDITTEXT        IDC_HZ, 168, 108, 37, 13, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Delay (ms)", IDC_DELAYLABEL, 125, 127, 40, 8
+    EDITTEXT        IDC_DELAY, 168, 125, 37, 13, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Hard (%)", IDC_HARDLABEL, 125, 144, 40, 8
+    EDITTEXT        IDC_HARD, 168, 142, 37, 13, ES_AUTOHSCROLL | ES_NUMBER
+
+    LTEXT           "", IDC_PREVIEW, 7, 163, 252, 18
+
+    PUSHBUTTON      "C&lear Binding", IDC_CLEAR, 7, 193, 60, 14
+    DEFPUSHBUTTON   "OK", IDOK, 155, 193, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 209, 193, 50, 14
+END
+
+IDD_CAPTURE DIALOGEX 0, 0, 180, 70
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION
+CAPTION "Capture"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "Press the key you want this control to send.",
+                    -1, 7, 7, 166, 16
+    LTEXT           "", IDC_CAPTURED, 7, 28, 166, 12
+    PUSHBUTTON      "Cancel", IDCANCEL, 65, 48, 50, 14
+END
+
+IDD_NEWNAME DIALOGEX 0, 0, 200, 76
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION |
+      WS_SYSMENU
+CAPTION "New Configuration"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "Name for the new configuration:", -1, 7, 7, 186, 8
+    EDITTEXT        IDC_NEWNAME, 7, 20, 186, 13, ES_AUTOHSCROLL
+    LTEXT           "It becomes <name>.txt in the profiles folder.",
+                    -1, 7, 38, 186, 8
+    DEFPUSHBUTTON   "OK", IDOK, 89, 55, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 143, 55, 50, 14
+END

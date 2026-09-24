@@ -13,7 +13,7 @@ Usage:
                                                 would change
     python tools/retab.py --fix   [PATH ...]    rewrite in place
 
-With no PATH, walks src_drv/ for .c, .h, .cpp and .inc.
+With no PATH, walks src_drv/ and src_cfg/ for .c, .h, .cpp and .inc.
 
 HOW THE SPLIT IS DECIDED
 
@@ -54,7 +54,9 @@ import sys
 
 TAB_WIDTH = 4
 SRC_EXT = (".c", ".h", ".cpp", ".hpp", ".inc")
-DEFAULT_ROOT = "src_drv"
+# Every directory of ours that holds C. A new one added here is
+# covered by --check without anyone having to remember to name it.
+DEFAULT_ROOTS = ["src_drv", "src_cfg"]
 
 
 def scan_line(line, state):
@@ -270,7 +272,8 @@ def expand(text):
 
 def gather(paths):
     files = []
-    roots = paths if paths else [DEFAULT_ROOT]
+    roots = paths if paths else [r for r in DEFAULT_ROOTS
+                                 if os.path.isdir(r)]
     for root in roots:
         if os.path.isfile(root):
             files.append(root)
