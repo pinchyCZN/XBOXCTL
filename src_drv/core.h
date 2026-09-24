@@ -321,11 +321,28 @@ typedef signed   long long  s64;
 
 /* --- stick modes, analog-to-mouse.txt section 7 ---------------------- */
 #define CORE_STICK_OFF          0
-#define CORE_STICK_MOUSE        1   /* relative pointer */
-#define CORE_STICK_ABSOLUTE     2
-#define CORE_STICK_JOY          3   /* drives the gamepad axes */
-#define CORE_STICK_WHEEL        4
+#define CORE_STICK_MOUSE        1   /* relative pointer              */
+#define CORE_STICK_ABSOLUTE     2   /* RESERVED - see below          */
+#define CORE_STICK_JOY          3   /* drives the gamepad axes       */
+#define CORE_STICK_WHEEL        4   /* vertical scroll               */
 #define CORE_STICK_MODE_COUNT   5
+
+/*
+ * ABSOLUTE IS RESERVED AND BEHAVES AS OFF, and the reason is the
+ * descriptor rather than the arithmetic.
+ *
+ * An absolute pointer reports WHERE IT IS, not how far it moved. The
+ * mouse collection declares relative axes, and a relative device cannot
+ * reach a position it has no way of observing - it does not know where
+ * the cursor is or how large the screen is. Absolute needs a fourth
+ * top-level collection declaring absolute axes.
+ *
+ * That is a descriptor change, and the descriptor is the one part of
+ * this driver where a change cost an entire debugging session: the
+ * collection ORDER turned out to be load-bearing. The number is kept so
+ * the wire format does not shift when it is implemented.
+ * analog-to-mouse.txt section 10 has the behaviour it should have.
+ */
 
 typedef struct _core_binding {      /* 12 bytes */
 	u8  source;             /* semiaxis, or CORE_SA_CHORD_BASE + N  */

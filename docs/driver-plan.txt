@@ -490,13 +490,25 @@ Table of Contents
    advancing if packets stop arriving - a stalled pipe, a pad unplugged
    mid-autofire - so that whatever is held gets released.
 
-   THE PACKET RATE IS 250 Hz, MEASURED. bInterval on the interrupt IN
-   endpoint of an Xbox Controller S, VID 045E PID 0285, read out of
-   DevExt->PollInterval on a running driver, is 4. The device is USB 1.1
-   full speed, where the unit is a 1ms frame, so a packet arrives every
-   4ms.
+   THE ENDPOINT INTERVAL IS 4ms. bInterval on the interrupt IN endpoint
+   of an Xbox Controller S, VID 045E PID 0285, read out of
+   DevExt->PollInterval on a running driver, is 4, and the device is USB
+   1.1 full speed where the unit is a 1ms frame.
 
-   THAT IS THE EMISSION RATE THE ENGINE GETS FOR FREE, and it is the rate
+   THAT BOUNDS HOW OFTEN THE PAD MAY SPEAK, NOT HOW OFTEN IT DOES, and
+   the difference is the single most expensive mistake in this project.
+   MEASURED ON HARDWARE: about five reports a second with nothing being
+   touched, and seven to ten with a stick held hard against its stop.
+   The pad reports only when its state changes, so a stick held still is
+   silent - a held stick is not a stream of identical packets, it is
+   nothing at all.
+
+   ANYTHING THAT NEEDS A STEADY CLOCK MUST USE THE TICK. Reading 4ms as
+   a delivery rate produced a pointer that stepped seven times a second,
+   an idle-detector that fired between ordinary packets, and a diagnosis
+   of a wedged pipe that was only ever the pad having nothing to say.
+
+   THAT IS NOT AN EMISSION RATE THE ENGINE GETS FOR FREE, which is what
    analog-to-mouse.txt section 3.3 wanted: enough that a rendered frame
    at 60fps contains four of them, so the per-frame mouse delta is even.
    No interpolation timer is needed for the stick path.

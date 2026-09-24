@@ -959,16 +959,134 @@ static const struct {
 	  CORE_SA_RSTICK_YNEG, CORE_SA_RSTICK_YPOS }
 };
 
+/*
+ * Deflection to speed: deadzone, rescale, smoothing, curve, acceleration.
+ *
+ * SHARED BY EVERY MODE THAT PRODUCES A RATE. The pointer and the wheel
+ * differ only in what they do with the number and which axes feed it;
+ * everything up to here is the same machinery and the same parameters.
+ *
+ * Returns 0 when the stick is inside the deadzone, having reset the
+ * state that only means something while it is outside.
+ */
+static s32 core_stick_speed(core_state *cs, u32 index, s32 magnitude,
+                            u32 dt_us)
+{
+	const core_stick *cfg = &cs->cfg.stick[index];
+	core_stick_state *ss  = &cs->stick_state[index];
+	s32 rc, u, g, speed;
+	s32 i, f;
+
+	if (magnitude <= (s32)cfg->deadzone) {
+		ss->u_prev  = 0;
+		ss->boost   = 0;
+		ss->accum_x = 0;
+		ss->accum_y = 0;
+		return 0;
+	}
+
+	rc = (magnitude < (s32)cfg->outer) ? magnitude : (s32)cfg->outer;
+	u  = (s32)(((s64)(rc - cfg->deadzone) * 65535) /
+	           ((s32)cfg->outer - (s32)cfg->deadzone));
+
+	if (cfg->smooth_ms != 0 && u > ss->u_prev) {
+		u32 tau_us = (u32)cfg->smooth_ms * 1000u;
+		u32 alpha  = (u32)(((u64)dt_us << 16) / (tau_us + dt_us));
+
+		u = ss->u_prev +
+		    (s32)((((s64)(u - ss->u_prev)) * alpha) >> 16);
+	}
+	ss->u_prev = u;
+
+	i = u >> 11;
+	f = u & 0x7FF;
+	if (i >= CORE_CURVE_POINTS - 1) {
+		i = CORE_CURVE_POINTS - 2;
+		f = 0x7FF;
+	}
+	g = (s32)cfg->curve[i] +
+	    (s32)((((s32)cfg->curve[i + 1] - (s32)cfg->curve[i]) * f) >> 11);
+
+	speed = (s32)(((s64)cfg->max_speed * g) >> 16);
+
+	if (cfg->accel_rate != 0) {
+		if (u >= (s32)cfg->accel_threshold) {
+			ss->boost += (s32)(((s64)cfg->accel_rate * dt_us) /
+			                   1000000);
+		} else {
+			ss->boost -= (s32)(((s64)cfg->accel_decay * dt_us) /
+			                   1000000);
+		}
+		ss->boost = core_clamp(ss->boost, 0, (s32)cfg->accel_max);
+		speed = (s32)(((s64)speed * (256 + ss->boost)) >> 8);
+	}
+
+	return speed;
+}
+
+/*
+ * A stick that scrolls.
+ *
+ * VERTICAL ONLY, AND NOT RADIAL. A wheel has one axis, so the deadzone
+ * applies to the Y deflection alone rather than to the distance from
+ * centre - otherwise pushing sideways would consume the deadzone and a
+ * diagonal would scroll at a rate that depended on the horizontal
+ * component, which is not what anybody means by a stick that scrolls.
+ *
+ * max_speed IS DETENTS PER SECOND HERE, NOT PIXELS. A pointer wants
+ * thousands; a wheel wants ten or twenty. The same field means a very
+ * different number in this mode and a profile that forgets it will
+ * scroll a document into next week.
+ */
+static void core_stick_wheel(core_state *cs, u32 index, u32 dt_us)
+{
+	const core_stick *cfg = &cs->cfg.stick[index];
+	core_stick_state *ss  = &cs->stick_state[index];
+	s32 y, mag, speed, step;
+
+	y = cs->semiaxis[CORE_STICK_AXES[index].ypos] -
+	    cs->semiaxis[CORE_STICK_AXES[index].yneg];
+	mag = (y < 0) ? -y : y;
+
+	speed = core_stick_speed(cs, index, mag, dt_us);
+	if (speed == 0) {
+		return;
+	}
+
+	/*
+	 * PUSH UP, SCROLL UP. The decode leaves Y down-positive, and a
+	 * positive wheel value scrolls away from the reader, so the sign
+	 * is flipped once here. invert_y flips it back for anyone who
+	 * wants the other convention.
+	 */
+	if (y > 0) {
+		speed = -speed;
+	}
+	speed = (s32)(((s64)speed * cfg->gain_y) >> 7);
+	if (cfg->invert_y) {
+		speed = -speed;
+	}
+
+	ss->accum_y += (s64)speed * dt_us;
+	step = (s32)(ss->accum_y / 1000000);
+	ss->accum_y -= (s64)step * 1000000;
+
+	core_mouse_wheel(cs, step, 0);
+}
+
 static void core_stick_run(core_state *cs, u32 index, u32 dt_us)
 {
 	const core_stick *cfg = &cs->cfg.stick[index];
 	core_stick_state *ss  = &cs->stick_state[index];
 	s32 x, y;
-	s32 r, rc, u, g;
+	s32 r;
 	s32 speed, vx, vy;
 	s32 step_x, step_y;
-	s32 i, f;
 
+	if (cfg->mode == CORE_STICK_WHEEL) {
+		core_stick_wheel(cs, index, dt_us);
+		return;
+	}
 	if (cfg->mode != CORE_STICK_MOUSE) {
 		return;
 	}
@@ -986,58 +1104,11 @@ static void core_stick_run(core_state *cs, u32 index, u32 dt_us)
 	 */
 	r = (s32)core_isqrt64((u64)((s64)x * x + (s64)y * y));
 
-	/* STEP 5. Radial deadzone, then rescale so the curve always sees a
-	 * full range whatever the deadzone is set to. */
-	if (r <= (s32)cfg->deadzone) {
-		ss->u_prev  = 0;
-		ss->boost   = 0;
-		ss->accum_x = 0;
-		ss->accum_y = 0;
+	/* STEPS 5 TO 8. Radial deflection to pixels per second, shared with
+	 * every other mode that produces a rate. */
+	speed = core_stick_speed(cs, index, r, dt_us);
+	if (speed == 0) {
 		return;
-	}
-
-	rc = (r < (s32)cfg->outer) ? r : (s32)cfg->outer;
-	u  = (s32)(((s64)(rc - cfg->deadzone) * 65535) /
-	           ((s32)cfg->outer - (s32)cfg->deadzone));
-
-	/*
-	 * STEP 6. RISE ONLY. Smoothing the fall would make the pointer
-	 * coast past where the stick stopped, which reads as the aim
-	 * overshooting rather than as anything smooth.
-	 */
-	if (cfg->smooth_ms != 0 && u > ss->u_prev) {
-		u32 tau_us = (u32)cfg->smooth_ms * 1000u;
-		u32 alpha  = (u32)(((u64)dt_us << 16) / (tau_us + dt_us));
-
-		u = ss->u_prev +
-		    (s32)((((s64)(u - ss->u_prev)) * alpha) >> 16);
-	}
-	ss->u_prev = u;
-
-	/* STEP 7. The table and a lerp - the driver never evaluates a
-	 * curve, it reads one the configurator computed. */
-	i = u >> 11;                            /* 0..31              */
-	f = u & 0x7FF;                          /* 11-bit fraction    */
-	if (i >= CORE_CURVE_POINTS - 1) {
-		i = CORE_CURVE_POINTS - 2;
-		f = 0x7FF;
-	}
-	g = (s32)cfg->curve[i] +
-	    (s32)((((s32)cfg->curve[i + 1] - (s32)cfg->curve[i]) * f) >> 11);
-
-	/* STEP 8. Deflection to pixels per second, then the time term. */
-	speed = (s32)(((s64)cfg->max_speed * g) >> 16);
-
-	if (cfg->accel_rate != 0) {
-		if (u >= (s32)cfg->accel_threshold) {
-			ss->boost += (s32)(((s64)cfg->accel_rate * dt_us) /
-			                   1000000);
-		} else {
-			ss->boost -= (s32)(((s64)cfg->accel_decay * dt_us) /
-			                   1000000);
-		}
-		ss->boost = core_clamp(ss->boost, 0, (s32)cfg->accel_max);
-		speed = (s32)(((s64)speed * (256 + ss->boost)) >> 8);
 	}
 
 	/*
@@ -1941,7 +2012,12 @@ static u32 core_cfg_fix_stick(core_stick *st)
 	u32 fixed = 0;
 	int i;
 
-	if (st->mode >= CORE_STICK_MODE_COUNT) {
+	if (st->mode >= CORE_STICK_MODE_COUNT ||
+	    st->mode == CORE_STICK_ABSOLUTE) {
+		/* ABSOLUTE IS NOT IMPLEMENTED AND IS REPAIRED RATHER THAN
+		 * IGNORED, so a configurator offering it hears about it
+		 * through the repaired count instead of silently doing
+		 * nothing. core.h says what it needs. */
 		st->mode = CORE_STICK_OFF;
 		fixed++;
 	}

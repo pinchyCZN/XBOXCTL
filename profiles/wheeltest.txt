@@ -1,0 +1,83 @@
+# XBOXCTL profile - exercises the features no other profile uses.
+#
+#   python tools/mkconfig.py profiles/wheeltest.txt -o wheeltest.bin
+#   B:\xboxctl\xbctl.ps1 set -Path wheeltest.bin
+#
+# LEFT STICK SCROLLS, RIGHT STICK AIMS. Push the left stick up and a
+# document scrolls up; the further you push, the faster. Sideways on the
+# left stick does nothing - a wheel has one axis.
+
+[global]
+tick_hz = 250
+
+# max_speed IS DETENTS PER SECOND IN WHEEL MODE, NOT PIXELS. A pointer
+# wants thousands; a wheel wants ten or twenty. The same field means a
+# very different number here, and 2800 would scroll a document into next
+# week.
+[stick left]
+mode = wheel
+deadzone = 5000         # covers this pad's resting offset
+outer = 32000
+max_speed = 12          # detents per second at full deflection
+curve = quad            # gentle near centre, quick at the edge
+gain_y = 128
+invert_y = 0            # 1 to scroll the other way
+smooth_ms = 8
+
+[stick right]
+mode = mouse
+deadzone = 5000
+outer = 32000
+max_speed = 2800
+curve = cubic
+gain_x = 128
+gain_y = 54
+invert_y = 0
+smooth_ms = 8
+
+# TURN ACCELERATION: hold the stick at the edge and the turn keeps
+# building. No curve of any shape can do this - it is a function of time
+# held, not of deflection. Set accel_rate to 0 to switch it off.
+accel_threshold = 50000
+accel_rate = 256        # +1.0x per second held past the threshold
+accel_max = 512         # ceiling of +2.0x
+accel_decay = 1024      # bleeds off quickly below the threshold
+
+[layer 1]
+start+back -> layer_cycle 1
+
+# HELD LAYER. While the left trigger is down, layer 2 is live; release
+# and it reverts. This binding must exist in every layer it can return
+# from, which is why it is in both.
+ltrigger -> layer_hold 2
+
+rtrigger -> mouse_button 1
+a -> key space
+b -> key lctrl toggle          # press to latch down, press again to lift
+x -> key r
+y -> mouse_wheel 1             # one detent per press
+white -> mouse_wheel -1
+black -> key f5 repeat 3 delay 500   # tap once; hold for a 3 Hz repeat
+lthumb -> key lshift
+
+# A D-pad that nudges the cursor, for menus. dx in the low byte, dy in
+# the high byte, both signed.
+dup -> mouse_pulse 0xF400 repeat 20      # dy = -12, twenty times a second
+ddown -> mouse_pulse 0x0C00 repeat 20    # dy = +12
+dleft -> mouse_pulse 0x00F4 repeat 20    # dx = -12
+dright -> mouse_pulse 0x000C repeat 20   # dx = +12
+
+[layer 2]
+start+back -> layer_cycle 1
+ltrigger -> layer_hold 2
+
+# PASSTHROUGH keeps the default gamepad button as well as sending the
+# key, which is the one case where a binding adds instead of replacing.
+a -> key 1 passthrough
+
+# ANALOG passes the trigger's pressure to the axis instead of
+# thresholding it into an on or off.
+rtrigger -> joy_axis 4 analog
+
+# A delayed single shot: assert, wait, release, stop.
+x -> key escape once repeat 2 delay 400

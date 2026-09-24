@@ -2314,6 +2314,55 @@ static int test_sticks(void)
 		         " packets and drop what is genuinely held");
 	}
 
+	/* --- a stick that scrolls ------------------------------------- */
+	core_init(&cs, recording_sink, NULL);
+	stick_config(&cfg);
+	cfg.stick[1].mode      = CORE_STICK_WHEEL;
+	cfg.stick[1].max_speed = 10;    /* DETENTS a second, not pixels */
+	cfg.stick[1].deadzone  = 2000;
+	cfg.stick[1].outer     = 32000;
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+
+	sink_reset();
+	stick_hold(&cs, 0, 32767, &t, 125);     /* stick up, one second */
+	/* Eight or nine, not ten: the last partial detent is still in the
+	 * accumulator, which is the carry working as intended. */
+	check(sink_wheel_total() >= 8 && sink_wheel_total() <= 10,
+	      "PUSHING UP SCROLLS UP at about max_speed detents a second");
+	sink_mouse_total(&dx, &dy);
+	check_eq(dx, 0, "and moves the pointer not at all");
+	check_eq(dy, 0, "on either axis");
+
+	sink_reset();
+	stick_hold(&cs, 0, -32767, &t, 125);    /* stick down */
+	check(sink_wheel_total() <= -8 && sink_wheel_total() >= -10,
+	      "and pushing down scrolls down");
+
+	/* SIDEWAYS IS NOT SCROLL, and the deadzone is vertical only - a
+	 * radial one would let a horizontal push eat it. */
+	sink_reset();
+	stick_hold(&cs, 32767, 0, &t, 125);
+	check_eq(sink_wheel_total(), 0,
+	         "a purely sideways push scrolls nothing");
+
+	/* --- absolute is reserved, and says so ------------------------ */
+	stick_config(&cfg);
+	cfg.stick[1].mode = CORE_STICK_ABSOLUTE;
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	{
+		u32 repaired = 0;
+
+		core_init(&cs, recording_sink, NULL);
+		core_set_config(&cs, blob, len, &repaired);
+		check_eq(cs.cfg.stick[1].mode, CORE_STICK_OFF,
+		         "ABSOLUTE IS REPAIRED TO OFF, not silently inert - it"
+		         " needs a collection that declares absolute axes");
+		check(repaired >= 1, "and the repair is counted");
+	}
+
 	/* --- acceleration builds with time held ----------------------- */
 	core_init(&cs, recording_sink, NULL);
 	stick_config(&cfg);

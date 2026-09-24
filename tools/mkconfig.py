@@ -275,6 +275,18 @@ def default_config():
 # --------------------------------------------------------------------------
 
 def parse_code(action, word):
+    # LAYERS ARE WRITTEN THE WAY THEY ARE DECLARED. A profile says
+    # [layer 1] and [layer 2], so layer_hold and layer_set take those
+    # same numbers; the driver indexes from zero. Without this the
+    # obvious "layer_hold 2" silently clamps to the layer below and the
+    # hold appears to do nothing. layer_cycle is NOT converted - its
+    # argument is a signed step, not an index.
+    if action in (ACTIONS["layer_hold"], ACTIONS["layer_set"]):
+        n = int(word, 0)
+        if n < 1 or n > MAX_LAYOUTS:
+            raise ValueError("layer must be 1..%d" % MAX_LAYOUTS)
+        return n - 1
+
     if action == ACTIONS["key"]:
         key = KEYS.get(word.lower())
         if key is None:
@@ -461,6 +473,8 @@ def dump(blob):
             aname = actions.get(act, "?")
             if act == ACTIONS["key"]:
                 value = keys.get(code, "0x%02X" % code)
+            elif act in (ACTIONS["layer_hold"], ACTIONS["layer_set"]):
+                value = str(code + 1)       # shown as written
             else:
                 value = str(code)
             extra = ""
