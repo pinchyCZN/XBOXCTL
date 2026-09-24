@@ -87,6 +87,30 @@ typedef struct _XC_POLL_SLOT {
 	PVOID       DevExt;         /* back pointer, for the completion */
 } XC_POLL_SLOT;
 
+/*
+ * THE LAST FEW MOUSE REPORTS, KEPT WHERE NOTHING CAN LOCK THEM AWAY.
+ *
+ * mouhid opens the mouse collection exclusively, so a diagnostic that
+ * reads the collection from user mode gets ACCESS_DENIED and there is
+ * no way around it - the input stack is deliberately not shareable.
+ * Recording what was emitted, inside the driver, is the only view of
+ * the pointer path available on a live system.
+ */
+#define XC_TRACE_MAX            32
+
+typedef struct _XC_TRACE_ENTRY {    /* 8 bytes */
+	s16 dx;
+	s16 dy;
+	u8  buttons;
+	u8  reserved[3];
+} XC_TRACE_ENTRY;
+
+typedef struct _XC_TRACE {
+	u32             count;      /* how many entries follow      */
+	u32             emitted;    /* mouse reports since the start */
+	XC_TRACE_ENTRY  entry[XC_TRACE_MAX];   /* oldest first      */
+} XC_TRACE;
+
 /* ======================================================================
  * RUMBLE
  *
@@ -207,6 +231,38 @@ typedef struct _XC_DEVEXT {
 	ULONG               PollRestartRequests;
 	ULONG               PipeResets;
 
+	/*
+	 * THE CLOCK, AND IT IS NOT THE OBVIOUS ONE.
+	 *
+	 * KeQueryInterruptTime is expressed in 100ns units but ADVANCES
+	 * ONLY ON THE SYSTEM TIMER TICK, about every 15.6ms. Packets
+	 * arrive every 4ms, so three packets out of four measure an
+	 * elapsed time of exactly zero and the fourth measures 15.6ms.
+	 * The pointer then moves in 44-pixel jumps at 64 Hz instead of
+	 * 11-pixel steps at 250 Hz - the same velocity, delivered in
+	 * lumps, which is felt as violent rather than fast.
+	 *
+	 * The performance counter has sub-microsecond resolution. The
+	 * base and frequency are cached so the conversion is a divide
+	 * rather than a call.
+	 */
+	u64                 ClockBase;
+	u64                 ClockFreq;
+
+	/* --- the mouse trace, wdm.h above --- */
+	XC_TRACE_ENTRY      Trace[XC_TRACE_MAX];
+	ULONG               TraceHead;
+	ULONG               TraceCount;
+	ULONG               TraceEmitted;
+
+	/*
+	 * EVERY REPORT, BY ID. The trace above records only mouse
+	 * reports, so a keyboard report going out when nobody asked for
+	 * one is invisible - and phantom keystrokes are exactly the
+	 * symptom that would produce.
+	 */
+	ULONG               ReportsById[8];
+
 	/* --- rumble --- */
 	XC_RUMBLE           Rumble;
 
@@ -282,6 +338,9 @@ typedef struct _XC_DEVEXT {
 #define IOCTL_XC_SET_CONFIG     XC_IOCTL_WRITE(4)
 #define IOCTL_XC_RESET_CONFIG   XC_IOCTL_WRITE(5)
 #define IOCTL_XC_SET_RUMBLE     XC_IOCTL_WRITE(6)
+#define IOCTL_XC_GET_TRACE      XC_IOCTL_READ(7)
+#define IOCTL_XC_NUDGE          XC_IOCTL_WRITE(8)
+#define IOCTL_XC_RAWMOUSE       XC_IOCTL_WRITE(9)
 
 /* More pads than anyone has. The array is walked, not searched. */
 #define XC_MAX_DEVICES          8
@@ -339,6 +398,7 @@ typedef struct _XC_STATS {          /* 40 bytes */
 	u32 layer;              /* the live layer, 1-based              */
 	u32 rumble_sent;
 	u32 rumble_errors;
+	u32 by_id[8];          /* reports emitted, indexed by ID */
 } XC_STATS;
 
 /*
@@ -359,6 +419,36 @@ typedef struct _XC_CONFIG_REQUEST {
  * report; no game will ever send one. Both paths end in the same
  * XcRumbleSet, so the hardware path is exercised either way.
  */
+/*
+ * NUDGE. Emit one mouse report carrying exactly these deltas.
+ *
+ * IT EXISTS TO SEPARATE TWO FAULTS THAT LOOK IDENTICAL: a driver that
+ * computes the wrong motion, and a host that misreads correct motion.
+ * Nothing about the stick, the curve or the accumulator is involved -
+ * the numbers go straight into a report - so if the pointer does not do
+ * what the numbers say, the fault is above this driver.
+ */
+typedef struct _XC_NUDGE_REQUEST {
+	u32 index;
+	s16 dx;
+	s16 dy;
+} XC_NUDGE_REQUEST;
+
+/*
+ * RAWMOUSE. Emit a mouse report containing exactly these four bytes,
+ * bypassing the engine entirely - no accumulator, no zero-move check.
+ *
+ * IT EXISTS TO ASK ONE QUESTION: does an ALL-ZERO mouse report move
+ * the cursor? If it does, nothing in the payload matters and the
+ * fault is in how the report is delivered rather than what is in it.
+ * core_mouse_move refuses a zero move on purpose, so this is the only
+ * way to send one.
+ */
+typedef struct _XC_RAWMOUSE_REQUEST {
+	u32 index;
+	u8  payload[4];     /* buttons, X, Y, wheel */
+} XC_RAWMOUSE_REQUEST;
+
 typedef struct _XC_RUMBLE_REQUEST {
 	u32 index;
 	u8  left;
@@ -419,6 +509,10 @@ void     XcRumbleSet(PXC_DEVEXT DevExt, u8 Left, u8 Right);
 void     XcQueueReport(PXC_DEVEXT DevExt, u8 report_id,
                        const u8 *payload, u32 len);
 int      XcDequeueReport(PXC_DEVEXT DevExt, XC_REPORT_NODE *out);
+
+/* Park a read. Exposed so the harness can prove a report is never
+ * written into a buffer too small to hold it. */
+NTSTATUS XcQueueRead(PXC_DEVEXT DevExt, PIRP Irp);
 
 NTSTATUS XcStartDevice(PDEVICE_OBJECT Fdo, PIRP Irp);
 void     XcStopDevice(PXC_DEVEXT DevExt);

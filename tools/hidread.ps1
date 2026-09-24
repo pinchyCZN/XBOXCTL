@@ -6,6 +6,19 @@
         powershell -ExecutionPolicy Bypass -File hidread.ps1 -Col 2     keyboard
         powershell -ExecutionPolicy Bypass -File hidread.ps1 -Quiet     count only
         powershell -ExecutionPolicy Bypass -File hidread.ps1 -NoSticks
+        powershell -ExecutionPolicy Bypass -File hidread.ps1 -Caps -Col 3
+
+    -Caps SAYS WHAT WINDOWS THINKS THE REPORTS LOOK LIKE, which is not
+    always what the driver is sending. Windows reads the report
+    descriptor once, when the device starts; changing the descriptor and
+    reloading the driver is not enough, because the device has to be
+    restarted for the new one to be read. Until it is, the old layout is
+    applied to the new reports and the fields land in the wrong places.
+
+    IT WORKS ON THE MOUSE AND KEYBOARD, which -Col 2 and -Col 3 cannot
+    otherwise be read at all: the handle is opened with NO access rights,
+    which HID allows for queries even when mouhid and kbdhid hold the
+    collection exclusively for reading.
 
     -NoSticks PRINTS THE WHOLE REPORT, exactly as the default does, but
     only when something OTHER THAN THE TWO ANALOG STICKS changes. The
@@ -29,9 +42,21 @@
     listening or five clients are. Measured on hardware.
 #>
 param(
+    # DEFAULTS TO THE XBOX PAD. Pass another to compare a device that
+    # works - the Adaptoid is 06F7:0001 and its mouse is Col01.
+    #
+    # NOT $Pid. THAT IS AN AUTOMATIC READ-ONLY VARIABLE - the process id -
+    # and a parameter of that name fails at bind time with an error that
+    # mentions neither the script nor the parameter. The short spellings
+    # survive as aliases.
+    [Alias('Vid')]
+    [string]$VendorId = '045e',
+    [Alias('Pid')]
+    [string]$ProductId = '0285',
     [int]$Col = 1,
     [switch]$Quiet,
     [switch]$NoSticks,
+    [switch]$Caps,
     [int]$Seconds = 0
 )
 
@@ -54,6 +79,21 @@ public static class NativeHid
 
     [DllImport("hid.dll")]
     public static extern void HidD_GetHidGuid(out Guid hidGuid);
+
+    [DllImport("hid.dll", SetLastError = true)]
+    public static extern bool HidD_GetPreparsedData(IntPtr handle,
+        out IntPtr preparsed);
+
+    [DllImport("hid.dll")]
+    public static extern bool HidD_FreePreparsedData(IntPtr preparsed);
+
+    [DllImport("hid.dll")]
+    public static extern int HidP_GetCaps(IntPtr preparsed, byte[] caps);
+
+    // HidP_Input = 0. caps is an array of HIDP_VALUE_CAPS.
+    [DllImport("hid.dll")]
+    public static extern int HidP_GetValueCaps(int reportType,
+        byte[] caps, ref ushort capsLength, IntPtr preparsed);
 
     [DllImport("setupapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern IntPtr SetupDiGetClassDevs(ref Guid classGuid,
@@ -98,7 +138,8 @@ function Find-CollectionPath([int]$col)
     if ($set -eq [IntPtr](-1)) { throw "SetupDiGetClassDevs failed" }
 
     # Our hardware ID, with the collection suffix hidclass appends.
-    $want = "vid_045e&pid_0285&col{0:d2}" -f $col
+    $want = ("vid_{0}&pid_{1}&col{2:d2}" -f $VendorId, $ProductId,
+                                              $col).ToLower()
     $found = $null
     try {
         $i = 0
@@ -144,7 +185,7 @@ function Find-CollectionPath([int]$col)
 
 $path = Find-CollectionPath $Col
 if (-not $path) {
-    Write-Host "  No collection $Col found for VID_045E&PID_0285."
+    Write-Host "  No collection $Col found for VID_$VendorId&PID_$ProductId."
     Write-Host "  Is the pad attached and is xboxctl bound? Run state.cmd."
     exit 1
 }
@@ -163,6 +204,85 @@ Write-Host "  $path"
 $GENERIC_READ  = [uint32]2147483648     # 0x80000000
 $FILE_SHARE_RW = [uint32]3              # READ | WRITE
 $OPEN_EXISTING = [uint32]3
+
+if ($Caps) {
+    # ZERO ACCESS RIGHTS. HID allows a query-only handle even where
+    # mouhid or kbdhid holds the collection exclusively for reading, and
+    # that is the only way to see the mouse and keyboard collections.
+    $q = [NativeHid]::CreateFile($path, 0, $FILE_SHARE_RW, [IntPtr]::Zero,
+                                 $OPEN_EXISTING, 0, [IntPtr]::Zero)
+    if ($q -eq [IntPtr](-1)) {
+        Write-Host ("  CreateFile failed: {0}" -f
+                    [Runtime.InteropServices.Marshal]::GetLastWin32Error())
+        exit 1
+    }
+    $q2 = $q
+    $pp = [IntPtr]::Zero
+    if (-not [NativeHid]::HidD_GetPreparsedData($q, [ref]$pp)) {
+        Write-Host "  HidD_GetPreparsedData failed"
+        $null = [NativeHid]::CloseHandle($q)
+        exit 1
+    }
+    # HIDP_CAPS begins: Usage, UsagePage, InputReportByteLength,
+    # OutputReportByteLength, FeatureReportByteLength - five USHORTs.
+    # NOT $caps - PowerShell variable names are case insensitive, so
+    # that IS the -Caps switch parameter, and assigning a byte array
+    # to a switch fails at run time with a type error that names
+    # neither the variable nor the parameter.
+    $capsBuf = New-Object byte[] 256
+    $st = [NativeHid]::HidP_GetCaps($pp, $capsBuf)
+    $null = [NativeHid]::HidD_FreePreparsedData($pp)
+    if ($st -ne 0x00110000) {
+        Write-Host ("  HidP_GetCaps returned 0x{0:X8}" -f $st)
+        exit 1
+    }
+    Write-Host ("  usage page 0x{0:X2}  usage 0x{1:X2}" -f
+                [BitConverter]::ToUInt16($capsBuf, 2),
+                [BitConverter]::ToUInt16($capsBuf, 0))
+    Write-Host ("  input report   {0} bytes" -f
+                [BitConverter]::ToUInt16($capsBuf, 4))
+    Write-Host ("  output report  {0} bytes" -f
+                [BitConverter]::ToUInt16($capsBuf, 6))
+    Write-Host ("  feature report {0} bytes" -f
+                [BitConverter]::ToUInt16($capsBuf, 8))
+
+    # THE FIELD THAT DECIDES EVERYTHING FOR A POINTER. Windows records
+    # per axis whether it is absolute or relative. A relative axis is
+    # applied as a delta; an absolute one has LogicalMinimum subtracted
+    # first, which on a mouse adds a fixed push to every report.
+    $ppd = [IntPtr]::Zero
+    $null = [NativeHid]::HidD_GetPreparsedData($q2, [ref]$ppd)
+    $n = [uint16]64
+    $vc = New-Object byte[] (64 * 72)
+    $vs = [NativeHid]::HidP_GetValueCaps(0, $vc, [ref]$n, $ppd)
+    $null = [NativeHid]::HidD_FreePreparsedData($ppd)
+    $null = [NativeHid]::CloseHandle($q2)
+    if ($vs -eq 0x00110000) {
+        Write-Host ""
+        Write-Host "  axis usages Windows found in the input reports:"
+        Write-Host "  rpt  usage  bits  logical min..max   absolute?"
+        for ($k = 0; $k -lt $n; $k++) {
+            $b = $k * 72
+            $rid  = $vc[$b + 2]
+            $abs  = $vc[$b + 15]
+            $bits = [BitConverter]::ToUInt16($vc, $b + 18)
+            $lmin = [BitConverter]::ToInt32($vc, $b + 40)
+            $lmax = [BitConverter]::ToInt32($vc, $b + 44)
+            $us   = [BitConverter]::ToUInt16($vc, $b + 56)
+            $flag = if ($abs -ne 0) { 'ABSOLUTE' } else { 'relative' }
+            $line = "  {0,3}  0x{1:x2}   {2,4}  {3,7}..{4,-7}  {5}" -f $rid, $us, $bits, $lmin, $lmax, $flag
+            Write-Host $line
+        }
+        Write-Host ""
+        Write-Host "  A mouse axis marked ABSOLUTE is the fault: Windows"
+        Write-Host "  subtracts logical min from every value, which adds a"
+        Write-Host "  fixed push of that size to every report."
+    } else {
+        $line = "  HidP_GetValueCaps returned 0x{0:X8}" -f $vs
+        Write-Host $line
+    }
+    exit 0
+}
 
 $h = [NativeHid]::CreateFile($path, $GENERIC_READ, $FILE_SHARE_RW,
                              [IntPtr]::Zero, $OPEN_EXISTING, 0, [IntPtr]::Zero)

@@ -73,7 +73,34 @@ static int XcReportCoalesces(u8 report_id)
 
 static void XcCompleteRead(PIRP Irp, const UCHAR *Data, UCHAR Length)
 {
+	/*
+	 * NEVER WRITE MORE THAN THE CALLER ASKED FOR. The callers already
+	 * choose a read that fits; this is the backstop, because the cost
+	 * of being wrong here is corrupting another driver's memory rather
+	 * than failing an IRP.
+	 */
+	if (XcReadCapacity(Irp) < Length) {
+		Irp->IoStatus.Status = STATUS_BUFFER_TOO_SMALL;
+		Irp->IoStatus.Information = 0;
+		IoCompleteRequest(Irp, IO_NO_INCREMENT);
+		return;
+	}
+
 	if (Irp->UserBuffer != NULL) {
+		/*
+		 * ZERO THE WHOLE BUFFER FIRST.
+		 *
+		 * hidclass parks reads whose buffer is sized to the LARGEST
+		 * report of any collection - thirty-seven bytes here, the
+		 * gamepad's - and reuses that buffer for every report. A
+		 * five-byte mouse report therefore leaves thirty-two bytes of
+		 * the previous gamepad report in place behind it. Anything
+		 * that reads past the length we declare finds stick positions
+		 * and button bits where it expects nothing, and acts on them.
+		 *
+		 * Writing only what we have is correct and not sufficient.
+		 */
+		RtlZeroMemory(Irp->UserBuffer, XcReadCapacity(Irp));
 		RtlCopyMemory(Irp->UserBuffer, Data, Length);
 	}
 	Irp->IoStatus.Status = STATUS_SUCCESS;
@@ -86,7 +113,34 @@ static void XcCompleteRead(PIRP Irp, const UCHAR *Data, UCHAR Length)
  * hold QueueLock: the cancel spin lock is acquired here and the two must
  * always be taken in this order.
  */
-static PIRP XcDequeueRead(PXC_DEVEXT DevExt)
+/*
+ * How much room a pending read offers.
+ *
+ * HIDCLASS CREATES ONE CHILD DEVICE PER TOP-LEVEL COLLECTION AND SIZES
+ * EACH CHILD'S READS TO THAT COLLECTION'S LARGEST REPORT. The mouse
+ * child asks for five bytes, the keyboard for eight, the gamepad for
+ * thirty-seven. They all arrive here as IOCTL_HID_READ_REPORT on one
+ * device and nothing in the IRP says which child sent it.
+ */
+static ULONG XcReadCapacity(PIRP Irp)
+{
+	PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+
+	return stack->Parameters.DeviceIoControl.OutputBufferLength;
+}
+
+/*
+ * Take a pending read that can hold Need bytes.
+ *
+ * TAKING THE FIRST READ REGARDLESS IS A KERNEL BUFFER OVERFLOW. A
+ * 37-byte gamepad report completed into the mouse child's five-byte
+ * buffer writes thirty-two bytes past its end, into hidclass's own
+ * memory. It does not fault - it corrupts, and the damage surfaces as
+ * input nobody generated: phantom keystrokes, wheel events, windows
+ * minimising. It looks like a driver computing the wrong values and it
+ * is not; it is a driver writing outside the buffer it was given.
+ */
+static PIRP XcDequeueRead(PXC_DEVEXT DevExt, ULONG Need)
 {
 	KIRQL       cancel_irql;
 	KIRQL       irql;
@@ -96,11 +150,19 @@ static PIRP XcDequeueRead(PXC_DEVEXT DevExt)
 	IoAcquireCancelSpinLock(&cancel_irql);
 	KeAcquireSpinLock(&DevExt->QueueLock, &irql);
 
-	if (!IsListEmpty(&DevExt->PendingReads)) {
-		entry = RemoveHeadList(&DevExt->PendingReads);
-		DevExt->PendingReadCount--;
-		irp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
-		IoSetCancelRoutine(irp, NULL);
+	for (entry = DevExt->PendingReads.Flink;
+	     entry != &DevExt->PendingReads;
+	     entry = entry->Flink) {
+		PIRP candidate = CONTAINING_RECORD(entry, IRP,
+		                                   Tail.Overlay.ListEntry);
+
+		if (XcReadCapacity(candidate) >= Need) {
+			RemoveEntryList(entry);
+			DevExt->PendingReadCount--;
+			IoSetCancelRoutine(candidate, NULL);
+			irp = candidate;
+			break;
+		}
 	}
 
 	KeReleaseSpinLock(&DevExt->QueueLock, irql);
@@ -191,7 +253,39 @@ void XcReportSink(void *ctx, u8 report_id, const u8 *payload, u32 len)
 		return;
 	}
 
-	irp = XcDequeueRead(DevExt);
+	/*
+	 * RECORD WHAT THE POINTER PATH PUT ON THE WIRE. This is the only
+	 * view of it on a live system: mouhid owns the mouse collection
+	 * exclusively, so nothing in user mode can read those reports back.
+	 */
+	if (report_id < 8) {
+		DevExt->ReportsById[report_id]++;
+	}
+
+	if (report_id == CORE_REPORT_ID_MOUSE && len > CORE_MS_Y + 1) {
+		KIRQL irql;
+
+		KeAcquireSpinLock(&DevExt->QueueLock, &irql);
+		DevExt->Trace[DevExt->TraceHead].dx =
+		        (s16)(payload[CORE_MS_X] | (payload[CORE_MS_X + 1] << 8));
+		DevExt->Trace[DevExt->TraceHead].dy =
+		        (s16)(payload[CORE_MS_Y] | (payload[CORE_MS_Y + 1] << 8));
+		DevExt->Trace[DevExt->TraceHead].buttons = payload[CORE_MS_BUTTONS];
+		DevExt->TraceHead = (DevExt->TraceHead + 1) % XC_TRACE_MAX;
+		if (DevExt->TraceCount < XC_TRACE_MAX) {
+			DevExt->TraceCount++;
+		}
+		DevExt->TraceEmitted++;
+		KeReleaseSpinLock(&DevExt->QueueLock, irql);
+	}
+
+	/*
+	 * A READ THAT CANNOT HOLD THIS REPORT IS NOT A READ FOR THIS
+	 * REPORT. Queue it instead and let the child that can take it come
+	 * and ask - which it will, because hidclass keeps its reads
+	 * outstanding.
+	 */
+	irp = XcDequeueRead(DevExt, len + 1);
 	if (irp != NULL) {
 		buf[0] = report_id;
 		RtlCopyMemory(&buf[1], payload, len);
@@ -221,7 +315,7 @@ static void NTAPI XcCancelRead(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
 }
 
-static NTSTATUS XcQueueRead(PXC_DEVEXT DevExt, PIRP Irp)
+NTSTATUS XcQueueRead(PXC_DEVEXT DevExt, PIRP Irp)
 {
 	KIRQL cancel_irql;
 	KIRQL irql;
@@ -258,7 +352,8 @@ static void XcCancelPendingReads(PXC_DEVEXT DevExt)
 	PIRP irp;
 
 	for (;;) {
-		irp = XcDequeueRead(DevExt);
+		/* Zero: any read will do, they are all being failed. */
+		irp = XcDequeueRead(DevExt, 0);
 		if (irp == NULL) {
 			break;
 		}
@@ -397,6 +492,62 @@ void XcPollFinish(PXC_DEVEXT DevExt, ULONG SlotIndex, NTSTATUS Status)
 
 #ifndef XBOXCTL_USERMODE
 
+/*
+ * Monotonic 100ns time, at a resolution the poll rate deserves.
+ *
+ * NOT KeQueryInterruptTime. It reports 100ns units but only advances on
+ * the system timer tick - roughly every 15.6ms - so at a 4ms poll rate
+ * most packets measure zero elapsed time and every fourth measures the
+ * whole tick. Anything integrating over that interval, the pointer
+ * accumulator above all, then moves in lumps at the timer rate rather
+ * than smoothly at the packet rate: the same velocity, delivered in
+ * 44-pixel jumps instead of 11-pixel steps, which is felt as violent.
+ *
+ * THE CONVERSION IS SPLIT SO IT CANNOT OVERFLOW. Multiplying a raw
+ * counter delta by ten million overflows 64 bits after a few weeks of
+ * uptime; taking the whole seconds first keeps every intermediate small.
+ */
+static u64 XcNow100ns(PXC_DEVEXT DevExt)
+{
+	LARGE_INTEGER now;
+	LARGE_INTEGER freq;
+	u64           delta;
+
+	now = KeQueryPerformanceCounter(&freq);
+
+	if (DevExt->ClockFreq == 0) {
+		if (freq.QuadPart <= 0) {
+			/* No usable counter. The coarse clock is wrong for the
+			 * pointer but right for everything else, and a driver
+			 * that refuses to run is worse than a lumpy one. */
+			return (u64)KeQueryInterruptTime();
+		}
+		DevExt->ClockFreq = (u64)freq.QuadPart;
+		DevExt->ClockBase = (u64)now.QuadPart;
+	}
+
+	delta = (u64)now.QuadPart - DevExt->ClockBase;
+
+	return (delta / DevExt->ClockFreq) * 10000000u +
+	       ((delta % DevExt->ClockFreq) * 10000000u) / DevExt->ClockFreq;
+}
+
+#else   /* XBOXCTL_USERMODE */
+
+/*
+ * The harness passes the engine its own timestamps, so this exists
+ * only to satisfy the shared tick path.
+ */
+static u64 XcNow100ns(PXC_DEVEXT DevExt)
+{
+	(void)DevExt;
+	return 0;
+}
+
+#endif  /* XBOXCTL_USERMODE */
+
+#ifndef XBOXCTL_USERMODE
+
 static NTSTATUS XcPollComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
                                PVOID Context)
 {
@@ -423,7 +574,7 @@ static NTSTATUS XcPollComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
 	}
 
 	XcOnTransfer(DevExt, status, slot->Buffer, transferred,
-	             (u64)KeQueryInterruptTime());
+	             XcNow100ns(DevExt));
 
 	XcPollFinish(DevExt, slot->Index, status);
 
@@ -845,7 +996,7 @@ static void NTAPI XcTickDpc(PKDPC Dpc, PVOID Context, PVOID Arg1, PVOID Arg2)
 	}
 
 	KeAcquireSpinLock(&DevExt->CoreLock, &irql);
-	core_tick(&DevExt->Core, (u64)KeQueryInterruptTime());
+	core_tick(&DevExt->Core, XcNow100ns(DevExt));
 	KeReleaseSpinLock(&DevExt->CoreLock, irql);
 }
 
@@ -1881,6 +2032,35 @@ static NTSTATUS XcCmdGetDevices(void *buffer, ULONG out_len, ULONG *written)
 	return STATUS_SUCCESS;
 }
 
+static NTSTATUS XcCmdGetTrace(PXC_DEVEXT dev, void *buffer,
+                              ULONG out_len, ULONG *written)
+{
+	static XC_TRACE trace;
+	KIRQL           irql;
+	ULONG           i, at;
+
+	if (out_len < sizeof(trace)) {
+		return STATUS_BUFFER_TOO_SMALL;
+	}
+
+	RtlZeroMemory(&trace, sizeof(trace));
+
+	KeAcquireSpinLock(&dev->QueueLock, &irql);
+	trace.count   = dev->TraceCount;
+	trace.emitted = dev->TraceEmitted;
+
+	/* Oldest first, so the reader sees them in the order they went out. */
+	at = (dev->TraceHead + XC_TRACE_MAX - dev->TraceCount) % XC_TRACE_MAX;
+	for (i = 0; i < dev->TraceCount; i++) {
+		trace.entry[i] = dev->Trace[(at + i) % XC_TRACE_MAX];
+	}
+	KeReleaseSpinLock(&dev->QueueLock, irql);
+
+	RtlCopyMemory(buffer, &trace, sizeof(trace));
+	*written = (ULONG)sizeof(trace);
+	return STATUS_SUCCESS;
+}
+
 static NTSTATUS XcCmdGetStats(PXC_DEVEXT dev, ULONG index, void *buffer,
                               ULONG out_len, ULONG *written)
 {
@@ -1903,6 +2083,7 @@ static NTSTATUS XcCmdGetStats(PXC_DEVEXT dev, ULONG index, void *buffer,
 	stats.layer            = (u32)dev->Core.layout + 1;
 	stats.rumble_sent      = dev->Rumble.Sent;
 	stats.rumble_errors    = dev->Rumble.Errors;
+	RtlCopyMemory(stats.by_id, dev->ReportsById, sizeof(stats.by_id));
 
 	RtlCopyMemory(buffer, &stats, sizeof(stats));
 	*written = (ULONG)sizeof(stats);
@@ -1972,9 +2153,12 @@ NTSTATUS XcControlCommand(ULONG code, void *buffer, ULONG in_len,
 
 	case IOCTL_XC_GET_CONFIG:
 	case IOCTL_XC_GET_STATS:
+	case IOCTL_XC_GET_TRACE:
 	case IOCTL_XC_RESET_CONFIG:
 	case IOCTL_XC_SET_CONFIG:
 	case IOCTL_XC_SET_RUMBLE:
+	case IOCTL_XC_NUDGE:
+	case IOCTL_XC_RAWMOUSE:
 		if (in_len < sizeof(request)) {
 			status = STATUS_INVALID_PARAMETER;
 			break;
@@ -1993,6 +2177,10 @@ NTSTATUS XcControlCommand(ULONG code, void *buffer, ULONG in_len,
 			break;
 		}
 
+		if (code == IOCTL_XC_GET_TRACE) {
+			status = XcCmdGetTrace(dev, buffer, out_len, written);
+			break;
+		}
 		if (code == IOCTL_XC_GET_STATS) {
 			status = XcCmdGetStats(dev, request.index, buffer,
 			                       out_len, written);
@@ -2005,6 +2193,38 @@ NTSTATUS XcControlCommand(ULONG code, void *buffer, ULONG in_len,
 		}
 		if (code == IOCTL_XC_RESET_CONFIG) {
 			core_set_config_default(&dev->Core);
+			status = STATUS_SUCCESS;
+			break;
+		}
+		if (code == IOCTL_XC_RAWMOUSE) {
+			XC_RAWMOUSE_REQUEST rm;
+
+			if (in_len < sizeof(rm)) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			RtlCopyMemory(&rm, buffer, sizeof(rm));
+
+			/* Straight to the sink: no engine, no filtering. */
+			XcReportSink(dev, CORE_REPORT_ID_MOUSE, rm.payload,
+			             CORE_MOUSE_PAYLOAD);
+			status = STATUS_SUCCESS;
+			break;
+		}
+		if (code == IOCTL_XC_NUDGE) {
+			XC_NUDGE_REQUEST nr;
+			KIRQL            irql;
+
+			if (in_len < sizeof(nr)) {
+				status = STATUS_INVALID_PARAMETER;
+				break;
+			}
+			RtlCopyMemory(&nr, buffer, sizeof(nr));
+
+			KeAcquireSpinLock(&dev->CoreLock, &irql);
+			core_mouse_move(&dev->Core, nr.dx, nr.dy);
+			KeReleaseSpinLock(&dev->CoreLock, irql);
+
 			status = STATUS_SUCCESS;
 			break;
 		}

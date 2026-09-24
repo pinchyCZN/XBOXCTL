@@ -575,11 +575,26 @@ Table of Contents
    changes the layer is not itself re-evaluated under the new layer in
    the same pass.
 
-   THE TIMER TICK RUNS THE SAME LOOP with a stale packet. Repeat
-   deadlines and the mouse accumulator both need a clock independent of
-   packet arrival, so the periodic DPC of analog-to-mouse.txt section
-   3.3 re-enters at step 6 with the last decoded state. One tick, two
-   customers.
+   THE TIMER TICK RUNS THE SAME LOOP with a stale packet, BUT NOT STEP
+   7. Repeat deadlines are a function of time rather than of packet
+   arrival, so the periodic DPC re-enters at step 6 with the last
+   decoded state and keeps a cycle moving when packets are late.
+
+   THE STICK PATH IS NOT RE-ENTERED, AND THAT IS A CORRECTNESS RULE.
+   Integrating a stick position on the tick means that if packets stop -
+   a wedged pipe, a pad gone quiet, a hub that dropped it - the last
+   deflection is replayed forever and the pointer sails off in that
+   direction for as long as the driver is loaded. It looks exactly like
+   a driver computing the wrong direction, and it is not: it is the
+   right direction, applied to input that stopped arriving. The packet
+   rate is also the better clock at 4ms against the tick's 16.
+
+   A PAD THAT GOES QUIET LETS GO OF EVERYTHING. Polling can stall with
+   nothing to show for it - no error, no cancelled transfer, simply no
+   completion - and the last packet then describes a pad that may have
+   been put down mid-press. The tick releases every asserted output
+   after CORE_STALE_MS of silence; real input resumes on the next
+   packet.
 
 10. The Configuration Blob
 

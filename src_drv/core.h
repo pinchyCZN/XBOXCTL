@@ -37,6 +37,7 @@ typedef unsigned long long  u64;
 typedef signed   long long  s64;
 #endif
 
+
 /* ======================================================================
  * THE RAW PACKET
  *
@@ -165,7 +166,7 @@ typedef signed   long long  s64;
  */
 #define CORE_GAMEPAD_PAYLOAD    36
 #define CORE_KEYBOARD_PAYLOAD   8
-#define CORE_MOUSE_PAYLOAD      7
+#define CORE_MOUSE_PAYLOAD      6
 
 /* The largest report the sink will ever be handed, ID byte included. */
 #define CORE_REPORT_MAX_BYTES   (CORE_GAMEPAD_PAYLOAD + 1)
@@ -246,18 +247,28 @@ typedef signed   long long  s64;
 #define CORE_KEY_TRACK_MAX      (CORE_KEY_LAST - CORE_KEY_FIRST + 1)
 
 /*
- * Mouse payload: buttons, 16-bit relative X and Y, wheel, horizontal pan.
+ * Mouse payload: buttons, 16-bit relative X and Y, then an 8-bit wheel.
  *
- * 16-BIT AXES, NOT THE USUAL 8. At high pointer speeds and a low emission
- * rate a single tick can owe more than 127 pixels; an 8-bit axis saturates
- * and the motion is silently lost. Two extra bytes removes the failure mode.
+ * SIXTEEN BITS PER AXIS. A single report can owe more than 127 counts at
+ * a high pointer speed, and a wider axis carries it in one go rather
+ * than over several reports.
+ *
+ * WHAT IS LEFT OVER IS CARRIED, NOT CLAMPED, whatever the width. A
+ * report owing more than the axis holds emits what fits and keeps the
+ * rest for the next one, so the pointer travels the whole distance and
+ * only the delivery is spread.
+ *
+ * THERE IS NO HORIZONTAL PAN. It sat on the Consumer usage page inside
+ * a mouse collection, nothing could drive it, and it is one fewer thing
+ * between this descriptor and the ones known to work.
  */
 #define CORE_MOUSE_BUTTONS      5
 #define CORE_MS_BUTTONS         0
 #define CORE_MS_X               1
 #define CORE_MS_Y               3
 #define CORE_MS_WHEEL           5
-#define CORE_MS_PAN             6
+#define CORE_MS_STEP_MAX        32767
+#define CORE_MS_WHEEL_MAX       127
 
 /* ======================================================================
  * CONFIGURATION
@@ -488,6 +499,13 @@ typedef void (*core_report_fn)(void *ctx, u8 report_id,
  * velocity by it and fling the pointer across the desktop. */
 #define CORE_MAX_TICK_MS        50
 
+/*
+ * How long a silence means the pad is gone rather than idle. The pad
+ * sends every 4ms whether anything moved or not, so a quarter second
+ * of nothing is sixty missed packets and not a quiet moment.
+ */
+#define CORE_STALE_MS           250
+
 /* ======================================================================
  * ENGINE STATE
  * ====================================================================== */
@@ -564,6 +582,7 @@ typedef struct _core_state {
 	u64             last_packet_100ns;
 	u64             last_tick_100ns;
 	int             clock_valid;
+	u8              stale;          /* the pad has gone quiet    */
 
 	/* --- decoded input --- */
 	s32             semiaxis[CORE_SEMIAXIS_COUNT];

@@ -14,7 +14,7 @@
  *
  *     Col01   Gamepad,  report ID 1     16 buttons, 6 axes, a hat
  *     Col02   Keyboard, report ID 2     8 modifiers, 6 key slots
- *     Col03   Mouse,    report ID 3     5 buttons, 16-bit X/Y, wheel, pan
+ *     Col03   Mouse,    report ID 3     5 buttons, X, Y and wheel
  *
  * THE GAMEPAD GOES FIRST because it is the collection a user re-binds
  * inside a game, and hidclass numbers the child devnodes in descriptor
@@ -26,7 +26,87 @@
  * is not an input device.
  * ====================================================================== */
 
+
 static const u8 CORE_HID_DESCRIPTOR_BYTES[] = {
+	/* ---- Mouse, report ID 3 ------------------------------ 77 bytes */
+	0x05, 0x01,             /* Usage Page (Generic Desktop)            */
+	0x09, 0x02,             /* Usage (Mouse)                           */
+	0xA1, 0x01,             /* Collection (Application)                */
+	0x09, 0x01,             /*   Usage (Pointer)                       */
+	0xA1, 0x00,             /*   Collection (Physical)                 */
+	0x85, 0x03,             /*     Report ID (3)                       */
+	0x05, 0x09,             /*     Usage Page (Button)                 */
+	0x19, 0x01,             /*     Usage Minimum (1)                   */
+	0x29, 0x05,             /*     Usage Maximum (5)                   */
+	0x15, 0x00,             /*     Logical Minimum (0)                 */
+	0x25, 0x01,             /*     Logical Maximum (1)                 */
+	0x75, 0x01,             /*     Report Size (1)                     */
+	0x95, 0x05,             /*     Report Count (5) - FIVE buttons     */
+	0x81, 0x02,             /*     Input (Data,Var,Abs)                */
+	0x75, 0x03,             /*     Report Size (3)                     */
+	0x95, 0x01,             /*     Report Count (1)                    */
+	0x81, 0x01,             /*     Input (Const) - pad to a byte       */
+
+	0x05, 0x01,             /*     Usage Page (Generic Desktop)        */
+	0x09, 0x30,             /*     Usage (X)                           */
+	0x09, 0x31,             /*     Usage (Y)                           */
+	0x16, 0x01, 0x80,       /*     Logical Minimum (-32767)            */
+	0x26, 0xFF, 0x7F,       /*     Logical Maximum (32767)             */
+	0x75, 0x10,             /*     Report Size (16)                    */
+	0x95, 0x02,             /*     Report Count (2)                    */
+	0x81, 0x06,             /*     Input (Data,Var,REL)                */
+
+	0x09, 0x38,             /*     Usage (Wheel)                       */
+	0x15, 0x81,             /*     Logical Minimum (-127)              */
+	0x25, 0x7F,             /*     Logical Maximum (127)               */
+	0x75, 0x08,             /*     Report Size (8)                     */
+	0x95, 0x01,             /*     Report Count (1)                    */
+	0x81, 0x06,             /*     Input (Data,Var,REL)                */
+	0xC0,                   /*   End Collection                        */
+	0xC0,                   /* End Collection                          */
+	/* ---- Keyboard, report ID 2 --------------------------- 67 bytes */
+	0x05, 0x01,             /* Usage Page (Generic Desktop)            */
+	0x09, 0x06,             /* Usage (Keyboard)                        */
+	0xA1, 0x01,             /* Collection (Application)                */
+	0x85, 0x02,             /*   Report ID (2)                         */
+	0x05, 0x07,             /*   Usage Page (Keyboard/Keypad)          */
+	0x19, 0xE0,             /*   Usage Minimum (0xE0, LeftControl)     */
+	0x29, 0xE7,             /*   Usage Maximum (0xE7, RightGUI)        */
+	0x15, 0x00,             /*   Logical Minimum (0)                   */
+	0x25, 0x01,             /*   Logical Maximum (1)                   */
+	0x75, 0x01,             /*   Report Size (1)                       */
+	0x95, 0x08,             /*   Report Count (8)                      */
+	0x81, 0x02,             /*   Input (Data,Var,Abs) - modifier byte  */
+	0x95, 0x01,             /*   Report Count (1)                      */
+	0x75, 0x08,             /*   Report Size (8)                       */
+	0x81, 0x01,             /*   Input (Const) - the reserved byte     */
+
+	/*
+	 * The LED output report is genuine: Windows really does send Num Lock
+	 * and Caps Lock changes down. They are accepted and discarded, which
+	 * matches the hardware. Refusing them makes Windows decide the
+	 * keyboard is broken.
+	 */
+	0x95, 0x05,             /*   Report Count (5)                      */
+	0x75, 0x01,             /*   Report Size (1)                       */
+	0x05, 0x08,             /*   Usage Page (LED)                      */
+	0x19, 0x01,             /*   Usage Minimum (1, NumLock)            */
+	0x29, 0x05,             /*   Usage Maximum (5, Kana)               */
+	0x91, 0x02,             /*   Output (Data,Var,Abs) - five LEDs     */
+	0x95, 0x01,             /*   Report Count (1)                      */
+	0x75, 0x03,             /*   Report Size (3)                       */
+	0x91, 0x01,             /*   Output (Const) - pad the LED byte     */
+
+	0x95, 0x06,             /*   Report Count (6) - SIX key slots      */
+	0x75, 0x08,             /*   Report Size (8)                       */
+	0x15, 0x00,             /*   Logical Minimum (0)                   */
+	0x26, 0xA4, 0x00,       /*   Logical Maximum (0xA4)                */
+	0x05, 0x07,             /*   Usage Page (Keyboard/Keypad)          */
+	0x19, 0x00,             /*   Usage Minimum (0)                     */
+	0x2A, 0xA4, 0x00,       /*   Usage Maximum (0xA4)                  */
+	0x81, 0x00,             /*   Input (Data,ARRAY)                    */
+	0xC0,                   /* End Collection                          */
+
 	/* ---- Gamepad, report ID 1 --------------------------- 135 bytes */
 	0x05, 0x01,             /* Usage Page (Generic Desktop)            */
 	0x09, 0x05,             /* Usage (Gamepad)                         */
@@ -126,92 +206,6 @@ static const u8 CORE_HID_DESCRIPTOR_BYTES[] = {
 	0x95, 0x02,             /*   Report Count (2)                      */
 	0x91, 0x02,             /*   Output (Data,Var,Abs) - rumble        */
 	0xC0,                   /* End Collection                          */
-
-	/* ---- Keyboard, report ID 2 --------------------------- 67 bytes */
-	0x05, 0x01,             /* Usage Page (Generic Desktop)            */
-	0x09, 0x06,             /* Usage (Keyboard)                        */
-	0xA1, 0x01,             /* Collection (Application)                */
-	0x85, 0x02,             /*   Report ID (2)                         */
-	0x05, 0x07,             /*   Usage Page (Keyboard/Keypad)          */
-	0x19, 0xE0,             /*   Usage Minimum (0xE0, LeftControl)     */
-	0x29, 0xE7,             /*   Usage Maximum (0xE7, RightGUI)        */
-	0x15, 0x00,             /*   Logical Minimum (0)                   */
-	0x25, 0x01,             /*   Logical Maximum (1)                   */
-	0x75, 0x01,             /*   Report Size (1)                       */
-	0x95, 0x08,             /*   Report Count (8)                      */
-	0x81, 0x02,             /*   Input (Data,Var,Abs) - modifier byte  */
-	0x95, 0x01,             /*   Report Count (1)                      */
-	0x75, 0x08,             /*   Report Size (8)                       */
-	0x81, 0x01,             /*   Input (Const) - the reserved byte     */
-
-	/*
-	 * The LED output report is genuine: Windows really does send Num Lock
-	 * and Caps Lock changes down. They are accepted and discarded, which
-	 * matches the hardware. Refusing them makes Windows decide the
-	 * keyboard is broken.
-	 */
-	0x95, 0x05,             /*   Report Count (5)                      */
-	0x75, 0x01,             /*   Report Size (1)                       */
-	0x05, 0x08,             /*   Usage Page (LED)                      */
-	0x19, 0x01,             /*   Usage Minimum (1, NumLock)            */
-	0x29, 0x05,             /*   Usage Maximum (5, Kana)               */
-	0x91, 0x02,             /*   Output (Data,Var,Abs) - five LEDs     */
-	0x95, 0x01,             /*   Report Count (1)                      */
-	0x75, 0x03,             /*   Report Size (3)                       */
-	0x91, 0x01,             /*   Output (Const) - pad the LED byte     */
-
-	0x95, 0x06,             /*   Report Count (6) - SIX key slots      */
-	0x75, 0x08,             /*   Report Size (8)                       */
-	0x15, 0x00,             /*   Logical Minimum (0)                   */
-	0x26, 0xA4, 0x00,       /*   Logical Maximum (0xA4)                */
-	0x05, 0x07,             /*   Usage Page (Keyboard/Keypad)          */
-	0x19, 0x00,             /*   Usage Minimum (0)                     */
-	0x2A, 0xA4, 0x00,       /*   Usage Maximum (0xA4)                  */
-	0x81, 0x00,             /*   Input (Data,ARRAY)                    */
-	0xC0,                   /* End Collection                          */
-
-	/* ---- Mouse, report ID 3 ------------------------------ 77 bytes */
-	0x05, 0x01,             /* Usage Page (Generic Desktop)            */
-	0x09, 0x02,             /* Usage (Mouse)                           */
-	0xA1, 0x01,             /* Collection (Application)                */
-	0x09, 0x01,             /*   Usage (Pointer)                       */
-	0xA1, 0x00,             /*   Collection (Physical)                 */
-	0x85, 0x03,             /*     Report ID (3)                       */
-	0x05, 0x09,             /*     Usage Page (Button)                 */
-	0x19, 0x01,             /*     Usage Minimum (1)                   */
-	0x29, 0x05,             /*     Usage Maximum (5)                   */
-	0x15, 0x00,             /*     Logical Minimum (0)                 */
-	0x25, 0x01,             /*     Logical Maximum (1)                 */
-	0x75, 0x01,             /*     Report Size (1)                     */
-	0x95, 0x05,             /*     Report Count (5) - FIVE buttons     */
-	0x81, 0x02,             /*     Input (Data,Var,Abs)                */
-	0x75, 0x03,             /*     Report Size (3)                     */
-	0x95, 0x01,             /*     Report Count (1)                    */
-	0x81, 0x01,             /*     Input (Const) - pad to a byte       */
-
-	0x05, 0x01,             /*     Usage Page (Generic Desktop)        */
-	0x09, 0x30,             /*     Usage (X)                           */
-	0x09, 0x31,             /*     Usage (Y)                           */
-	0x16, 0x01, 0x80,       /*     Logical Minimum (-32767)            */
-	0x26, 0xFF, 0x7F,       /*     Logical Maximum (32767)             */
-	0x75, 0x10,             /*     Report Size (16) - SIXTEEN BITS     */
-	0x95, 0x02,             /*     Report Count (2)                    */
-	0x81, 0x06,             /*     Input (Data,Var,REL)                */
-
-	0x09, 0x38,             /*     Usage (Wheel)                       */
-	0x15, 0x81,             /*     Logical Minimum (-127)              */
-	0x25, 0x7F,             /*     Logical Maximum (127)               */
-	0x75, 0x08,             /*     Report Size (8)                     */
-	0x95, 0x01,             /*     Report Count (1)                    */
-	0x81, 0x06,             /*     Input (Data,Var,REL)                */
-
-	0x05, 0x0C,             /*     Usage Page (Consumer)               */
-	0x0A, 0x38, 0x02,       /*     Usage (AC Pan)                      */
-	0x75, 0x08,             /*     Report Size (8)                     */
-	0x95, 0x01,             /*     Report Count (1)                    */
-	0x81, 0x06,             /*     Input (Data,Var,REL)                */
-	0xC0,                   /*   End Collection                        */
-	0xC0                    /* End Collection                          */
 };
 
 const u8 *core_hid_descriptor(u32 *length)
@@ -1207,8 +1201,6 @@ static void core_evaluate(core_state *cs, u64 now_100ns)
 		}
 		core_apply_binding(cs, b, &cs->bind[layer][i], now_100ns);
 	}
-
-	core_sticks(cs, now_100ns);
 }
 
 static void core_build_gamepad(core_state *cs, u8 *payload)
@@ -1378,22 +1370,29 @@ void core_key_event(core_state *cs, u8 usage, int down)
 
 static void core_emit_mouse(core_state *cs)
 {
-	u8 payload[CORE_MOUSE_PAYLOAD];
+	u8  payload[CORE_MOUSE_PAYLOAD];
+	s32 dx, dy, wheel;
+
+	/*
+	 * CARRY WHAT WILL NOT FIT, DO NOT DROP IT. One byte holds 127
+	 * counts; anything beyond that stays in the accumulator and goes
+	 * out on the next report, so a fast flick travels the right
+	 * distance and only takes an extra few milliseconds to do it.
+	 */
+	dx    = core_clamp(cs->ms.dx, -CORE_MS_STEP_MAX, CORE_MS_STEP_MAX);
+	dy    = core_clamp(cs->ms.dy, -CORE_MS_STEP_MAX, CORE_MS_STEP_MAX);
+	wheel = core_clamp(cs->ms.wheel, -CORE_MS_WHEEL_MAX, CORE_MS_WHEEL_MAX);
 
 	core_zero(payload, CORE_MOUSE_PAYLOAD);
 	payload[CORE_MS_BUTTONS] = cs->ms.buttons;
-	core_put16(&payload[CORE_MS_X], core_clamp(cs->ms.dx, -CORE_OUT_AXIS_SCALE,
-	                                           CORE_OUT_AXIS_SCALE));
-	core_put16(&payload[CORE_MS_Y], core_clamp(cs->ms.dy, -CORE_OUT_AXIS_SCALE,
-	                                           CORE_OUT_AXIS_SCALE));
-	payload[CORE_MS_WHEEL] = (u8)(s8)core_clamp(cs->ms.wheel, -127, 127);
-	payload[CORE_MS_PAN]   = (u8)(s8)core_clamp(cs->ms.pan, -127, 127);
+	core_put16(&payload[CORE_MS_X], dx);
+	core_put16(&payload[CORE_MS_Y], dy);
+	payload[CORE_MS_WHEEL]   = (u8)(s8)wheel;
 
-	/* Movement is relative: once reported it is spent. */
-	cs->ms.dx = 0;
-	cs->ms.dy = 0;
-	cs->ms.wheel = 0;
-	cs->ms.pan = 0;
+	cs->ms.dx    -= dx;
+	cs->ms.dy    -= dy;
+	cs->ms.wheel -= wheel;
+	cs->ms.pan    = 0;      /* nothing carries it to the host */
 
 	core_emit(cs, CORE_REPORT_ID_MOUSE, payload, CORE_MOUSE_PAYLOAD);
 }
@@ -1520,6 +1519,20 @@ void core_on_packet(core_state *cs, const u8 *raw, u32 len, u64 now_100ns)
 
 	core_decode(cs);
 	core_evaluate(cs, now_100ns);
+
+	/*
+	 * THE POINTER ADVANCES ONLY ON A PACKET, and that is a correctness
+	 * rule rather than an optimisation. Integrating a stick position on
+	 * the periodic tick means that if packets stop - a wedged pipe, a
+	 * pad that has gone quiet, a hub that dropped it - the last
+	 * deflection keeps being replayed and the pointer sails off in that
+	 * direction for as long as the driver is loaded.
+	 *
+	 * The packet rate is also the better clock: 4ms against the tick's
+	 * 16, on a signal that only changes when a packet arrives anyway.
+	 */
+	core_sticks(cs, now_100ns);
+
 	core_emit_gamepad(cs);
 }
 
@@ -1551,21 +1564,45 @@ void core_tick(core_state *cs, u64 now_100ns)
 
 	(void)elapsed_ms;
 
-	/*
-	 * RE-RUN THE EVALUATION ON THE LAST PACKET SEEN. Repeat
-	 * deadlines are a function of time rather than of packet
-	 * arrival, so a cycle has to keep moving even when nothing new
-	 * has come in. Packets normally get there first at 4ms against
-	 * this timer's 16; this is what covers the gap when they do
-	 * not.
-	 *
-	 * WITH NO PACKET YET THERE IS NOTHING TO EVALUATE, and the
-	 * decoded state would be all zeroes rather than merely stale.
-	 */
-	if (cs->raw_valid) {
-		core_evaluate(cs, now_100ns);
-		core_emit_gamepad(cs);
+	if (!cs->raw_valid) {
+		return;         /* nothing decoded yet, nothing to re-run */
 	}
+
+	/*
+	 * A PAD THAT HAS GONE QUIET LETS GO OF EVERYTHING.
+	 *
+	 * Polling can stall with nothing to show for it - no error, no
+	 * cancelled transfer, simply no completion - and the last packet
+	 * then describes a pad that may have been put down mid-press.
+	 * Anything held at that moment would stay held: a key repeating
+	 * into a document, a mouse button down, a trigger autofiring.
+	 *
+	 * Releasing is the only safe reading of silence. Real input
+	 * resumes on the next packet.
+	 */
+	if (now_100ns > cs->last_packet_100ns &&
+	    now_100ns - cs->last_packet_100ns >
+	    (u64)CORE_STALE_MS * CORE_100NS_PER_MS) {
+		if (!cs->stale) {
+			cs->stale = 1;
+			core_release_all(cs);
+			core_emit_gamepad(cs);
+		}
+		return;
+	}
+	cs->stale = 0;
+
+	/*
+	 * RE-RUN THE EVALUATION ON THE LAST PACKET SEEN. Repeat deadlines
+	 * are a function of time rather than of packet arrival, so a cycle
+	 * has to keep moving even when nothing new has come in. Packets
+	 * normally get there first at 4ms against this timer's 16; this is
+	 * what covers the gap when they do not.
+	 *
+	 * THE STICKS ARE NOT RUN HERE - see core_on_packet.
+	 */
+	core_evaluate(cs, now_100ns);
+	core_emit_gamepad(cs);
 }
 
 /* ======================================================================

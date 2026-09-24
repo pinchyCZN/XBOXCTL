@@ -154,7 +154,7 @@ Table of Contents
    | Col01 | Gamepad  |         1 | 24 buttons, 7 axes, a hat, and a   |
    |       |          |           | 21-byte diagnostic tail            |
    | Col02 | Keyboard |         2 | 8 modifiers, 6 key slots, 5 LEDs   |
-   | Col03 | Mouse    |         3 | 5 buttons, 16-bit X/Y, wheel, pan  |
+   | Col03 | Mouse    |         3 | 5 buttons, then X, Y and wheel     |
    +-------+----------+-----------+------------------------------------+
 
    THE GAMEPAD GOES FIRST because it is the collection a user re-binds
@@ -225,19 +225,33 @@ Table of Contents
    list keeps being tracked internally, so releasing back to six restores
    it with no fresh press.
 
-   Input report 3, mouse, 8 bytes:
+   Input report 3, mouse, 5 bytes:
 
        byte 0      report ID = 3
        byte 1      bits 0..4 buttons 1..5, bits 5..7 padding
-       byte 2..3   X, signed 16-bit, relative
-       byte 4..5   Y, signed 16-bit, relative
-       byte 6      vertical wheel, signed 8-bit
-       byte 7      horizontal pan, signed 8-bit
+       byte 2      X, signed 8-bit, relative
+       byte 3      Y, signed 8-bit, relative
+       byte 4      vertical wheel, signed 8-bit
 
-   16-BIT AXES, NOT THE USUAL 8. At high pointer speeds and a low
-   emission rate a single tick can owe more than 127 pixels; an 8-bit axis
-   saturates and the motion is silently lost. Two extra bytes removes the
-   failure mode. See analog-to-mouse.txt section 11.
+   EIGHT BITS PER AXIS, AND THE REASON IS EMPIRICAL RATHER THAN
+   TECHNICAL. A 16-bit axis is legal HID and parses correctly - the
+   descriptor was decoded item by item and the fields land exactly where
+   this document says. On the test machine the pointer nonetheless ran to
+   a corner whatever was sent, including a single injected report of a
+   known delta. The Adaptoid's 8-bit mouse works on the same machine, so
+   this collection is now byte for byte the shape the Adaptoid uses:
+   three signed bytes for X, Y and wheel, and no AC Pan item.
+
+   THE SATURATION THAT ARGUED FOR 16 BITS IS HANDLED BY CARRYING. A
+   report owing more than 127 counts emits 127 and keeps the rest for
+   the next one, so the pointer travels the whole distance and only the
+   delivery is spread. At 250 Hz a report owes about eleven counts at
+   the default speed, so it rarely arises at all.
+
+   THERE IS NO HORIZONTAL PAN. It sat on the Consumer usage page inside
+   a mouse collection, which is legal and was dropped with the 16-bit
+   axes rather than left as the one remaining difference from a
+   descriptor known to work here.
 
    THE WHEEL IS REALLY DRIVABLE. The Adaptoid declares one and nothing in
    that driver can ever write a non-zero value to it. Binding a trigger or

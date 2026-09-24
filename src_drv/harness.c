@@ -395,9 +395,17 @@ static int test_descriptor(void)
 	 */
 	check_eq(n_top, 3, "three named top-level collections");
 	if (n_top == 3) {
-		check_eq(top_usages[0], 0x05, "Col01 is a Gamepad");
+		/*
+		 * THE MOUSE COMES FIRST, AND THE ORDER IS LOAD-BEARING.
+		 * With the gamepad declared first, this same mouse
+		 * collection - byte for byte - made the pointer jump 157
+		 * pixels diagonally on an all-zero report and produced
+		 * phantom keystrokes and wheel events. Mouse first is the
+		 * order the Adaptoid uses and the order that works.
+		 */
+		check_eq(top_usages[0], 0x02, "Col01 is a Mouse");
 		check_eq(top_usages[1], 0x06, "Col02 is a Keyboard");
-		check_eq(top_usages[2], 0x02, "Col03 is a Mouse");
+		check_eq(top_usages[2], 0x05, "Col03 is a Gamepad");
 	}
 
 	/*
@@ -667,12 +675,33 @@ static int test_mouse(void)
 	core_mouse_button(&cs, 1, 1);
 	check_eq((long)g_SinkCount, 0, "repeat press emits nothing");
 
-	/* 16-bit axes carry what an 8-bit one would saturate. */
+	/*
+	 * A DELTA LARGER THAN ONE BYTE IS CARRIED, NOT CLAMPED. One report
+	 * takes 127 counts and the rest waits for the next one, so the
+	 * pointer travels the whole distance; only the delivery is spread.
+	 */
 	sink_reset();
-	core_mouse_move(&cs, 5000, -5000);
+	core_mouse_move(&cs, 40000, -40000);
 	check_eq((s16)(g_Sink[0].payload[CORE_MS_X] |
-	               (g_Sink[0].payload[CORE_MS_X + 1] << 8)), 5000,
-	         "a 5000 pixel delta survives the wire");
+	               (g_Sink[0].payload[CORE_MS_X + 1] << 8)),
+	         CORE_MS_STEP_MAX,
+	         "a delta wider than the axis fills one report to the brim");
+	check_eq((long)cs.ms.dx, 40000 - CORE_MS_STEP_MAX,
+	         "AND THE REMAINDER IS KEPT");
+
+	sink_reset();
+	core_mouse_move(&cs, 0, 0);
+	check_eq((long)g_SinkCount, 0,
+	         "a zero move still emits nothing, even with a remainder"
+	         " pending - the next real report carries it");
+	sink_reset();
+	core_mouse_move(&cs, 1, -1);
+	check_eq((s16)(g_Sink[0].payload[CORE_MS_X] |
+	               (g_Sink[0].payload[CORE_MS_X + 1] << 8)),
+	         40000 - CORE_MS_STEP_MAX + 1,
+	         "and the next report carries the whole remainder, which now"
+	         " fits");
+	check_eq((long)cs.ms.dx, 0, "leaving nothing owed");
 
 	/* Buttons outside the declared range are ignored, not clamped. */
 	sink_reset();
@@ -2204,6 +2233,69 @@ static int test_sticks(void)
 	      " down-positive one, so inverting again here would aim the"
 	      " wrong way out of the box");
 
+	/* --- A PAD THAT GOES QUIET STOPS THE POINTER ------------------ */
+	core_init(&cs, recording_sink, NULL);
+	stick_config(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+
+	/* Hold the stick over, then stop delivering packets and let the
+	 * periodic tick run on by itself. */
+	stick_hold(&cs, 32767, 0, &t, 10);
+	sink_reset();
+	{
+		int k;
+
+		for (k = 0; k < 200; k++) {     /* 3.2 seconds of ticks */
+			t += 16 * CORE_100NS_PER_MS;
+			core_tick(&cs, t);
+		}
+	}
+	sink_mouse_total(&dx, &dy);
+	check_eq(dx, 0,
+	         "THE TICK DOES NOT MOVE THE POINTER. Integrating the last"
+	         " stick position on the tick means a pad that stops"
+	         " delivering sails the cursor off in whatever direction it"
+	         " was last pushed, for as long as the driver is loaded");
+	check_eq(dy, 0, "on either axis");
+
+	/* --- and a pad that goes quiet lets go of what it held --------- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	cfg.layout[0].binding[1].source = CORE_SA_A;
+	cfg.layout[0].binding[1].action = CORE_ACT_KEY;
+	cfg.layout[0].binding[1].code   = 0x1A;         /* W */
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+	{
+		u8  packet[CORE_RAW_PACKET_BYTES];
+		int k;
+
+		make_packet(packet);
+		packet[CORE_RAW_ANALOG_BASE + 0] = 255;         /* hold A */
+		for (k = 0; k < 4; k++) {
+			t += 4 * CORE_100NS_PER_MS;
+			core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t);
+		}
+		check_eq(cs.kb.count, 1, "A is holding W down");
+
+		/* Packets stop. The tick runs on. */
+		for (k = 0; k < 40; k++) {
+			t += 16 * CORE_100NS_PER_MS;
+			core_tick(&cs, t);
+		}
+		check_eq(cs.kb.count, 0,
+		         "AND A QUARTER SECOND OF SILENCE RELEASES IT. A pad put"
+		         " down mid-press would otherwise type into a document"
+		         " until it was unplugged");
+
+		/* Real input resumes on the next packet. */
+		t += 4 * CORE_100NS_PER_MS;
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t);
+		check_eq(cs.kb.count, 1, "and the next packet takes it back");
+	}
+
 	/* --- acceleration builds with time held ----------------------- */
 	core_init(&cs, recording_sink, NULL);
 	stick_config(&cfg);
@@ -2354,6 +2446,102 @@ static int test_rumble(void)
 }
 
 /* ======================================================================
+ * READS ARE SIZED PER COLLECTION
+ *
+ * hidclass makes one child device per top-level collection and sizes each
+ * child's reads to that collection's largest report: five bytes for the
+ * mouse, eight for the keyboard, thirty-seven for the gamepad. They all
+ * arrive as IOCTL_HID_READ_REPORT on one device and nothing in the IRP
+ * says which child sent it.
+ *
+ * COMPLETING THE WRONG ONE IS A KERNEL BUFFER OVERFLOW, not a wrong
+ * value. A gamepad report written into the mouse child's buffer goes
+ * thirty-two bytes past its end into hidclass's memory, and the damage
+ * comes back as input nobody generated.
+ * ====================================================================== */
+
+/*
+ * An IRP shaped like the one hidclass parks on us for a read: a buffer
+ * and, crucially, the length of that buffer in the stack location.
+ */
+static IO_STACK_LOCATION g_ReadStack[4];
+static int               g_ReadStackNext;
+
+static void harness_make_read(PIRP Irp, UCHAR *Buffer, ULONG Length)
+{
+	PIO_STACK_LOCATION stack = &g_ReadStack[g_ReadStackNext++ % 4];
+
+	memset(Irp, 0, sizeof(*Irp));
+	memset(stack, 0, sizeof(*stack));
+	stack->Parameters.DeviceIoControl.OutputBufferLength = Length;
+	Irp->KstubStack = stack;
+	Irp->UserBuffer = Buffer;
+}
+
+static int test_readfit(void)
+{
+	static XC_DEVEXT devext;
+	static UCHAR     small[8];
+	static UCHAR     large[64];
+	static IRP       irp_small;
+	static IRP       irp_large;
+	u8               payload[CORE_GAMEPAD_PAYLOAD];
+	int              i;
+
+	XcDevExtInit(&devext);
+
+	/* Two parked reads: a mouse-sized one first, then a gamepad-sized
+	 * one, which is the order that produces the overflow. */
+	for (i = 0; i < (int)sizeof(small); i++)  { small[i] = 0xAA; }
+	for (i = 0; i < (int)sizeof(large); i++)  { large[i] = 0xAA; }
+
+	harness_make_read(&irp_small, small, CORE_MOUSE_PAYLOAD + 1);
+	harness_make_read(&irp_large, large, CORE_GAMEPAD_PAYLOAD + 1);
+	XcQueueRead(&devext, &irp_small);
+	XcQueueRead(&devext, &irp_large);
+	check_eq((long)devext.PendingReadCount, 2, "two reads parked");
+
+	/* A gamepad report must not take the five-byte read. */
+	for (i = 0; i < CORE_GAMEPAD_PAYLOAD; i++) { payload[i] = (u8)i; }
+	XcReportSink(&devext, CORE_REPORT_ID_GAMEPAD, payload,
+	             CORE_GAMEPAD_PAYLOAD);
+
+	check_eq(small[CORE_MOUSE_PAYLOAD + 1], 0xAA,
+	         "A 37-BYTE REPORT DID NOT OVERRUN THE 5-BYTE READ. Taking"
+	         " whichever read is at the head of the list writes 32 bytes"
+	         " into hidclass's memory, and the damage returns as"
+	         " keystrokes and wheel events nobody generated");
+	check_eq(large[0], CORE_REPORT_ID_GAMEPAD,
+	         "it went to the read that could hold it");
+	check_eq(devext.PendingReadCount, 1,
+	         "and only that read was consumed");
+
+	/* The small read is still parked, and a mouse report fits it. */
+	XcReportSink(&devext, CORE_REPORT_ID_MOUSE, payload,
+	             CORE_MOUSE_PAYLOAD);
+	check_eq(small[0], CORE_REPORT_ID_MOUSE,
+	         "and a report that fits still reaches it");
+	check_eq(devext.PendingReadCount, 0, "both reads are now used");
+
+	/*
+	 * WITH NO READ BIG ENOUGH, THE REPORT QUEUES rather than being
+	 * forced into a buffer that cannot hold it.
+	 */
+	XcDevExtInit(&devext);
+	for (i = 0; i < (int)sizeof(small); i++) { small[i] = 0xAA; }
+	harness_make_read(&irp_small, small, CORE_MOUSE_PAYLOAD + 1);
+	XcQueueRead(&devext, &irp_small);
+
+	XcReportSink(&devext, CORE_REPORT_ID_GAMEPAD, payload,
+	             CORE_GAMEPAD_PAYLOAD);
+	check_eq(small[0], 0xAA, "the undersized read was left alone");
+	check_eq((long)devext.PendingReadCount, 1, "and left parked");
+	check_eq((long)devext.ReportCount, 1, "the report waits in the queue");
+
+	return 0;
+}
+
+/* ======================================================================
  * THE REGISTRATION CONTRACT
  * ====================================================================== */
 
@@ -2477,6 +2665,77 @@ int main(int argc, char **argv)
 	if (argc == 3 && strcmp(argv[1], "--load") == 0) {
 		return load_blob(argv[2]);
 	}
+	if (argc == 3 && strcmp(argv[1], "--mouse") == 0) {
+		/* Replay a blob against a few stick positions and print
+		 * what the pointer path actually emits. */
+		static core_config cfg;
+		static core_state  cs;
+		static u8          blob[8192];
+		u8                 packet[CORE_RAW_PACKET_BYTES];
+		u32                len;
+		FILE              *in;
+		int                rc, i, k;
+		u64                t = 1000;
+		static const struct { const char *name; s16 x, y; } POS[] = {
+			{ "centre     ",      0,      0 },
+			{ "right      ",  32767,      0 },
+			{ "left       ", -32767,      0 },
+			{ "up         ",      0,  32767 },
+			{ "down       ",      0, -32767 },
+			{ "up-right   ",  32767,  32767 },
+			{ "half right ",  16383,      0 }
+		};
+
+		in = fopen(argv[2], "rb");
+		if (!in) {
+			printf("  cannot read %s\n", argv[2]);
+			return 1;
+		}
+		len = (u32)fread(blob, 1, sizeof(blob), in);
+		fclose(in);
+
+		core_init(&cs, recording_sink, NULL);
+		rc = core_set_config(&cs, blob, len, NULL);
+		if (rc != CORE_CFG_OK) {
+			printf("  blob rejected, code %d\n", rc);
+			return 1;
+		}
+
+		cfg = cs.cfg;
+		printf("  stick 0 mode %u   stick 1 mode %u\n",
+		       cfg.stick[0].mode, cfg.stick[1].mode);
+		printf("  claim %08lX   deadzone %u/%u  speed %u"
+		       "  gain %u/%u  invert %u/%u\n",
+		       (unsigned long)cfg.stick_claim,
+		       cfg.stick[1].deadzone, cfg.stick[1].outer,
+		       cfg.stick[1].max_speed,
+		       cfg.stick[1].gain_x, cfg.stick[1].gain_y,
+		       cfg.stick[1].invert_x, cfg.stick[1].invert_y);
+		printf("\n  position      dx      dy   (one second of 4ms packets)\n");
+
+		for (i = 0; i < (int)(sizeof(POS) / sizeof(POS[0])); i++) {
+			long dx, dy;
+
+			make_packet(packet);
+			put_le16(&packet[CORE_RAW_RSTICK_X], POS[i].x);
+			put_le16(&packet[CORE_RAW_RSTICK_Y], POS[i].y);
+			for (k = 0; k < 3; k++) {
+				t += 4 * CORE_100NS_PER_MS;
+				core_on_packet(&cs, packet,
+				               CORE_RAW_PACKET_BYTES, t);
+			}
+			sink_reset();
+			for (k = 0; k < 250; k++) {
+				t += 4 * CORE_100NS_PER_MS;
+				core_on_packet(&cs, packet,
+				               CORE_RAW_PACKET_BYTES, t);
+			}
+			sink_mouse_total(&dx, &dy);
+			printf("  %s %7ld %7ld\n",
+			       POS[i].name, dx, dy);
+		}
+		return 0;
+	}
 	if (argc == 2 && strcmp(argv[1], "--ioctls") == 0) {
 		/* THE CODES AS THE MACRO BUILDS THEM. A user-mode
 		 * tool computes the same arithmetic by hand, and a
@@ -2497,6 +2756,12 @@ int main(int argc, char **argv)
 		       (unsigned long)IOCTL_XC_RESET_CONFIG);
 		printf("SET_RUMBLE    0x%08lX\n",
 		       (unsigned long)IOCTL_XC_SET_RUMBLE);
+		printf("GET_TRACE     0x%08lX\n",
+		       (unsigned long)IOCTL_XC_GET_TRACE);
+		printf("NUDGE         0x%08lX\n",
+		       (unsigned long)IOCTL_XC_NUDGE);
+		printf("RAWMOUSE      0x%08lX\n",
+		       (unsigned long)IOCTL_XC_RAWMOUSE);
 		return 0;
 	}
 
@@ -2519,6 +2784,7 @@ int main(int argc, char **argv)
 	printf("[autofire]\n");     test_autofire();
 	printf("[sticks]\n");       test_sticks();
 	printf("[rumble]\n");       test_rumble();
+	printf("[readfit]\n");      test_readfit();
 	printf("[registration]\n"); test_driver_entry();
 
 	printf("---------------\n");

@@ -302,24 +302,48 @@ Table of Contents
    full speed, where the unit is a 1ms frame, so a packet arrives every
    4ms. The stick path therefore needs no timer of its own.
 
-   IF THE MEASURED PACKET RATE IS BELOW THE CONFIGURED EMISSION RATE,
-   interpolate. Run a periodic DPC at the emission rate that advances the
-   accumulator from the LAST KNOWN velocity, and let a packet arrival
-   update that velocity and advance the accumulator by the time since the
-   previous advance. A stick held still is the common case and
-   interpolating it is exactly right; a stick in motion is served one
-   packet late, which is already true.
+   THE ACCUMULATOR ADVANCES ONLY ON A PACKET, AND NOTHING ELSE MAY
+   ADVANCE IT. This is a correctness rule, not a performance choice.
 
-   THAT SAME TICK IS THE AUTOFIRE CLOCK. One periodic DPC serves both,
-   which is a reason to have it even when the packet rate is adequate.
-   See mapping-engine.txt section 6.
+   Interpolating between packets from the last known velocity looks
+   attractive and is a trap. Polling can stall with nothing to show for
+   it - no error, no cancelled transfer, simply no completion - and an
+   interpolator cannot tell that from a stick held still. It replays the
+   last deflection forever, and the pointer sails off in that direction
+   for as long as the driver is loaded. The symptom is indistinguishable
+   from a driver computing the wrong direction; it is the right
+   direction applied to input that stopped arriving.
+
+   THE AUTOFIRE TICK IS A SEPARATE CUSTOMER. A periodic DPC is still
+   needed for repeat deadlines, which really are a function of time
+   rather than of packet arrival, and it re-enters the binding walk with
+   the last decoded state. It does NOT re-enter the stick path. See
+   mapping-engine.txt section 9.
+
+   THAT TICK ALSO WATCHES FOR SILENCE. After CORE_STALE_MS with no
+   packet it releases every asserted output, because a pad that stopped
+   talking may have been put down mid-press and nothing else would ever
+   let go.
 
 3.4.  Timebase And Hitches
 
-   Advance the accumulator by MEASURED elapsed time, from
-   KeQueryInterruptTime, not by the nominal tick period. A dropped or
-   late packet then costs nothing, because the next one carries the
-   missing interval.
+   Advance the accumulator by MEASURED elapsed time, not by the nominal
+   packet period. A dropped or late packet then costs nothing, because
+   the next one carries the missing interval.
+
+   NOT FROM KeQueryInterruptTime, AND THIS IS THE TRAP THE UNITS HIDE.
+   That clock is expressed in 100ns units but ADVANCES ONLY ON THE
+   SYSTEM TIMER TICK, about every 15.6ms. Against a 4ms packet rate,
+   three packets in four measure an elapsed time of exactly zero and the
+   fourth measures the whole tick, so the pointer moves in 44-pixel
+   jumps at 64 Hz instead of 11-pixel steps at 250 Hz. The velocity is
+   correct and the motion is unusable - it reads as violent rather than
+   fast, and it defeats the sub-pixel accumulator entirely.
+
+   Use KeQueryPerformanceCounter, whose resolution is sub-microsecond.
+   Convert the delta to 100ns units in two steps, whole seconds first,
+   or multiplying a raw counter delta by ten million overflows 64 bits
+   after a few weeks of uptime.
 
    CLAMP THE ELAPSED TIME. A resume from sleep, a long DPC starvation or
    a debugger break can hand you an interval of seconds, and multiplying

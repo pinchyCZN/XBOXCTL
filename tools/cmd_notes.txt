@@ -7,6 +7,13 @@ verifier /standard /faults 2000 /driver xboxctl.sys
 
 verifier /flags 0x20BBB /driver xboxctl.sys
 
+verifier /flags 0xA0BBB /driver xboxctl.sys
+
+verifier /flags 0x609BB /driver xboxctl.sys
+verifier /faultssystematic resetruntime
+verifier /faultssystematic enableruntime
+verifier /faultssystematic querystatistics
+
 verifier /query
 
 verifier /querysettings
@@ -24,6 +31,10 @@ powershell -ExecutionPolicy Bypass -File hidread.ps1 -Buttons
 
 powershell -ExecutionPolicy Bypass -File hidread.ps1 -nosticks
 
+hidread.ps1 -Col 3
+
 powershell -ExecutionPolicy Bypass -File xbctl.ps1 set -Path arcade.bin
 
-powershell -ExecutionPolicy Bypass -File xbctl.ps1 rumble 200 200
+powershell -ExecutionPolicy Bypass -File xbctl.ps1 stats
+
+powershell -ExecutionPolicy Bypass -File xbctl.ps1 rumble 50 50
