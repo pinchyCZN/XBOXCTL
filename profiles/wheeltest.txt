@@ -51,8 +51,16 @@ start+back -> layer_cycle 1
 # from, which is why it is in both.
 ltrigger -> layer_hold 2
 
-rtrigger -> mouse_button 1
-a -> key space
+# PRESS HARDER TO AUTOFIRE. A light squeeze holds the mouse button down
+# the way it always did; push the trigger past 'hard' and it starts
+# clicking at 12 Hz, and easing off goes back to a plain hold without
+# ever letting go. Semi-automatic and automatic on one trigger, which is
+# the only thing this pad's analog buttons are read for.
+rtrigger -> mouse_button 1 repeat 12 hard 69%
+# A hard press on A autofires the letter a. 12 Hz, not 100 - the driver
+# caps a repeat at half the tick rate, and a key going down and up a
+# hundred times a second floods the keyboard path for no benefit.
+a -> key a repeat 12 hard 75%
 b -> key lctrl toggle          # press to latch down, press again to lift
 x -> key r
 y -> mouse_wheel 1             # one detent per press
@@ -79,5 +87,4 @@ a -> key 1 passthrough
 # thresholding it into an on or off.
 rtrigger -> joy_axis 4 analog
 
-# A delayed single shot: assert, wait, release, stop.
-x -> key escape once repeat 2 delay 400
+x -> key escape

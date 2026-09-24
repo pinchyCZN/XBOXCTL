@@ -46,8 +46,8 @@ Read In This Order
    3.  mapping-engine.txt
 
        Everything that is not the stick: the source enumeration, the
-       action set, the twelve-byte binding record, activation with
-       hysteresis, autofire, layers, the three output state machines, the
+       action set, the twelve-byte binding record, activation,
+       autofire, layers, the three output state machines, the
        evaluation order and the configuration blob. Ends with the
        boundary - what the model deliberately cannot express and what the
        smallest honest extension would be.

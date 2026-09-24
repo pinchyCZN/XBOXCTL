@@ -298,8 +298,8 @@ Table of Contents
    TWO BUFFERS ARE NOT HISTORY. They exist because two in-flight URBs
    cannot share one DMA target. Edge detection is a separate concern and
    needs no packet history at all: each binding carries its own activation
-   latch, which hysteresis and toggle require anyway, and the edge is the
-   change in that latch. See mapping-engine.txt section 5.
+   latch, which toggle requires anyway, and the edge is the change in that
+   latch. See mapping-engine.txt section 5.
 
    WHAT THE SECOND SLOT BUYS IS LATENCY CONSISTENCY, NOT CORRECTNESS. The
    pad reports full state on every poll, so a missed poll costs one
@@ -777,9 +777,9 @@ Table of Contents
    |   | tests for every malformed case |                                  |
    +---+--------------------------------+----------------------------------+
    | 5 | The binding engine: activation,| DONE. One binding types into     |
-   |   | hysteresis, the keyboard and   | Notepad, chords cycle the layer, |
-   |   | mouse paths, chords, layers,   | autofire runs at its configured  |
-   |   | autofire                       | rate                             |
+   |   | the keyboard and mouse paths,  | Notepad, chords cycle the layer, |
+   |   | chords, layers, autofire       | autofire runs at its configured  |
+   |   |                                | rate                             |
    +---+--------------------------------+----------------------------------+
    | 6 | The stick: curve table,        | DONE. profiles/fps.txt aims,     |
    |   | accumulator, radial pipeline,  | the pointer is radial, and the   |

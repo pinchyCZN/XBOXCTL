@@ -315,9 +315,8 @@ typedef signed   long long  s64;
 #define CORE_BF_REPEAT          0x01
 #define CORE_BF_TOGGLE          0x02
 #define CORE_BF_ANALOG          0x04
-#define CORE_BF_NO_REPEAT_FIRST 0x08
 #define CORE_BF_PASSTHROUGH     0x10    /* keep the default gamepad out */
-#define CORE_BF_KNOWN           0x1F
+#define CORE_BF_KNOWN           0x17
 
 /* --- stick modes, analog-to-mouse.txt section 7 ---------------------- */
 #define CORE_STICK_OFF          0
@@ -348,12 +347,29 @@ typedef struct _core_binding {      /* 12 bytes */
 	u8  source;             /* semiaxis, or CORE_SA_CHORD_BASE + N  */
 	u8  action;             /* CORE_ACT_*                           */
 	u16 code;               /* per action                           */
-	u16 on_at;              /* activation, CORE_MAX_VALUE units     */
-	u16 off_at;             /* release, <= on_at                    */
+	u16 hard_at;            /* autofire pressure; 0 = always        */
 	u8  flags;              /* CORE_BF_*                            */
 	u8  repeat_hz;          /* 0 = no repeat                        */
 	u16 repeat_delay_ms;    /* before the first repeat              */
+	u16 reserved;
 } core_binding;
+
+/*
+ * THERE IS NO ACTIVATION THRESHOLD AND NO RELEASE THRESHOLD. A control
+ * is pressed when it reads anything other than zero.
+ *
+ * The analog face buttons and the triggers are not sticks. A stick rests
+ * wherever its centring springs leave it, several thousand units off
+ * centre, which is why it needs a deadzone. A button rests at exactly
+ * zero because nothing is touching it, so a threshold there does not
+ * reject noise - it just makes the button need a shove.
+ *
+ * hard_at IS NOT THAT THRESHOLD. It is how hard to press for the
+ * ALTERNATE action, and today that means autofire: below it a binding
+ * with CORE_BF_REPEAT is an ordinary hold, and past it the repeat runs.
+ * Zero means no alternate point, so a REPEAT binding autofires from the
+ * moment it is touched.
+ */
 
 typedef struct _core_chord {        /* 4 bytes */
 	u8  member[CORE_CHORD_MEMBERS]; /* sources, CORE_SA_NONE unused */
@@ -541,10 +557,9 @@ typedef struct _core_mouse_state {
  * another layer is live and can be released deliberately.
  */
 typedef struct _core_bind_state {
-	u8  active;             /* the source is past its threshold  */
+	u8  active;             /* the source reads non-zero         */
 	u8  latched;            /* TOGGLE output, independent of it  */
 	u8  repeat_on;          /* the asserted half of the cycle    */
-	u8  repeat_done;        /* NO_REPEAT_FIRST has had its turn  */
 	u64 repeat_at;          /* when the next flip falls due      */
 } core_bind_state;
 

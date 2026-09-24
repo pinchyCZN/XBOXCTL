@@ -435,9 +435,6 @@ static const u8 CORE_HAT_TABLE[16] = {
 	2, 1, 3, 8, 8, 8, 8, 8
 };
 
-/* Activation point for an analog control used as a button. */
-#define CORE_DEFAULT_BUTTON_ON  ((CORE_MAX_VALUE * 10) / 255)
-
 /*
  * Semiaxis to HID button, for the default map. Index is the HID button
  * number minus one; the value is the semiaxis that drives it.
@@ -509,13 +506,54 @@ static const struct {
  * binding on it deactivates by the ordinary path and lets go of whatever
  * it was asserting. Skipping would freeze it mid-press instead.
  */
+/*
+ * A SEMIAXIS AS A BINDING SEES IT: the stick deadzone applied, and
+ * nothing else applied at all.
+ *
+ * THE DEADZONE LIVES ON THE STICK BECAUSE THE STICK IS THE ONLY THING
+ * THAT NEEDS ONE. A stick rests wherever its centring springs leave it -
+ * several thousand units off centre on this pad - so a stick direction
+ * bound to a key would type that key forever with nobody touching it.
+ * A button rests at exactly zero and needs no such help.
+ *
+ * So there is one deadzone, it is per stick, it is set where every other
+ * property of that stick is set, and it applies to whatever reads the
+ * stick. Bindings have none of their own.
+ *
+ * THE POINTER PIPELINE DOES NOT COME THROUGH HERE. It applies the same
+ * deadzone RADIALLY, against the distance from centre, which is the only
+ * correct shape for a pointer; per-axis here would square off the corner
+ * and is only ever asking whether a direction is pressed. The gamepad
+ * axes do not come through here either - they report the stick where it
+ * actually is, because an application doing its own calibration needs
+ * the truth rather than our idea of centre.
+ */
+static s32 core_semiaxis_value(const core_state *cs, u8 source)
+{
+	s32 v;
+
+	if (source >= CORE_SEMIAXIS_COUNT) {
+		return 0;
+	}
+	v = cs->semiaxis[source];
+
+	if (source >= CORE_SA_LSTICK_XNEG && source <= CORE_SA_RSTICK_YPOS) {
+		u32 stick = (u32)(source - CORE_SA_LSTICK_XNEG) / 4u;
+
+		if (v <= (s32)cs->cfg.stick[stick].deadzone) {
+			return 0;
+		}
+	}
+	return v;
+}
+
 static s32 core_source_value(const core_state *cs, u8 source)
 {
 	if (source < CORE_SEMIAXIS_COUNT) {
 		if (cs->hold_mask & (1u << source)) {
 			return 0;
 		}
-		return cs->semiaxis[source];
+		return core_semiaxis_value(cs, source);
 	}
 	if (source >= CORE_SA_CHORD_BASE &&
 	    source < CORE_SA_CHORD_BASE + CORE_MAX_CHORDS) {
@@ -541,18 +579,13 @@ static int core_suppressed(u32 mask, u8 source)
  * keep their own controls until the chord they belong to takes them.
  * ====================================================================== */
 
-/*
- * A MEMBER IS "PRESSED" AT THE DEFAULT MAP'S THRESHOLD, not at some
- * threshold of its own. Every control that makes sense in a chord is
- * digital on this pad - it reads 0 or full scale - so a second, separate
- * threshold would be a knob with nothing behind it.
- */
+/* A member is down when it reads non-zero, like everything else. */
 static int core_member_down(const core_state *cs, u8 source)
 {
 	if (source >= CORE_SEMIAXIS_COUNT) {
 		return 0;
 	}
-	return cs->semiaxis[source] >= CORE_DEFAULT_BUTTON_ON;
+	return core_semiaxis_value(cs, source) > 0;
 }
 
 /*
@@ -657,7 +690,7 @@ static void core_layer_prime(core_state *cs, u32 layer)
 			continue;
 		}
 		value = core_source_value(cs, b->source);
-		st->active  = (u8)(value > 0 && value >= (s32)b->on_at);
+		st->active  = (u8)(value > 0);
 		st->latched = 0;
 	}
 }
@@ -681,7 +714,13 @@ static void core_fold_default(core_state *cs, u32 suppress)
 		if (core_suppressed(suppress, src)) {
 			continue;
 		}
-		if (cs->semiaxis[src] >= CORE_DEFAULT_BUTTON_ON) {
+		/* PRESSED MEANS NON-ZERO, and it means that here for the same
+		 * reason it does for a binding: the analog buttons rest at
+		 * exactly zero, so a threshold only adds required force. The
+		 * gamepad button and the key a binding sends now come on at
+		 * the same point, which they did not when this had a
+		 * threshold of its own. */
+		if (cs->semiaxis[src] > 0) {
 			cs->gp.buttons |= (u16)(1u << i);
 		}
 	}
@@ -842,7 +881,7 @@ static void core_apply_action(core_state *cs, const core_binding *b,
  * the wheel and the pointer nudge, are driven by.
  */
 static int core_repeat(const core_binding *b, core_bind_state *st,
-                       int edge, int *asserted, u64 now_100ns)
+                       s32 value, int edge, int *asserted, u64 now_100ns)
 {
 	u64 half;
 	int fired = edge;
@@ -851,13 +890,28 @@ static int core_repeat(const core_binding *b, core_bind_state *st,
 		return fired;
 	}
 
+	/*
+	 * PRESS HARDER TO AUTOFIRE. With hard_at set, the binding is an
+	 * ordinary hold until the control is pushed past it, and the repeat
+	 * runs from there; ease off and it goes back to a hold. This is the
+	 * only thing an analog button's pressure is read for, and it is why
+	 * the pad has analog buttons at all.
+	 *
+	 * The cycle resets on the way out so easing off and pressing hard
+	 * again starts a fresh one rather than resuming mid-flight.
+	 */
+	if (b->hard_at != 0 && value < (s32)b->hard_at) {
+		st->repeat_on = 0;
+		st->repeat_at = 0;
+		return fired;           /* still held, just not repeating */
+	}
+
 	if (!*asserted) {
 		/* RESET ON RELEASE, whatever half the cycle was in. A cycle
 		 * left mid-flight would resume from where it stopped the next
 		 * time the control was touched. */
-		st->repeat_on   = 0;
-		st->repeat_done = 0;
-		st->repeat_at   = 0;
+		st->repeat_on = 0;
+		st->repeat_at = 0;
 		return 0;
 	}
 
@@ -873,22 +927,17 @@ static int core_repeat(const core_binding *b, core_bind_state *st,
 		 * what makes a held control behave like a keyboard: one
 		 * press, a pause, then repetition.
 		 */
-		st->repeat_on   = 1;
-		st->repeat_done = 0;
-		st->repeat_at   = now_100ns +
+		st->repeat_on = 1;
+		st->repeat_at = now_100ns +
 		        (b->repeat_delay_ms
 		         ? (u64)b->repeat_delay_ms * CORE_100NS_PER_MS
 		         : half);
 		fired = 1;
-	} else if (!st->repeat_done && now_100ns >= st->repeat_at) {
+	} else if (now_100ns >= st->repeat_at) {
 		st->repeat_on = (u8)(!st->repeat_on);
 		st->repeat_at = now_100ns + half;
 		if (st->repeat_on) {
 			fired = 1;
-		} else if (b->flags & CORE_BF_NO_REPEAT_FIRST) {
-			/* One cycle only: assert, wait, release, stop. A
-			 * delayed single shot rather than a repeat. */
-			st->repeat_done = 1;
 		}
 	}
 
@@ -910,21 +959,8 @@ static void core_apply_binding(core_state *cs, const core_binding *b,
 
 	value = core_source_value(cs, b->source);
 
-	/*
-	 * TWO THRESHOLDS, NOT ONE. The face buttons on this pad are analog,
-	 * so a single threshold chatters for as long as a finger rests near
-	 * it. Rise above on_at to activate; stay active until the value
-	 * falls below off_at.
-	 *
-	 * A VALUE OF ZERO IS NEVER ACTIVE, whatever on_at says. A binding
-	 * configured with on_at of 0 would otherwise assert permanently,
-	 * including for every source nothing is touching.
-	 */
-	if (st->active) {
-		active = (value > (s32)b->off_at);
-	} else {
-		active = (value > 0 && value >= (s32)b->on_at);
-	}
+	/* NON-ZERO IS PRESSED. core.h says why there is no threshold. */
+	active = (value > 0);
 
 	edge = (active && !st->active);
 	if (edge && (b->flags & CORE_BF_TOGGLE)) {
@@ -934,7 +970,7 @@ static void core_apply_binding(core_state *cs, const core_binding *b,
 
 	asserted = (b->flags & CORE_BF_TOGGLE) ? st->latched : active;
 
-	edge = core_repeat(b, st, edge, &asserted, now_100ns);
+	edge = core_repeat(b, st, value, edge, &asserted, now_100ns);
 
 	core_apply_action(cs, b, value, asserted, edge);
 }
@@ -1686,8 +1722,6 @@ typedef char core_cfg_size_check[
      sizeof(core_config_header) == 32) ? 1 : -1];
 
 #define CORE_CFG_DEFAULT_TICK_HZ    250
-#define CORE_CFG_DEFAULT_ON         (CORE_MAX_VALUE * 2 / 5)
-#define CORE_CFG_DEFAULT_OFF        (CORE_MAX_VALUE / 4)
 #define CORE_CFG_DEFAULT_AUTOFIRE   12      /* Hz */
 
 static u32 core_cfg_blob_bytes(u32 layout_count)
@@ -1750,8 +1784,6 @@ static void core_binding_clear(core_binding *b)
 	core_zero(b, (u32)sizeof(*b));
 	b->source = CORE_SA_NONE;
 	b->action = CORE_ACT_NONE;
-	b->on_at  = CORE_CFG_DEFAULT_ON;
-	b->off_at = CORE_CFG_DEFAULT_OFF;
 }
 
 void core_config_defaults(core_config *cfg)
@@ -1940,13 +1972,10 @@ static u32 core_cfg_fix_binding(core_binding *b, u8 layout_count,
 		fixed++;
 	}
 
-	/* Thresholds: on_at within range, off_at never above it. */
-	if (b->on_at > CORE_MAX_VALUE) {
-		b->on_at = CORE_MAX_VALUE;
-		fixed++;
-	}
-	if (b->off_at > b->on_at) {
-		b->off_at = b->on_at;
+	/* A hard point past full scale could never be reached, so it would
+	 * silently disable the autofire it was asked for. */
+	if (b->hard_at > CORE_MAX_VALUE) {
+		b->hard_at = CORE_MAX_VALUE;
 		fixed++;
 	}
 

@@ -1148,8 +1148,9 @@ static int test_config(void)
 	cfg.layout[0].binding[4].source    = CORE_SA_X;
 	cfg.layout[0].binding[4].action    = CORE_ACT_JOY_BUTTON;
 	cfg.layout[0].binding[4].code      = 1;
-	cfg.layout[0].binding[4].on_at     = 100;
-	cfg.layout[0].binding[4].off_at    = 30000;    /* above on_at */
+	cfg.layout[0].binding[4].flags     = CORE_BF_REPEAT;
+	cfg.layout[0].binding[4].repeat_hz = 10;
+	cfg.layout[0].binding[4].hard_at   = 60000;    /* past full scale */
 	cfg.layout[0].binding[5].source    = CORE_SA_Y;
 	cfg.layout[0].binding[5].action    = CORE_ACT_JOY_BUTTON;
 	cfg.layout[0].binding[5].code      = 1;
@@ -1167,9 +1168,10 @@ static int test_config(void)
 	         "a button of 900 is clamped to the descriptor's 16");
 	check_eq(back.layout[0].binding[3].action, CORE_ACT_NONE,
 	         "a key that is not a usage is dropped, not clamped");
-	check(back.layout[0].binding[4].off_at <=
-	      back.layout[0].binding[4].on_at,
-	      "off_at is never above on_at");
+	check_eq(back.layout[0].binding[4].hard_at, CORE_MAX_VALUE,
+	         "a hard point past full scale is clamped to it - left"
+	         " alone it could never be reached, so the autofire it was"
+	         " asked for would silently never run");
 	check_eq(back.layout[0].binding[5].repeat_hz, 125,
 	         "autofire is capped at half the tick rate");
 	check(back.stick[0].outer > back.stick[0].deadzone,
@@ -1200,8 +1202,8 @@ static int test_config(void)
  * BINDINGS
  *
  * mapping-engine.txt sections 4.1, 5 and 9. The pad's face buttons are
- * analog, so every "button" here is really a threshold with hysteresis,
- * and the tests below are written against pressures rather than presses.
+ * analog, so the tests below press them to a PRESSURE out of 255 rather
+ * than to an on or an off, which is also how hard_at is reached.
  * ====================================================================== */
 
 /* Install a configuration built in memory rather than parsed from a blob,
@@ -1262,11 +1264,9 @@ static int test_bindings(void)
 	u8                 packet[CORE_RAW_PACKET_BYTES];
 	u64                t = 1000;
 
-	/* --- a key binding, and the hysteresis around it --------------- */
+	/* --- a key binding fires on ANY pressure at all ---------------- */
 	core_init(&cs, recording_sink, NULL);
 	bind_one(&cfg, CORE_SA_A, CORE_ACT_KEY, 0x1A, 0);   /* A -> W */
-	cfg.layout[0].binding[0].on_at  = CORE_MAX_VALUE / 2;
-	cfg.layout[0].binding[0].off_at = CORE_MAX_VALUE / 4;
 	bind_install(&cs, &cfg);
 
 	make_packet(packet);
@@ -1274,23 +1274,70 @@ static int test_bindings(void)
 	bind_press(&cs, packet, 0, 0, t += 4000);
 	check_eq(cs.kb.count, 0, "at rest no key is held");
 
-	bind_press(&cs, packet, 0, 100, t += 4000);     /* ~39 per cent */
-	check_eq(cs.kb.count, 0, "below on_at the key stays up");
-
-	bind_press(&cs, packet, 0, 200, t += 4000);     /* ~78 per cent */
-	check_eq(cs.kb.count, 1, "past on_at the key goes down");
+	/*
+	 * THE LIGHTEST TOUCH THE PAD CAN REPORT TYPES THE KEY. One count in
+	 * 255 is the smallest non-zero pressure there is, and a threshold
+	 * of any size at all would swallow it. These buttons rest at
+	 * exactly zero, so there is no noise for a threshold to reject -
+	 * it would only make the button need a shove.
+	 */
+	bind_press(&cs, packet, 0, 1, t += 4000);
+	check_eq(cs.kb.count, 1, "one count of 255 already types it");
 	check_eq(cs.kb.keys[0], 0x1A, "and it is W");
 
-	/*
-	 * THE POINT OF TWO THRESHOLDS. Back off to a pressure BELOW on_at
-	 * but above off_at: a single-threshold design releases here, and a
-	 * finger resting near the boundary then chatters at the packet rate.
-	 */
-	bind_press(&cs, packet, 0, 100, t += 4000);
-	check_eq(cs.kb.count, 1, "between the thresholds the key STAYS down");
+	bind_press(&cs, packet, 0, 200, t += 4000);
+	check_eq(cs.kb.count, 1, "pressing harder changes nothing");
 
-	bind_press(&cs, packet, 0, 40, t += 4000);      /* ~16 per cent */
-	check_eq(cs.kb.count, 0, "below off_at it releases");
+	bind_press(&cs, packet, 0, 0, t += 4000);
+	check_eq(cs.kb.count, 0, "and only zero releases it");
+
+	/* --- A STICK IS THE ONE THING THAT STILL NEEDS A DEADZONE ----- */
+	core_init(&cs, recording_sink, NULL);
+	bind_one(&cfg, CORE_SA_RSTICK_XPOS, CORE_ACT_KEY, 0x07, 0); /* D */
+	cfg.stick[1].deadzone = 7000;
+	bind_install(&cs, &cfg);
+	make_packet(packet);
+
+	/*
+	 * A STICK AT REST IS NOT AT ZERO. This pad's right stick sits some
+	 * thousands of units off centre with nothing touching it, so a
+	 * direction bound to a key would type it forever if non-zero alone
+	 * meant pressed. The stick's own deadzone is what makes that false,
+	 * and it is the only deadzone left anywhere.
+	 */
+	put_le16(&packet[CORE_RAW_RSTICK_X], 3900);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+	check_eq(cs.kb.count, 0,
+	         "a stick resting off centre types nothing");
+
+	put_le16(&packet[CORE_RAW_RSTICK_X], 32767);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+	check_eq(cs.kb.count, 1, "and pushing it past the deadzone types D");
+
+	put_le16(&packet[CORE_RAW_RSTICK_X], 3900);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+	check_eq(cs.kb.count, 0, "letting go releases it again");
+	put_le16(&packet[CORE_RAW_RSTICK_X], 0);
+
+	/* THE GAMEPAD BUTTON COMES ON AT THE SAME POINT. A binding and the
+	 * default map used to disagree by a factor of ten, so the same
+	 * press that lit the button in joy.cpl was not enough to type. */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	core_config_suppress(&cfg);
+	bind_install(&cs, &cfg);
+	make_packet(packet);
+	bind_press(&cs, packet, 0, 1, t += 4000);
+	check(cs.gp.buttons & 0x0001,
+	      "one count of 255 lights the gamepad button too");
+	bind_press(&cs, packet, 0, 0, t += 4000);
+	check(!(cs.gp.buttons & 0x0001), "and zero puts it out");
+
+	core_init(&cs, recording_sink, NULL);
+	bind_one(&cfg, CORE_SA_A, CORE_ACT_KEY, 0x1A, 0);
+	bind_install(&cs, &cfg);
+	make_packet(packet);
+	bind_press(&cs, packet, 0, 255, t += 4000);
 
 	/* --- suppression, section 4.1 ---------------------------------- */
 	check(!(cs.gp.buttons & 0x0001),
@@ -1371,7 +1418,6 @@ static int test_bindings(void)
 	core_init(&cs, recording_sink, NULL);
 	bind_one(&cfg, CORE_SA_LTRIGGER, CORE_ACT_JOY_AXIS, 0,
 	         CORE_BF_ANALOG);
-	cfg.layout[0].binding[0].on_at = 1;
 	bind_install(&cs, &cfg);
 	make_packet(packet);
 	packet[CORE_RAW_ANALOG_BASE + 6] = 255;         /* left trigger */
@@ -1902,6 +1948,58 @@ static int test_autofire(void)
 		         " autofire cycle types forever");
 	}
 
+	/* --- PRESS HARDER TO AUTOFIRE --------------------------------- */
+	core_init(&cs, recording_sink, NULL);
+	core_config_defaults(&cfg);
+	cfg.layout[0].binding[1].source    = CORE_SA_A;
+	cfg.layout[0].binding[1].action    = CORE_ACT_JOY_BUTTON;
+	cfg.layout[0].binding[1].code      = 1;
+	cfg.layout[0].binding[1].flags     = CORE_BF_REPEAT;
+	cfg.layout[0].binding[1].repeat_hz = 10;
+	cfg.layout[0].binding[1].hard_at   = CORE_MAX_VALUE / 2;
+	core_config_suppress(&cfg);
+	len = core_config_save(&cfg, blob, sizeof(blob));
+	core_set_config(&cs, blob, len, NULL);
+
+	make_packet(packet);
+	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+
+	/* A light press - held, and only held. */
+	sink_reset();
+	packet[CORE_RAW_ANALOG_BASE + 0] = 100;         /* ~39 per cent */
+	for (k = 0; k < 250; k++) {
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	}
+	check_eq(sink_button_presses(0x0001), 1,
+	         "A PRESS SHORT OF hard_at IS AN ORDINARY HOLD - pressed"
+	         " once, and still down a second later");
+	check(cs.gp.buttons & 0x0001, "with the button down at the end of it");
+
+	/* Lean on it and the same unbroken press starts repeating. */
+	sink_reset();
+	packet[CORE_RAW_ANALOG_BASE + 0] = 255;
+	for (k = 0; k < 250; k++) {
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	}
+	{
+		long presses = sink_button_presses(0x0001);
+
+		check(presses >= 9 && presses <= 11,
+		      "PUSHING PAST hard_at AUTOFIRES at about ten a second,"
+		      " without the control ever being let go of");
+	}
+
+	/* Ease off and it is a plain hold again. */
+	sink_reset();
+	packet[CORE_RAW_ANALOG_BASE + 0] = 100;
+	for (k = 0; k < 250; k++) {
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
+	}
+	check(sink_button_presses(0x0001) <= 1,
+	      "and easing off stops the repeat");
+	check(cs.gp.buttons & 0x0001,
+	      "leaving the button held, not stuck in the released half");
+
 	/* --- repeat_delay_ms: one press, a pause, then repetition ----- */
 	core_init(&cs, recording_sink, NULL);
 	core_config_defaults(&cfg);
@@ -1935,32 +2033,6 @@ static int test_autofire(void)
 	check(sink_button_presses(0x0001) > 5,
 	      "past the delay it repeats - the keyboard behaviour, where a"
 	      " held key types once, pauses, then runs");
-
-	/* --- NO_REPEAT_FIRST is a delayed single shot ----------------- */
-	core_init(&cs, recording_sink, NULL);
-	core_config_defaults(&cfg);
-	cfg.layout[0].binding[1].source          = CORE_SA_A;
-	cfg.layout[0].binding[1].action          = CORE_ACT_JOY_BUTTON;
-	cfg.layout[0].binding[1].code            = 1;
-	cfg.layout[0].binding[1].flags           = (u8)(CORE_BF_REPEAT |
-	                                                CORE_BF_NO_REPEAT_FIRST);
-	cfg.layout[0].binding[1].repeat_hz       = 20;
-	cfg.layout[0].binding[1].repeat_delay_ms = 100;
-	core_config_suppress(&cfg);
-	len = core_config_save(&cfg, blob, sizeof(blob));
-	core_set_config(&cs, blob, len, NULL);
-
-	make_packet(packet);
-	core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
-	sink_reset();
-	packet[CORE_RAW_ANALOG_BASE + 0] = 255;
-	for (k = 0; k < 250; k++) {
-		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += PACKET);
-	}
-	check_eq(sink_button_presses(0x0001), 1,
-	         "NO_REPEAT_FIRST presses once and stops, however long the"
-	         " control is held");
-	check(!(cs.gp.buttons & 0x0001), "and has let go by the end");
 
 	/* --- a wheel with REPEAT scrolls once per period -------------- */
 	core_init(&cs, recording_sink, NULL);

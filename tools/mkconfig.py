@@ -34,7 +34,7 @@ CURVE_POINTS = 33
 STICK_COUNT = 2
 
 HDR_FMT = "<IHHHHBBBBH14s"
-BINDING_FMT = "<BBHHHBBH"
+BINDING_FMT = "<BBHHBBHH"
 CHORD_FMT = "<BBBB"
 STICK_FMT = "<7H6B2x33H"
 
@@ -78,7 +78,7 @@ ACTIONS = {
 
 FLAGS = {
     "repeat": 0x01, "toggle": 0x02, "analog": 0x04,
-    "once": 0x08, "passthrough": 0x10,
+    "passthrough": 0x10,
 }
 
 STICK_MODES = {
@@ -157,16 +157,15 @@ class Binding(object):
         self.source = SA_NONE
         self.action = 0
         self.code = 0
-        self.on_at = MAX_VALUE * 2 // 5
-        self.off_at = MAX_VALUE // 4
+        self.hard_at = 0
         self.flags = 0
         self.repeat_hz = 0
         self.repeat_delay_ms = 0
 
     def pack(self):
         return struct.pack(BINDING_FMT, self.source, self.action, self.code,
-                           self.on_at, self.off_at, self.flags,
-                           self.repeat_hz, self.repeat_delay_ms)
+                           self.hard_at, self.flags, self.repeat_hz,
+                           self.repeat_delay_ms, 0)
 
 
 class Stick(object):
@@ -350,17 +349,35 @@ def parse_binding(text, chords):
         elif word == "delay":
             b.repeat_delay_ms = int(words[i + 1], 0)
             i += 2
-        elif word == "on":
-            b.on_at = int(words[i + 1], 0)
-            i += 2
-        elif word == "off":
-            b.off_at = int(words[i + 1], 0)
+        elif word == "hard":
+            # How hard to press before the repeat runs. Only means
+            # anything alongside "repeat".
+            #
+            # A PERCENTAGE IS THE SANE WAY TO WRITE THIS. The raw unit
+            # is the 0..MAX_VALUE scale every analog value is decoded
+            # onto, NOT the 0..255 byte the pad sends, and the two are
+            # off by a factor of 137. Writing the byte you meant gives
+            # a hard point down near zero, which does not fail - it
+            # autofires from the lightest touch and looks like 'hard'
+            # being ignored.
+            arg = words[i + 1]
+            if arg.endswith("%"):
+                pct = float(arg[:-1])
+                if not 0.0 <= pct <= 100.0:
+                    raise ValueError("hard must be 0%..100%")
+                b.hard_at = int(round(MAX_VALUE * pct / 100.0))
+            else:
+                b.hard_at = int(arg, 0)
+                if b.hard_at > MAX_VALUE:
+                    raise ValueError("hard must be 0..%d or a percentage"
+                                     % MAX_VALUE)
             i += 2
         else:
             raise ValueError("unknown option '%s'" % words[i])
 
-    if b.off_at > b.on_at:
-        b.off_at = b.on_at
+    if b.hard_at and not (b.flags & FLAGS["repeat"]):
+        raise ValueError("'hard' needs 'repeat' - it is the pressure the"
+                         " autofire starts at, not an activation point")
     return b
 
 
@@ -459,9 +476,9 @@ def dump(blob):
             chords.append(struct.unpack(CHORD_FMT, blob[at:at + CHORD_SIZE]))
         for i in range(MAX_BINDINGS):
             at = base + i * BINDING_SIZE
-            (src, act, code, on_at, off_at, flags,
-             hz, delay) = struct.unpack(BINDING_FMT,
-                                        blob[at:at + BINDING_SIZE])
+            (src, act, code, hard_at, flags, hz,
+             delay, _rsv) = struct.unpack(BINDING_FMT,
+                                          blob[at:at + BINDING_SIZE])
             if act == 0:
                 continue
             if src >= SA_CHORD_BASE:
@@ -485,6 +502,8 @@ def dump(blob):
                 extra += " repeat %d" % hz
             if delay:
                 extra += " delay %d" % delay
+            if hard_at:
+                extra += " hard %.0f%%" % (hard_at * 100.0 / MAX_VALUE)
             print("    %-14s -> %s %s%s" % (label, aname, value, extra))
         off += lbytes
 

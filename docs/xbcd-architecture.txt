@@ -841,10 +841,10 @@ Table of Contents
    |   |                            | integration and autofire have no clock |
    +---+----------------------------+----------------------------------------+
    | 5 | one destination byte per   | no room for a key code, a repeat rate, |
-   |   | source                     | a per-binding threshold or hysteresis  |
+   |   | source                     | an autofire point or a layer           |
    +---+----------------------------+----------------------------------------+
-   | 6 | thresholds are global per  | two triggers cannot have two different |
-   |   | source KIND                | trigger points                         |
+   | 6 | thresholds are global per  | a light press and a hard press cannot  |
+   |   | source KIND                | mean two different things              |
    +---+----------------------------+----------------------------------------+
    | 7 | no timer in the input path | autofire and mouse velocity both need  |
    |   |                            | a periodic tick                        |

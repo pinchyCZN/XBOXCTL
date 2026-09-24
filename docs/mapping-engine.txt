@@ -37,7 +37,7 @@ Table of Contents
    4.  The Binding Record
    4.1.  Binding A Source Suppresses Its Default
    5.  Activation
-   5.1.  Threshold And Hysteresis
+   5.1.  Pressed Means Non-Zero
    5.2.  Toggle
    6.  Repeat, Also Known As Autofire
    6.1.  The Trap: HID Reports Are State, Not Events
@@ -252,11 +252,11 @@ Table of Contents
            u8  source;           /* 0..24, 32..33, 64+N chord, 0xFF end */
            u8  action;           /* the table in section 3 */
            u16 code;             /* per action */
-           u16 on_at;            /* activation, MAX_VALUE units */
-           u16 off_at;           /* release, <= on_at */
+           u16 hard_at;          /* autofire pressure; 0 = always */
            u8  flags;            /* section 5 and 6 */
            u8  repeat_hz;        /* 0 = no repeat */
            u16 repeat_delay_ms;  /* before the first repeat */
+           u16 reserved;
        };
 
        flags:
@@ -265,8 +265,6 @@ Table of Contents
            0x04  ANALOG      pass the magnitude through rather than
                              thresholding it; only meaningful for
                              JOY_AXIS and MOUSE_PULSE
-           0x08  NO_REPEAT_FIRST  the first repeat interval is the only
-                             one; used to make a delayed single shot
            0x10  PASSTHROUGH keep the source driving its default gamepad
                              control as well as performing the action;
                              section 4.1
@@ -311,34 +309,46 @@ Table of Contents
 
 5.  Activation
 
-5.1.  Threshold And Hysteresis
+5.1.  Pressed Means Non-Zero
 
-   A binding is active when its source rises above on_at, and stays
-   active until the source falls below off_at:
+   A binding is active when its source reads anything but zero:
 
-       if (!was_active && value >= on_at)  active = 1
-       if ( was_active && value <  off_at) active = 0
+       active = (value > 0)
 
-   PER BINDING, NOT PER SOURCE KIND. XBCD has three global thresholds -
-   BThreshold, TThreshold, AThreshold - so two triggers cannot have two
-   trigger points. Here every binding carries its own, and XBCD's values
-   become the defaults the configurator seeds:
+   There is no activation threshold and no release threshold, and a
+   binding carries no way to set one.
 
-       digital sources               on_at = 1
-       analog face buttons           on_at = MAX_VALUE * 10/255  = 1372
-       triggers                      on_at = MAX_VALUE * 10/255  = 1372
-       stick semiaxes                on_at = MAX_VALUE * 100/255 = 13725
+   A THRESHOLD ON A BUTTON LOOKS RIGHT AND IS NOT, which is worth
+   stating positively because the reasoning that produces one is sound
+   as far as it goes. The face buttons and the triggers are analog, an
+   analog control resting exactly at its trip point would chatter, and
+   hysteresis is the textbook answer to chatter. All true, and none of
+   it applies: these controls rest at EXACTLY zero when nothing is
+   touching them. There is no resting value near any trip point, so
+   there is nothing to chatter, and a threshold buys nothing while
+   costing real force at the button.
 
-   Those are tuned numbers with twenty years of use behind them. There
-   is no reason to rediscover them.
+   The pressure is still there to be read, and section 5.5 reads it.
 
-   off_at IS WHAT XBCD DOES NOT HAVE and it matters more than the
-   threshold does. With a single threshold, a trigger resting exactly at
-   the trip point chatters: press, release, press, release, several
-   times a packet-rate second, each transition a real keystroke. A
-   default off_at of about 80 per cent of on_at costs nothing and removes
-   the failure mode entirely. Reject a configuration with off_at above
-   on_at rather than trying to interpret it.
+   A STICK IS THE EXCEPTION AND IT IS HANDLED ON THE STICK. A stick sits
+   where its centring springs leave it, measured on this pad at some
+   thousands of units off centre, so "non-zero" would be permanently
+   true for a stick direction bound to a key. The stick's own deadzone -
+   section 8, the same field the pointer uses - is applied to a semiaxis
+   before any binding or chord sees it, so the rule above holds for
+   sticks too.
+
+   ONE DEADZONE, ON THE THING THAT NEEDS ONE. It is per stick rather
+   than per binding, because a stick's resting offset is a property of
+   the stick and not of what happens to be bound to it. Two directions
+   of the same stick cannot disagree about where centre is.
+
+   THE GAMEPAD AXES AND THE POINTER DO NOT COME THROUGH THAT PATH. The
+   axes report the stick where it actually is, because an application
+   doing its own calibration needs the truth; the pointer applies the
+   same deadzone radially, against distance from centre, which is the
+   only correct shape for a pointer and the wrong one for asking whether
+   a direction is pressed.
 
 5.2.  Toggle
 
@@ -399,6 +409,27 @@ Table of Contents
    repeat_delay_ms defaulting to 0 gives plain autofire from the first
    instant; a non-zero value gives the familiar keyboard behaviour where
    a held key types once, pauses, then repeats.
+
+   hard_at IS WHERE THE PRESSURE GOES. With it set, a REPEAT binding is
+   an ordinary hold until the control is pushed past it and repeats from
+   there; ease off below it and the cycle resets and it is a hold again,
+   without the control ever being released. Zero means no such point and
+   the binding autofires from the moment it is touched.
+
+   That is the only thing a binding reads pressure for, and it is what
+   the analog buttons are for: semi-automatic and automatic on one
+   trigger, chosen by how hard it is squeezed. It composes with
+   repeat_delay_ms - the delay is measured from the moment hard_at is
+   crossed, not from the first touch.
+
+   hard_at IS ON THE MAX_VALUE SCALE, NOT THE PAD BYTE. The triggers and
+   the analog face buttons are all one byte on the wire, 0 to 255, and
+   the decode scales every one of them to 0..MAX_VALUE before anything
+   reads it. The two differ by a factor of 137, and writing the byte
+   gives a hard point down near zero, which does not fail: it autofires
+   from the lightest touch and reads as hard_at being ignored. A
+   configurator should offer this as a percentage of full travel and
+   never as a raw number.
 
    ALWAYS EMIT A RELEASE ON DEACTIVATION, whatever phase the repeat was
    in. A binding that deactivates during the asserted half and does not
@@ -639,9 +670,13 @@ Table of Contents
    XBCDReadConfig already does value by value and is why a fresh install
    with nothing stored still works. Extend the discipline to the blob:
    reject on a bad signature or an unknown version, clamp every count,
-   reject off_at above on_at, reject a source index that is not in the
+   clamp hard_at to full scale, reject a source index that is not in the
    enumeration, and repair a non-monotone curve table rather than
    trusting it.
+
+   A HARD POINT PAST FULL SCALE IS CLAMPED RATHER THAN IGNORED. Left
+   alone it could never be reached, so the autofire the profile asked
+   for would simply never run and nothing would say why.
 
    CLAMP EVERY ACTION CODE TO THE DESCRIPTOR. A JOY_BUTTON index above
    sixteen, or a JOY_AXIS above five, is an out-of-range write into a
@@ -660,25 +695,25 @@ Table of Contents
 11. A Worked Example
 
    The FPS profile from the Adaptoid library, expressed in this model.
-   Sources are the section 2 indices, thresholds in MAX_VALUE units.
+   Sources are the section 2 indices.
 
-   +--------+------------------+--------------+-------+--------+----------+
-   | Source | Control          | Action       | code  | on_at  | flags    |
-   +========+==================+==============+=======+========+==========+
-   |     15 | Right trigger    | MOUSE_BUTTON |     1 |   1372 | -        |
-   |     14 | Left trigger     | MOUSE_BUTTON |     3 |   1372 | -        |
-   |      8 | A                | KEY space    |  0x2C |   1372 | -        |
-   |      9 | B                | KEY c        |  0x06 |   1372 | -        |
-   |     10 | X                | KEY enter    |  0x28 |   1372 | -        |
-   |     11 | Y                | KEY slash    |  0x38 |   1372 | -        |
-   |     12 | Black            | KEY tab      |  0x2B |   1372 | -        |
-   |      0 | D-up             | KEY space    |  0x2C |      1 | -        |
-   |      1 | D-down           | KEY c        |  0x06 |      1 | -        |
-   |     18 | Left stick Y-    | KEY w        |  0x1A |  13725 | -        |
-   |     19 | Left stick Y+    | KEY s        |  0x16 |  13725 | -        |
-   |     16 | Left stick X-    | KEY a        |  0x04 |  13725 | -        |
-   |     17 | Left stick X+    | KEY d        |  0x07 |  13725 | -        |
-   +--------+------------------+--------------+-------+--------+----------+
+   +--------+------------------+--------------+-------+----------+
+   | Source | Control          | Action       | code  | flags    |
+   +========+==================+==============+=======+==========+
+   |     15 | Right trigger    | MOUSE_BUTTON |     1 | -        |
+   |     14 | Left trigger     | MOUSE_BUTTON |     3 | -        |
+   |      8 | A                | KEY space    |  0x2C | -        |
+   |      9 | B                | KEY c        |  0x06 | -        |
+   |     10 | X                | KEY enter    |  0x28 | -        |
+   |     11 | Y                | KEY slash    |  0x38 | -        |
+   |     12 | Black            | KEY tab      |  0x2B | -        |
+   |      0 | D-up             | KEY space    |  0x2C | -        |
+   |      1 | D-down           | KEY c        |  0x06 | -        |
+   |     18 | Left stick Y-    | KEY w        |  0x1A | -        |
+   |     19 | Left stick Y+    | KEY s        |  0x16 | -        |
+   |     16 | Left stick X-    | KEY a        |  0x04 | -        |
+   |     17 | Left stick X+    | KEY d        |  0x07 | -        |
+   +--------+------------------+--------------+-------+----------+
 
    plus one stick record: right stick in relative-mouse mode, quadratic
    curve, max_speed 2812, gain_y 55, invert_y set.
