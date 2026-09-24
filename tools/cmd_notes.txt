@@ -33,7 +33,9 @@ powershell -ExecutionPolicy Bypass -File hidread.ps1 -nosticks
 
 hidread.ps1 -Col 3
 
-powershell -ExecutionPolicy Bypass -File xbctl.ps1 set -Path arcade.bin
+hidread.ps1 -Jitter -Seconds 5
+
+powershell -ExecutionPolicy Bypass -File xbctl.ps1 set -Path fps.bin
 
 powershell -ExecutionPolicy Bypass -File xbctl.ps1 stats
 

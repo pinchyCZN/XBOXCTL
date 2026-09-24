@@ -580,21 +580,16 @@ Table of Contents
    arrival, so the periodic DPC re-enters at step 6 with the last
    decoded state and keeps a cycle moving when packets are late.
 
-   THE STICK PATH IS NOT RE-ENTERED, AND THAT IS A CORRECTNESS RULE.
-   Integrating a stick position on the tick means that if packets stop -
-   a wedged pipe, a pad gone quiet, a hub that dropped it - the last
-   deflection is replayed forever and the pointer sails off in that
-   direction for as long as the driver is loaded. It looks exactly like
-   a driver computing the wrong direction, and it is not: it is the
-   right direction, applied to input that stopped arriving. The packet
-   rate is also the better clock at 4ms against the tick's 16.
+   THE STICK PATH IS RE-ENTERED TOO, AND IT HAS TO BE. The pad reports
+   only when something changes - five times a second at rest, seven to
+   ten with a stick held - so a pointer advanced only on packets steps
+   at that rate and is felt as choppy. analog-to-mouse.txt section 3.3
+   has the measurements.
 
-   A PAD THAT GOES QUIET LETS GO OF EVERYTHING. Polling can stall with
-   nothing to show for it - no error, no cancelled transfer, simply no
-   completion - and the last packet then describes a pad that may have
-   been put down mid-press. The tick releases every asserted output
-   after CORE_STALE_MS of silence; real input resumes on the next
-   packet.
+   SILENCE IS NOT A FAULT. Nothing releases held output on a timeout:
+   with a pad that speaks only on change, a quiet interval is the normal
+   case, and a timeout would fire between ordinary packets and drop what
+   is genuinely held.
 
 10. The Configuration Blob
 

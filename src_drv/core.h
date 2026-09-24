@@ -499,12 +499,6 @@ typedef void (*core_report_fn)(void *ctx, u8 report_id,
  * velocity by it and fling the pointer across the desktop. */
 #define CORE_MAX_TICK_MS        50
 
-/*
- * How long a silence means the pad is gone rather than idle. The pad
- * sends every 4ms whether anything moved or not, so a quarter second
- * of nothing is sixty missed packets and not a quiet moment.
- */
-#define CORE_STALE_MS           250
 
 /* ======================================================================
  * ENGINE STATE
@@ -582,7 +576,6 @@ typedef struct _core_state {
 	u64             last_packet_100ns;
 	u64             last_tick_100ns;
 	int             clock_valid;
-	u8              stale;          /* the pad has gone quiet    */
 
 	/* --- decoded input --- */
 	s32             semiaxis[CORE_SEMIAXIS_COUNT];

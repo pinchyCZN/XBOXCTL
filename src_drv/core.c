@@ -1237,10 +1237,21 @@ static void core_emit(core_state *cs, u8 report_id, const u8 *payload, u32 len)
 }
 
 /*
- * EMIT ONLY ON CHANGE. The raw tail is part of the comparison, so a packet
- * whose mapped output is identical but whose stick moved by one count still
- * produces a report - which is what a configurator watching the raw bytes
- * needs.
+ * EMIT ONLY ON CHANGE, AND THE RAW TAIL IS NOT A CHANGE.
+ *
+ * THE TAIL MOVES ON ALMOST EVERY PACKET. The sticks rest a count or two
+ * either side of centre and never settle, so including the tail in the
+ * comparison makes 82 per cent of packets produce a report - two hundred
+ * a second, measured - for a collection that usually has nothing reading
+ * it at all.
+ *
+ * THAT FLOOD IS NOT FREE. hidclass keeps two reads outstanding on this
+ * driver and every report consumes one, so a gamepad report nobody wants
+ * delays the mouse report somebody does. The pointer then moves in
+ * bursts: smooth for a moment, stalled, smooth again.
+ *
+ * The tail still ships in every report that goes out. It simply stops
+ * being a reason to send one.
  */
 static void core_emit_gamepad(core_state *cs)
 {
@@ -1249,7 +1260,7 @@ static void core_emit_gamepad(core_state *cs)
 	core_build_gamepad(cs, payload);
 
 	if (cs->gp_last_valid &&
-	    !core_differs(payload, cs->gp_last, CORE_GAMEPAD_PAYLOAD)) {
+	    !core_differs(payload, cs->gp_last, CORE_GP_RAW)) {
 		return;
 	}
 
@@ -1520,19 +1531,6 @@ void core_on_packet(core_state *cs, const u8 *raw, u32 len, u64 now_100ns)
 	core_decode(cs);
 	core_evaluate(cs, now_100ns);
 
-	/*
-	 * THE POINTER ADVANCES ONLY ON A PACKET, and that is a correctness
-	 * rule rather than an optimisation. Integrating a stick position on
-	 * the periodic tick means that if packets stop - a wedged pipe, a
-	 * pad that has gone quiet, a hub that dropped it - the last
-	 * deflection keeps being replayed and the pointer sails off in that
-	 * direction for as long as the driver is loaded.
-	 *
-	 * The packet rate is also the better clock: 4ms against the tick's
-	 * 16, on a signal that only changes when a packet arrives anyway.
-	 */
-	core_sticks(cs, now_100ns);
-
 	core_emit_gamepad(cs);
 }
 
@@ -1569,39 +1567,29 @@ void core_tick(core_state *cs, u64 now_100ns)
 	}
 
 	/*
-	 * A PAD THAT HAS GONE QUIET LETS GO OF EVERYTHING.
+	 * THE TICK IS THE CLOCK FOR EVERYTHING THAT IS A FUNCTION OF TIME,
+	 * AND THAT INCLUDES THE POINTER.
 	 *
-	 * Polling can stall with nothing to show for it - no error, no
-	 * cancelled transfer, simply no completion - and the last packet
-	 * then describes a pad that may have been put down mid-press.
-	 * Anything held at that moment would stay held: a key repeating
-	 * into a document, a mouse button down, a trigger autofiring.
+	 * THE PAD ONLY SPEAKS WHEN SOMETHING CHANGES. Measured on hardware:
+	 * about five reports a second with nothing touched, and seven to
+	 * ten with a stick held hard against its stop - not the 250 a
+	 * second the endpoint interval suggests. A stick held still is
+	 * silent, because nothing about it is changing.
 	 *
-	 * Releasing is the only safe reading of silence. Real input
-	 * resumes on the next packet.
-	 */
-	if (now_100ns > cs->last_packet_100ns &&
-	    now_100ns - cs->last_packet_100ns >
-	    (u64)CORE_STALE_MS * CORE_100NS_PER_MS) {
-		if (!cs->stale) {
-			cs->stale = 1;
-			core_release_all(cs);
-			core_emit_gamepad(cs);
-		}
-		return;
-	}
-	cs->stale = 0;
-
-	/*
-	 * RE-RUN THE EVALUATION ON THE LAST PACKET SEEN. Repeat deadlines
-	 * are a function of time rather than of packet arrival, so a cycle
-	 * has to keep moving even when nothing new has come in. Packets
-	 * normally get there first at 4ms against this timer's 16; this is
-	 * what covers the gap when they do not.
+	 * So advancing the pointer only when a packet arrives makes it
+	 * update seven times a second while a stick is held, which is felt
+	 * as heavy choppiness. Integrating here instead gives it the tick
+	 * rate regardless of what the pad has to say.
 	 *
-	 * THE STICKS ARE NOT RUN HERE - see core_on_packet.
+	 * SILENCE IS THEREFORE NORMAL AND MUST NOT BE TREATED AS A FAULT.
+	 * Anything that releases held output after a timeout would fire
+	 * constantly between ordinary packets and wipe the sub-pixel
+	 * accumulator with it. Outputs are released on real events -
+	 * removal, stop, power down, a configuration swap - and on nothing
+	 * else.
 	 */
 	core_evaluate(cs, now_100ns);
+	core_sticks(cs, now_100ns);
 	core_emit_gamepad(cs);
 }
 

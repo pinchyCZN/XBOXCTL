@@ -302,28 +302,32 @@ Table of Contents
    full speed, where the unit is a 1ms frame, so a packet arrives every
    4ms. The stick path therefore needs no timer of its own.
 
-   THE ACCUMULATOR ADVANCES ONLY ON A PACKET, AND NOTHING ELSE MAY
-   ADVANCE IT. This is a correctness rule, not a performance choice.
+   THE ACCUMULATOR ADVANCES ON THE TICK, NOT ON PACKET ARRIVAL, AND THE
+   REASON IS A FACT ABOUT THE HARDWARE.
 
-   Interpolating between packets from the last known velocity looks
-   attractive and is a trap. Polling can stall with nothing to show for
-   it - no error, no cancelled transfer, simply no completion - and an
-   interpolator cannot tell that from a stick held still. It replays the
-   last deflection forever, and the pointer sails off in that direction
-   for as long as the driver is loaded. The symptom is indistinguishable
-   from a driver computing the wrong direction; it is the right
-   direction applied to input that stopped arriving.
+   THE PAD REPORTS ONLY WHEN SOMETHING CHANGES. Measured: about five
+   reports a second with nothing touched, and seven to ten with a stick
+   held hard against its stop. Not the 250 the 4ms endpoint interval
+   suggests - a stick held still is silent, because nothing about it is
+   changing. The interval bounds how often it MAY speak, not how often
+   it does.
 
-   THE AUTOFIRE TICK IS A SEPARATE CUSTOMER. A periodic DPC is still
-   needed for repeat deadlines, which really are a function of time
-   rather than of packet arrival, and it re-enters the binding walk with
-   the last decoded state. It does NOT re-enter the stick path. See
-   mapping-engine.txt section 9.
+   So a pointer advanced only on packets updates seven times a second
+   while a stick is held, which is felt as heavy choppiness however
+   correct the arithmetic is. Integrating on the periodic DPC gives it
+   the tick rate instead, and section 3.3 sets that rate.
 
-   THAT TICK ALSO WATCHES FOR SILENCE. After CORE_STALE_MS with no
-   packet it releases every asserted output, because a pad that stopped
-   talking may have been put down mid-press and nothing else would ever
-   let go.
+   SILENCE IS NORMAL AND MUST NOT BE TREATED AS A FAULT. A timeout that
+   released held output after a quiet interval would fire between
+   ordinary packets, drop keys that are genuinely held, and wipe the
+   sub-pixel accumulator with them. Outputs are released on real events
+   - removal, stop, power down, a configuration swap - and on nothing
+   else.
+
+   THE COST IS A POINTER THAT KEEPS MOVING IF THE PIPE EVER WEDGES with
+   a stick deflected, since that is indistinguishable from a stick held
+   still. No such wedge has been observed; what looked like one was this
+   same silence, misread.
 
 3.4.  Timebase And Hitches
 

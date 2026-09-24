@@ -320,7 +320,11 @@ try {
     }
 
     'stats' {
-        $r = Invoke-Ctl $IOCTL.stats (Index-Bytes $Index) 64
+        # 256, not 64. XC_STATS grew when the per-report-id counters
+        # were added, and a buffer sized to the old struct comes back
+        # as error 122 - which reads like a dead device, not a short
+        # buffer.
+        $r = Invoke-Ctl $IOCTL.stats (Index-Bytes $Index) 256
         $b = $r[0]
         $names = @('index', 'packets accepted', 'packets rejected',
                    'reports emitted', 'reports dropped', 'poll errors',

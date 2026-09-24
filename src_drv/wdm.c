@@ -26,7 +26,17 @@
  * keep time advancing if packets stop arriving - a stalled pipe, a pad
  * unplugged mid-autofire - so that whatever is held gets released.
  */
-#define XC_TICK_PERIOD_MS       16
+/*
+ * 8ms, 125 Hz, which is the rate the Adaptoid polls at and the rate
+ * its pointer is smooth at.
+ *
+ * THIS IS THE POINTER'S CLOCK, NOT A HOUSEKEEPING INTERVAL. The pad
+ * reports only when something changes - five to ten times a second
+ * with a stick held - so the tick is what the stick pipeline
+ * integrates on. At 16ms the pointer stepped 62 times a second and
+ * looked it.
+ */
+#define XC_TICK_PERIOD_MS       8
 
 /* ======================================================================
  * SEAMS WIRED ONLY IN ONE BUILD

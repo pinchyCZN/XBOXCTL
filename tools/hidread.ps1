@@ -3,9 +3,20 @@
     GUEST side. No elevation needed.
 
         powershell -ExecutionPolicy Bypass -File hidread.ps1            gamepad
-        powershell -ExecutionPolicy Bypass -File hidread.ps1 -Col 2     keyboard
+        powershell -ExecutionPolicy Bypass -File hidread.ps1 -Caps -Col 1  mouse
+
+    THE GAMEPAD IS Col03. The collections are declared mouse, keyboard,
+    gamepad, so the gamepad is the third child and the only one that can
+    be READ - mouhid and kbdhid hold the other two exclusively. -Caps
+    works on all three because it opens with no access rights.
         powershell -ExecutionPolicy Bypass -File hidread.ps1 -Quiet     count only
         powershell -ExecutionPolicy Bypass -File hidread.ps1 -NoSticks
+        powershell -ExecutionPolicy Bypass -File hidread.ps1 -Jitter
+
+    -Jitter MEASURES HOW MUCH THE STICKS MOVE WHEN NOBODY IS TOUCHING
+    THEM. It reports the spread of each axis in the pad's own raw counts
+    and in the scaled counts this driver emits, which is what a report
+    threshold has to clear. Leave the pad alone while it runs.
         powershell -ExecutionPolicy Bypass -File hidread.ps1 -Caps -Col 3
 
     -Caps SAYS WHAT WINDOWS THINKS THE REPORTS LOOK LIKE, which is not
@@ -53,10 +64,15 @@ param(
     [string]$VendorId = '045e',
     [Alias('Pid')]
     [string]$ProductId = '0285',
-    [int]$Col = 1,
+    # 3, THE GAMEPAD, because it is the only collection anything can
+    # open for reading. The order is mouse, keyboard, gamepad - see
+    # ../docs/driver-plan.txt section 4.1 for why that order matters -
+    # and mouhid and kbdhid hold the first two exclusively.
+    [int]$Col = 3,
     [switch]$Quiet,
     [switch]$NoSticks,
     [switch]$Caps,
+    [switch]$Jitter,
     [int]$Seconds = 0
 )
 
@@ -287,8 +303,78 @@ if ($Caps) {
 $h = [NativeHid]::CreateFile($path, $GENERIC_READ, $FILE_SHARE_RW,
                              [IntPtr]::Zero, $OPEN_EXISTING, 0, [IntPtr]::Zero)
 if ($h -eq [IntPtr](-1)) {
-    Write-Host "  CreateFile failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+    $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    Write-Host "  CreateFile failed: $err"
+    if ($err -eq 5) {
+        Write-Host ""
+        Write-Host "  Access denied. THE COLLECTION ORDER CHANGED: Col01 is"
+        Write-Host "  now the MOUSE and Col02 the KEYBOARD, and mouhid and"
+        Write-Host "  kbdhid hold those exclusively - nothing else may read"
+        Write-Host "  them. The gamepad is Col03."
+        Write-Host ""
+        Write-Host "      hidread.ps1            reads the gamepad"
+        Write-Host "      hidread.ps1 -Caps -Col 1   works on any of them"
+    }
     exit 1
+}
+
+if ($Jitter) {
+    if ($Seconds -le 0) { $Seconds = 5 }
+    Write-Host "  measuring for $Seconds seconds - DO NOT TOUCH THE PAD"
+
+    # Raw stick counts live in the diagnostic tail; the scaled axes this
+    # driver emits are earlier in the same report. Measuring both gives
+    # the threshold in whichever unit it ends up being expressed in.
+    # driver-plan.txt section 4.2 has the layout.
+    $axes = @(
+        @{ n = 'LX raw   '; at = 29; w = 2 },
+        @{ n = 'LY raw   '; at = 31; w = 2 },
+        @{ n = 'RX raw   '; at = 33; w = 2 },
+        @{ n = 'RY raw   '; at = 35; w = 2 },
+        @{ n = 'X  scaled'; at =  3; w = 2 },
+        @{ n = 'Y  scaled'; at =  5; w = 2 },
+        @{ n = 'Rx scaled'; at =  7; w = 2 },
+        @{ n = 'Ry scaled'; at =  9; w = 2 }
+    )
+    foreach ($a in $axes) { $a.min = 32767; $a.max = -32768 }
+
+    $samples = 0
+    $changed = 0
+    $prev = $null
+    $stop = (Get-Date).AddSeconds($Seconds)
+    $jbuf = New-Object byte[] 64
+    while ((Get-Date) -lt $stop) {
+        $got = 0
+        if (-not [NativeHid]::ReadFile($h, $jbuf, $jbuf.Length, [ref]$got,
+                                       [IntPtr]::Zero)) { break }
+        $samples++
+        foreach ($a in $axes) {
+            $v = [BitConverter]::ToInt16($jbuf, $a.at)
+            if ($v -lt $a.min) { $a.min = $v }
+            if ($v -gt $a.max) { $a.max = $v }
+        }
+        $key = ''
+        for ($j = 1; $j -le 16; $j++) { $key += '{0:x2}' -f $jbuf[$j] }
+        if ($null -ne $prev -and $key -ne $prev) { $changed++ }
+        $prev = $key
+    }
+
+    Write-Host ""
+    Write-Host "  $samples reports in $Seconds seconds"
+    Write-Host "  axis         min      max    spread"
+    foreach ($a in $axes) {
+        $line = "  {0}  {1,7}  {2,7}  {3,8}" -f $a.n, $a.min, $a.max, ($a.max - $a.min)
+        Write-Host $line
+    }
+    Write-Host ""
+    Write-Host "  $changed of $samples reports had a DIFFERENT mapped payload"
+    Write-Host "  (buttons, axes, hat, layer - not the raw tail)."
+    Write-Host ""
+    Write-Host "  A report threshold must clear the SCALED spread above."
+    Write-Host "  Anything larger than that stops the jitter producing"
+    Write-Host "  reports; anything smaller does not."
+    $null = [NativeHid]::CloseHandle($h)
+    exit 0
 }
 
 Write-Host "  reading - Ctrl+C to stop"

@@ -20,10 +20,20 @@ mode = off
 
 [stick right]
 mode = mouse
-deadzone = 7000         # radial, in 35000ths. Raise if the stick drifts
-outer = 33000           # deflection treated as full
+# DEADZONE IS MEASURED, NOT GUESSED. The stick jitters one or two raw
+# counts out of 32767 at rest, which is about two units out of 35000.
+# 1500 is a generous margin over that. A large deadzone does not make
+# the pointer steadier - it throws away the whole fine-control region
+# near centre, which is exactly where slow movement comes from.
+deadzone = 1500         # radial, in 35000ths
+outer = 32000           # deflection treated as full
+
+# SLOW CONTROL COMES FROM THE CURVE, NOT FROM A LOW TOP SPEED. A cubic
+# gives an eighth of the speed at half deflection where a linear gives
+# a half, so the first third of stick travel is a creep and the last
+# third is a flick.
 max_speed = 2800        # pixels per second at full deflection
-curve = quad            # linear | quad | cubic | smoothstep | <y1> <y2>
+curve = cubic           # linear | quad | cubic | smoothstep | <y1> <y2>
 gain_x = 128            # 128 = 1.0
 gain_y = 54             # 54/128 = 0.42, slower vertical, as shipped
 invert_y = 0            # 1 for inverted aiming

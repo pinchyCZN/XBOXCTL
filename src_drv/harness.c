@@ -2056,8 +2056,17 @@ static void stick_config(core_config *cfg)
 	core_config_suppress(cfg);
 }
 
-/* Hold the right stick at (x, y) for one second of 4ms packets. */
-static void stick_hold(core_state *cs, s16 x, s16 y, u64 *t, int packets)
+/*
+ * Hold the right stick at (x, y) for a number of ticks.
+ *
+ * ONE PACKET, THEN TICKS, BECAUSE THAT IS WHAT THE PAD DOES. It reports
+ * only when something changes - measured at five reports a second with
+ * nothing touched and seven to ten with a stick held against its stop -
+ * so a held stick is silent. Feeding a packet per tick would test a
+ * device that does not exist and would hide the very starvation this
+ * arrangement exists to prevent.
+ */
+static void stick_hold(core_state *cs, s16 x, s16 y, u64 *t, int ticks)
 {
 	u8  packet[CORE_RAW_PACKET_BYTES];
 	int k;
@@ -2065,9 +2074,14 @@ static void stick_hold(core_state *cs, s16 x, s16 y, u64 *t, int packets)
 	make_packet(packet);
 	put_le16(&packet[CORE_RAW_RSTICK_X], x);
 	put_le16(&packet[CORE_RAW_RSTICK_Y], y);
-	for (k = 0; k < packets; k++) {
-		*t += 4 * CORE_100NS_PER_MS;
-		core_on_packet(cs, packet, CORE_RAW_PACKET_BYTES, *t);
+
+	/* The packet costs no time of its own, so the elapsed interval is
+	 * exactly the ticks that follow and the arithmetic below is exact. */
+	core_on_packet(cs, packet, CORE_RAW_PACKET_BYTES, *t);
+
+	for (k = 0; k < ticks; k++) {
+		*t += 8 * CORE_100NS_PER_MS;
+		core_tick(cs, *t);
 	}
 }
 
@@ -2102,7 +2116,7 @@ static int test_sticks(void)
 	core_init(&cs, recording_sink, NULL);
 	core_set_config(&cs, blob, len, NULL);
 	sink_reset();
-	stick_hold(&cs, 1200, 0, &t, 100);      /* about 1280 units */
+	stick_hold(&cs, 1200, 0, &t, 50);      /* about 1280 units */
 	sink_mouse_total(&dx, &dy);
 	check_eq(dx, 0, "inside the deadzone the pointer does not move");
 	check_eq(dy, 0, "on either axis");
@@ -2112,7 +2126,7 @@ static int test_sticks(void)
 	core_set_config(&cs, blob, len, NULL);
 	stick_hold(&cs, 32767, 0, &t, 2);       /* prime the clock */
 	sink_reset();
-	stick_hold(&cs, 32767, 0, &t, 250);     /* one second */
+	stick_hold(&cs, 32767, 0, &t, 125);     /* one second */
 	sink_mouse_total(&dx, &dy);
 	check(dx > 2750 && dx < 2810,
 	      "a second at full deflection moves about max_speed pixels");
@@ -2120,7 +2134,7 @@ static int test_sticks(void)
 
 	/* --- THE ACCUMULATOR: no drift over time ---------------------- */
 	sink_reset();
-	stick_hold(&cs, 32767, 0, &t, 1000);    /* four seconds */
+	stick_hold(&cs, 32767, 0, &t, 500);    /* four seconds */
 	sink_mouse_total(&dx, &dy);
 	{
 		long expected = 4 * dx / 4;     /* silence unused warnings */
@@ -2137,7 +2151,7 @@ static int test_sticks(void)
 	core_set_config(&cs, blob, len, NULL);
 	stick_hold(&cs, -32767, 0, &t, 2);
 	sink_reset();
-	stick_hold(&cs, -32767, 0, &t, 1000);
+	stick_hold(&cs, -32767, 0, &t, 500);
 	sink_mouse_total(&dx2, &dy2);
 	check(dx2 < 0 && (-dx2 > dx - 8) && (-dx2 < dx + 8),
 	      "LEFT MOVES EXACTLY AS FAR AS RIGHT. A shift instead of a"
@@ -2149,7 +2163,7 @@ static int test_sticks(void)
 	core_set_config(&cs, blob, len, NULL);
 	stick_hold(&cs, 32767, 32767, &t, 2);
 	sink_reset();
-	stick_hold(&cs, 32767, 32767, &t, 250);
+	stick_hold(&cs, 32767, 32767, &t, 125);
 	sink_mouse_total(&dx2, &dy2);
 	{
 		/* The magnitude of the diagonal, times 1000 to stay integer. */
@@ -2173,7 +2187,7 @@ static int test_sticks(void)
 	core_set_config(&cs, blob, len, NULL);
 	stick_hold(&cs, 16383, 0, &t, 2);
 	sink_reset();
-	stick_hold(&cs, 16383, 0, &t, 250);
+	stick_hold(&cs, 16383, 0, &t, 125);
 	sink_mouse_total(&dx, &dy);
 	check(dx > 1330 && dx < 1470,
 	      "with a linear curve, half deflection is half speed");
@@ -2196,7 +2210,7 @@ static int test_sticks(void)
 		core_set_config(&cs, blob, len, NULL);
 		stick_hold(&cs, 16383, 0, &t, 2);
 		sink_reset();
-		stick_hold(&cs, 16383, 0, &t, 250);
+		stick_hold(&cs, 16383, 0, &t, 125);
 		sink_mouse_total(&dx, &dy);
 		check(dx > 640 && dx < 780,
 		      "and with a quadratic one it is a QUARTER - the table is"
@@ -2210,7 +2224,7 @@ static int test_sticks(void)
 	core_set_config(&cs, blob, len, NULL);
 	stick_hold(&cs, 0, 32767, &t, 2);       /* pad Y is up-positive */
 	sink_reset();
-	stick_hold(&cs, 0, 32767, &t, 250);
+	stick_hold(&cs, 0, 32767, &t, 125);
 	sink_mouse_total(&dx, &dy);
 	check(dy < 0,
 	      "PUSHING THE STICK UP MOVES THE POINTER UP. Screen Y grows"
@@ -2225,7 +2239,7 @@ static int test_sticks(void)
 	core_set_config(&cs, blob, len, NULL);
 	stick_hold(&cs, 0, 32767, &t, 2);
 	sink_reset();
-	stick_hold(&cs, 0, 32767, &t, 250);
+	stick_hold(&cs, 0, 32767, &t, 125);
 	sink_mouse_total(&dx, &dy);
 	check(dy < 0,
 	      "UP IS UP UNDER THE BUILT-IN CONFIGURATION TOO. The decode"
@@ -2233,33 +2247,43 @@ static int test_sticks(void)
 	      " down-positive one, so inverting again here would aim the"
 	      " wrong way out of the box");
 
-	/* --- A PAD THAT GOES QUIET STOPS THE POINTER ------------------ */
+	/* --- THE TICK IS WHAT MOVES THE POINTER ----------------------- */
 	core_init(&cs, recording_sink, NULL);
 	stick_config(&cfg);
 	len = core_config_save(&cfg, blob, sizeof(blob));
 	core_set_config(&cs, blob, len, NULL);
 
-	/* Hold the stick over, then stop delivering packets and let the
-	 * periodic tick run on by itself. */
-	stick_hold(&cs, 32767, 0, &t, 10);
-	sink_reset();
+	/*
+	 * ONE packet puts the stick over, and then nothing else arrives -
+	 * which is exactly what the hardware does with a stick held still.
+	 * Every pixel below comes from the tick.
+	 */
 	{
+		u8  packet[CORE_RAW_PACKET_BYTES];
 		int k;
 
-		for (k = 0; k < 200; k++) {     /* 3.2 seconds of ticks */
-			t += 16 * CORE_100NS_PER_MS;
+		make_packet(packet);
+		put_le16(&packet[CORE_RAW_RSTICK_X], 32767);
+		t += 4 * CORE_100NS_PER_MS;
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t);
+		t += 8 * CORE_100NS_PER_MS;
+		core_tick(&cs, t);
+		sink_reset();
+
+		for (k = 0; k < 125; k++) {     /* one second of ticks */
+			t += 8 * CORE_100NS_PER_MS;
 			core_tick(&cs, t);
 		}
 	}
 	sink_mouse_total(&dx, &dy);
-	check_eq(dx, 0,
-	         "THE TICK DOES NOT MOVE THE POINTER. Integrating the last"
-	         " stick position on the tick means a pad that stops"
-	         " delivering sails the cursor off in whatever direction it"
-	         " was last pushed, for as long as the driver is loaded");
-	check_eq(dy, 0, "on either axis");
+	check(dx > 2750 && dx < 2810,
+	      "A HELD STICK KEEPS MOVING THE POINTER WITH NO FURTHER"
+	      " PACKETS. The pad reports only on change, so a stick held"
+	      " still is silent; a pointer that advanced only on packets"
+	      " would step about seven times a second");
+	check_eq(dy, 0, "and only on the axis that was pushed");
 
-	/* --- and a pad that goes quiet lets go of what it held --------- */
+	/* --- and silence is not a fault ------------------------------- */
 	core_init(&cs, recording_sink, NULL);
 	core_config_defaults(&cfg);
 	cfg.layout[0].binding[1].source = CORE_SA_A;
@@ -2274,26 +2298,20 @@ static int test_sticks(void)
 
 		make_packet(packet);
 		packet[CORE_RAW_ANALOG_BASE + 0] = 255;         /* hold A */
-		for (k = 0; k < 4; k++) {
-			t += 4 * CORE_100NS_PER_MS;
-			core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t);
-		}
-		check_eq(cs.kb.count, 1, "A is holding W down");
-
-		/* Packets stop. The tick runs on. */
-		for (k = 0; k < 40; k++) {
-			t += 16 * CORE_100NS_PER_MS;
-			core_tick(&cs, t);
-		}
-		check_eq(cs.kb.count, 0,
-		         "AND A QUARTER SECOND OF SILENCE RELEASES IT. A pad put"
-		         " down mid-press would otherwise type into a document"
-		         " until it was unplugged");
-
-		/* Real input resumes on the next packet. */
 		t += 4 * CORE_100NS_PER_MS;
 		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t);
-		check_eq(cs.kb.count, 1, "and the next packet takes it back");
+		check_eq(cs.kb.count, 1, "A is holding W down");
+
+		/* Seconds of ticks with no packet at all. */
+		for (k = 0; k < 500; k++) {
+			t += 8 * CORE_100NS_PER_MS;
+			core_tick(&cs, t);
+		}
+		check_eq(cs.kb.count, 1,
+		         "AND FOUR SECONDS OF SILENCE DOES NOT RELEASE IT. A pad"
+		         " that speaks only on change is silent whenever nothing"
+		         " is moving, so a timeout would fire between ordinary"
+		         " packets and drop what is genuinely held");
 	}
 
 	/* --- acceleration builds with time held ----------------------- */
@@ -2308,10 +2326,10 @@ static int test_sticks(void)
 
 	stick_hold(&cs, 32767, 0, &t, 2);
 	sink_reset();
-	stick_hold(&cs, 32767, 0, &t, 250);     /* first second */
+	stick_hold(&cs, 32767, 0, &t, 125);     /* first second */
 	sink_mouse_total(&dx, &dy);
 	sink_reset();
-	stick_hold(&cs, 32767, 0, &t, 250);     /* second second */
+	stick_hold(&cs, 32767, 0, &t, 125);     /* second second */
 	sink_mouse_total(&dx2, &dy2);
 	check(dx2 > dx,
 	      "HELD AT THE EDGE, THE TURN KEEPS BUILDING. No curve of any"
