@@ -97,6 +97,17 @@ typedef signed   long long  s64;
  * clamping at the end lets a real full deflection reach real full scale.
  * ====================================================================== */
 
+/*
+ * THE PERIODIC TICK. wdm.c arms its timer at this and the engine is
+ * bounded by it, so the two must not be allowed to disagree - a rate
+ * the engine cannot produce is worse than one it refuses.
+ *
+ * A REPEAT CYCLE NEEDS ONE TICK TO ASSERT AND ONE TO RELEASE, so the
+ * fastest autofire is half the tick rate: 62 Hz at 8ms.
+ */
+#define CORE_TICK_MS            8
+#define CORE_MAX_REPEAT_HZ      (1000 / (2 * CORE_TICK_MS))
+
 #define CORE_MAX_VALUE          35000
 #define CORE_OUT_AXIS_SCALE     32767
 
@@ -415,8 +426,7 @@ typedef struct _core_config_header {    /* 32 bytes */
 	u8  binding_count;      /* per layout                           */
 	u8  chord_count;
 	u8  collections;        /* bit 0 gamepad, 1 keyboard, 2 mouse   */
-	u16 tick_hz;
-	u8  reserved[14];
+	u8  reserved[16];
 } core_config_header;
 
 /*
@@ -430,7 +440,6 @@ typedef struct _core_config {
 	u8          binding_count;
 	u8          chord_count;
 	u8          collections;
-	u16         tick_hz;
 	core_stick  stick[CORE_STICK_COUNT];    /* global, not per layer */
 	core_layout layout[CORE_MAX_LAYOUTS];
 

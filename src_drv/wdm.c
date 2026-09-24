@@ -36,7 +36,7 @@
  * integrates on. At 16ms the pointer stepped 62 times a second and
  * looked it.
  */
-#define XC_TICK_PERIOD_MS       8
+#define XC_TICK_PERIOD_MS       CORE_TICK_MS
 
 /* ======================================================================
  * SEAMS WIRED ONLY IN ONE BUILD

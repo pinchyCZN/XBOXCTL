@@ -11,9 +11,6 @@
 # never evaluates one. Two numbers describe it - see analog-to-mouse.txt
 # section 4.1 - and the presets below cover the shipped Adaptoid profiles.
 
-[global]
-tick_hz = 250
-
 # The left stick stays a joystick: WASD-style movement wants the axes.
 [stick left]
 mode = off

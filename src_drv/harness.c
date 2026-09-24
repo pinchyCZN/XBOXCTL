@@ -1042,7 +1042,6 @@ static int test_config(void)
 	core_config_defaults(&cfg);
 	check(cfg.valid, "the built-in configuration is valid");
 	check_eq(cfg.layout_count, 2, "two layouts, not eight");
-	check_eq(cfg.tick_hz, 250, "ticking at the measured poll rate");
 
 	check_eq(cfg.layout[0].chord[0].member[0], CORE_SA_START,
 	         "chord 0 is Start");
@@ -1172,8 +1171,10 @@ static int test_config(void)
 	         "a hard point past full scale is clamped to it - left"
 	         " alone it could never be reached, so the autofire it was"
 	         " asked for would silently never run");
-	check_eq(back.layout[0].binding[5].repeat_hz, 125,
-	         "autofire is capped at half the tick rate");
+	check_eq(back.layout[0].binding[5].repeat_hz, CORE_MAX_REPEAT_HZ,
+	         "autofire is capped at half the TICK rate, which is what"
+	         " the engine can actually produce - a cycle needs one tick"
+	         " to assert and one to release");
 	check(back.stick[0].outer > back.stick[0].deadzone,
 	      "outer is pushed above deadzone so the rescale cannot"
 	      " divide by zero");
@@ -2034,6 +2035,54 @@ static int test_autofire(void)
 	      "past the delay it repeats - the keyboard behaviour, where a"
 	      " held key types once, pauses, then runs");
 
+	/* --- THE RATE IS THE RATE, ON THE TICK ------------------------ */
+	{
+		/*
+		 * DRIVEN BY THE TICK AND NOT BY PACKETS, because that is what
+		 * the hardware does: the pad reports only when something
+		 * changes, so a held button is silent and every flip below has
+		 * to come from the timer.
+		 *
+		 * A deadline is noticed at the first tick AT OR AFTER it, never
+		 * exactly on it. Measuring the next half period from that
+		 * moment rounds every half up to a whole tick and pays the
+		 * error again every half, which quantises the rate instead of
+		 * jittering it - 20 Hz ran at 15. The deadline therefore
+		 * advances by exactly half a period.
+		 */
+		static const int RATES[] = { 5, 10, 12, 20, 30 };
+		int r;
+
+		for (r = 0; r < 5; r++) {
+			core_init(&cs, recording_sink, NULL);
+			core_config_defaults(&cfg);
+			cfg.layout[0].binding[1].source    = CORE_SA_A;
+			cfg.layout[0].binding[1].action    = CORE_ACT_JOY_BUTTON;
+			cfg.layout[0].binding[1].code      = 1;
+			cfg.layout[0].binding[1].flags     = CORE_BF_REPEAT;
+			cfg.layout[0].binding[1].repeat_hz = (u8)RATES[r];
+			core_config_suppress(&cfg);
+			len = core_config_save(&cfg, blob, sizeof(blob));
+			core_set_config(&cs, blob, len, NULL);
+
+			make_packet(packet);
+			packet[CORE_RAW_ANALOG_BASE + 0] = 255;
+			t += PACKET;
+			core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t);
+			sink_reset();
+
+			/* One second of ticks, and not one packet. */
+			for (k = 0; k < 1000 / CORE_TICK_MS; k++) {
+				t += CORE_TICK_MS * CORE_100NS_PER_MS;
+				core_tick(&cs, t);
+			}
+			check_eq(g_SinkDropped, 0,
+			         "the ring held every report, so the count is real");
+			check_eq(sink_button_presses(0x0001), RATES[r],
+			         "repeat_hz presses EXACTLY that many times a second");
+		}
+	}
+
 	/* --- a wheel with REPEAT scrolls once per period -------------- */
 	core_init(&cs, recording_sink, NULL);
 	core_config_defaults(&cfg);
@@ -2773,8 +2822,8 @@ static int load_blob(const char *path)
 		return 1;
 	}
 
-	printf("  %s: %u bytes, %u layout(s), tick %u Hz\n",
-	       path, (unsigned)len, cfg.layout_count, cfg.tick_hz);
+	printf("  %s: %u bytes, %u layout(s)\n",
+	       path, (unsigned)len, cfg.layout_count);
 	if (repaired) {
 		printf("  %u field(s) REPAIRED - the blob was accepted but\n"
 		       "  not as written; dump it to see what changed\n",

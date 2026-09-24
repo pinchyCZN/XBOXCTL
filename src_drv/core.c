@@ -935,7 +935,27 @@ static int core_repeat(const core_binding *b, core_bind_state *st,
 		fired = 1;
 	} else if (now_100ns >= st->repeat_at) {
 		st->repeat_on = (u8)(!st->repeat_on);
-		st->repeat_at = now_100ns + half;
+
+		/*
+		 * THE NEXT DEADLINE COMES FROM THE LAST ONE, NOT FROM NOW.
+		 *
+		 * This runs on the tick, so a deadline is noticed at the first
+		 * tick AT OR AFTER it, never exactly on it. Measuring the next
+		 * half period from that moment rounds every half up to a whole
+		 * tick and the error is paid again every half, so the rate is
+		 * quantised rather than jittered: 20 Hz asked for a 25ms half,
+		 * got 32, and ran at 15 Hz. Advancing the deadline by exactly
+		 * half keeps the average right and leaves only phase jitter.
+		 *
+		 * RESYNC IF A WHOLE PERIOD WAS MISSED rather than catching up.
+		 * Deadlines that have fallen behind real time would otherwise
+		 * fire on consecutive ticks until they caught up, turning a
+		 * stall into a burst.
+		 */
+		st->repeat_at += half;
+		if (st->repeat_at <= now_100ns) {
+			st->repeat_at = now_100ns + half;
+		}
 		if (st->repeat_on) {
 			fired = 1;
 		}
@@ -1721,7 +1741,6 @@ typedef char core_cfg_size_check[
      sizeof(core_layout)        == 420 &&
      sizeof(core_config_header) == 32) ? 1 : -1];
 
-#define CORE_CFG_DEFAULT_TICK_HZ    250
 #define CORE_CFG_DEFAULT_AUTOFIRE   12      /* Hz */
 
 static u32 core_cfg_blob_bytes(u32 layout_count)
@@ -1800,7 +1819,6 @@ void core_config_defaults(core_config *cfg)
 	cfg->binding_count = CORE_MAX_BINDINGS;
 	cfg->chord_count   = CORE_MAX_CHORDS;
 	cfg->collections   = 0x07;      /* gamepad, keyboard, mouse */
-	cfg->tick_hz       = CORE_CFG_DEFAULT_TICK_HZ;
 
 	core_stick_defaults(&cfg->stick[0]);
 	core_stick_defaults(&cfg->stick[1]);
@@ -1947,7 +1965,7 @@ static int core_cfg_clamp16(u16 *v, u16 lo, u16 hi)
 }
 
 static u32 core_cfg_fix_binding(core_binding *b, u8 layout_count,
-                                u8 chord_count, u16 tick_hz)
+                                u8 chord_count)
 {
 	u32 fixed = 0;
 	u16 axis;
@@ -2025,11 +2043,12 @@ static u32 core_cfg_fix_binding(core_binding *b, u8 layout_count,
 
 	/*
 	 * A REPEAT CYCLE NEEDS A TICK TO ASSERT AND A TICK TO RELEASE, so a
-	 * rate above half the tick rate cannot be represented and would
-	 * silently become something else.
+	 * rate above half the TICK rate cannot be produced at all. Clamping
+	 * against anything else lets a profile ask for a rate the engine
+	 * silently does not deliver.
 	 */
-	if (b->repeat_hz > tick_hz / 2) {
-		b->repeat_hz = (u8)(tick_hz / 2);
+	if (b->repeat_hz > CORE_MAX_REPEAT_HZ) {
+		b->repeat_hz = (u8)CORE_MAX_REPEAT_HZ;
 		fixed++;
 	}
 
@@ -2169,12 +2188,6 @@ int core_config_load(core_config *cfg, const u8 *blob, u32 len,
 	cfg->binding_count = hdr.binding_count;
 	cfg->chord_count   = hdr.chord_count;
 	cfg->collections   = (u8)(hdr.collections & 0x07);
-	cfg->tick_hz       = hdr.tick_hz;
-
-	if (cfg->tick_hz < 8 || cfg->tick_hz > 1000) {
-		cfg->tick_hz = CORE_CFG_DEFAULT_TICK_HZ;
-		fixed++;
-	}
 
 	off = hdr.header_bytes;
 	for (i = 0; i < CORE_STICK_COUNT; i++) {
@@ -2196,8 +2209,7 @@ int core_config_load(core_config *cfg, const u8 *blob, u32 len,
 			}
 			fixed += core_cfg_fix_binding(&lay->binding[i],
 			                              cfg->layout_count,
-			                              cfg->chord_count,
-			                              cfg->tick_hz);
+			                              cfg->chord_count);
 		}
 		for (i = 0; i < CORE_MAX_CHORDS; i++) {
 			core_chord *ch = &lay->chord[i];
@@ -2255,7 +2267,6 @@ u32 core_config_save(const core_config *cfg, u8 *blob, u32 len)
 	hdr.binding_count = cfg->binding_count;
 	hdr.chord_count  = cfg->chord_count;
 	hdr.collections  = cfg->collections;
-	hdr.tick_hz      = cfg->tick_hz;
 
 	core_copy(blob, &hdr, (u32)sizeof(hdr));
 	off = (u32)sizeof(hdr);

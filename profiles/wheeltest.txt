@@ -7,9 +7,6 @@
 # document scrolls up; the further you push, the faster. Sideways on the
 # left stick does nothing - a wheel has one axis.
 
-[global]
-tick_hz = 250
-
 # max_speed IS DETENTS PER SECOND IN WHEEL MODE, NOT PIXELS. A pointer
 # wants thousands; a wheel wants ten or twenty. The same field means a
 # very different number here, and 2800 would scroll a document into next
@@ -60,8 +57,8 @@ rtrigger -> mouse_button 1 repeat 12 hard 69%
 # A hard press on A autofires the letter a. 12 Hz, not 100 - the driver
 # caps a repeat at half the tick rate, and a key going down and up a
 # hundred times a second floods the keyboard path for no benefit.
-a -> key a repeat 12 hard 75%
-b -> key lctrl toggle          # press to latch down, press again to lift
+a -> joy_button 1 repeat 50 hard 75%
+b -> key b repeat 50 hard 50%          # press to latch down, press again to lift
 x -> key r
 y -> mouse_wheel 1             # one detent per press
 white -> mouse_wheel -1

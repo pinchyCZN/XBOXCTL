@@ -410,6 +410,26 @@ Table of Contents
    instant; a non-zero value gives the familiar keyboard behaviour where
    a held key types once, pauses, then repeats.
 
+   repeat_hz IS COMPLETE DOWN-UP CYCLES PER SECOND. At 20 the control is
+   asserted 20 times and released 20 times in a second, each half lasting
+   25ms. It is not 20 half-flips and not 20 edges.
+
+   THE CEILING IS HALF THE TICK RATE, which is 62 Hz at an 8ms tick. A
+   cycle needs one tick to assert and one to release; there is no way to
+   express anything faster, so a higher figure is clamped rather than
+   accepted and quietly approximated.
+
+   ADVANCE THE DEADLINE BY EXACTLY HALF A PERIOD, never from the moment
+   the deadline was noticed. The engine runs on the tick, so a deadline
+   falls due BETWEEN ticks and is acted on at the first tick at or after
+   it. Measuring the next half from that moment rounds every half up to
+   a whole tick, and the error is paid again every half rather than
+   averaging out: a 25ms half becomes 32ms and 20 Hz runs at 15. Adding
+   half to the previous deadline leaves only phase jitter, which nothing
+   can perceive, and keeps the rate exact. Resync if a whole period has
+   been missed, so a stall does not come back as a burst of catch-up
+   flips.
+
    hard_at IS WHERE THE PRESSURE GOES. With it set, a REPEAT binding is
    an ordinary hold until the control is pushed past it and repeats from
    there; ease off below it and the cycle resets and it is a hold again,
@@ -641,8 +661,7 @@ Table of Contents
            u8  chord_count;
            u8  collections;         /* bit 0 gamepad, 1 keyboard,
                                        2 mouse - driver-plan.txt 4.3 */
-           u16 tick_hz;
-           u8  reserved[12];
+           u8  reserved[16];
        };
 
        then, once and not per layout,
@@ -681,9 +700,10 @@ Table of Contents
    CLAMP EVERY ACTION CODE TO THE DESCRIPTOR. A JOY_BUTTON index above
    sixteen, or a JOY_AXIS above five, is an out-of-range write into a
    report buffer at DISPATCH_LEVEL - the descriptor is the bound, and
-   section 3 is the list. Clamp repeat_hz to tick_hz / 2 as well: a
+   section 3 is the list. Clamp repeat_hz to half the TICK rate as well:
+   a
    repeat cycle needs one tick to assert and one to release, so a rate
-   above half the tick rate cannot be represented and silently becomes
+   above that cannot be represented and silently becomes
    something else. THE BLOB ARRIVES FROM USER MODE AND IS PARSED AT
    DISPATCH_LEVEL; there is no second chance.
 

@@ -12,9 +12,6 @@
 # does not produce a steady press and a pulsing one at the same time. Add
 # the word "passthrough" to a binding to get both.
 
-[global]
-tick_hz = 250
-
 # Both sticks stay plain joystick axes. Set mode = mouse to hand a stick to
 # the pointer pipeline instead; the curve is computed here and shipped as a
 # 33-entry table, so the driver never evaluates one.

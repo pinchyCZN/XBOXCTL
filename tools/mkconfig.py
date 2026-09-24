@@ -33,7 +33,7 @@ CHORD_MEMBERS = 3
 CURVE_POINTS = 33
 STICK_COUNT = 2
 
-HDR_FMT = "<IHHHHBBBBH14s"
+HDR_FMT = "<IHHHHBBBB16s"
 BINDING_FMT = "<BBHHBBHH"
 CHORD_FMT = "<BBBB"
 STICK_FMT = "<7H6B2x33H"
@@ -221,7 +221,6 @@ class Layout(object):
 
 class Config(object):
     def __init__(self):
-        self.tick_hz = 250
         self.collections = 0x07
         self.sticks = [Stick(), Stick()]
         self.layouts = [Layout(i) for i in range(MAX_LAYOUTS)]
@@ -230,7 +229,7 @@ class Config(object):
         hdr = struct.pack(HDR_FMT, SIGNATURE, VERSION, HDR_SIZE,
                           LAYOUT_SIZE, STICK_SIZE, MAX_LAYOUTS,
                           MAX_BINDINGS, MAX_CHORDS, self.collections,
-                          self.tick_hz, b"\0" * 14)
+                          b"\0" * 16)
         out = hdr
         for st in self.sticks:
             out += st.pack()
@@ -407,8 +406,14 @@ def parse_profile(text):
                 continue
 
             if section == "global":
-                key, _, value = line.partition("=")
-                setattr(cfg, key.strip(), int(value.strip(), 0))
+                # [global] HAS NO SETTINGS. An empty section header still
+                # parses, so an existing profile is not broken by its
+                # presence, but a key in it is an error rather than a
+                # silent no-op: the tick period is a property of the
+                # driver, not of a profile.
+                key, _, _value = line.partition("=")
+                raise ValueError("unknown setting '%s' - [global] has no"
+                                 " settings" % key.strip())
             elif section == "stick":
                 key, _, value = line.partition("=")
                 key = key.strip().lower()
