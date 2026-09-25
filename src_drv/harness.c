@@ -1292,6 +1292,45 @@ static int test_bindings(void)
 	bind_press(&cs, packet, 0, 0, t += 4000);
 	check_eq(cs.kb.count, 0, "and only zero releases it");
 
+	/* --- WHICH SEMIAXIS EACH PHYSICAL PUSH LANDS IN --------------- */
+	{
+		/*
+		 * PINNED, because the answer is counter-intuitive and a name
+		 * table has already been written against the wrong one. The pad
+		 * reports Y up-positive; the decode negates it once so the value
+		 * is down-positive the way HID wants. A physical UP push
+		 * therefore lands in the semiaxis named YNEG, and anything
+		 * calling YPOS "up" fires on the wrong thumb direction.
+		 */
+		core_init(&cs, recording_sink, NULL);
+		core_config_defaults(&cfg);
+		bind_install(&cs, &cfg);
+		make_packet(packet);
+
+		put_le16(&packet[CORE_RAW_RSTICK_Y], 32767);
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		check(cs.semiaxis[CORE_SA_RSTICK_YNEG] > CORE_MAX_VALUE - 200,
+		      "PUSHING UP FILLS YNEG, not YPOS - the decode negates Y so"
+		      " the value is down-positive, which is what HID wants and"
+		      " the opposite of what the name suggests");
+		check_eq(cs.semiaxis[CORE_SA_RSTICK_YPOS], 0, "and YPOS stays 0");
+
+		put_le16(&packet[CORE_RAW_RSTICK_Y], -32767);
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		check(cs.semiaxis[CORE_SA_RSTICK_YPOS] > CORE_MAX_VALUE - 200,
+		      "pushing DOWN fills YPOS");
+		check_eq(cs.semiaxis[CORE_SA_RSTICK_YNEG], 0, "and YNEG stays 0");
+		put_le16(&packet[CORE_RAW_RSTICK_Y], 0);
+
+		/* X NEEDS NO SUCH WARNING: right is XPOS, as it reads. */
+		put_le16(&packet[CORE_RAW_RSTICK_X], 32767);
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		check(cs.semiaxis[CORE_SA_RSTICK_XPOS] > CORE_MAX_VALUE - 200,
+		      "pushing RIGHT fills XPOS, which needs no explaining");
+		check_eq(cs.semiaxis[CORE_SA_RSTICK_XNEG], 0, "and XNEG stays 0");
+		put_le16(&packet[CORE_RAW_RSTICK_X], 0);
+	}
+
 	/* --- A STICK IS THE ONE THING THAT STILL NEEDS A DEADZONE ----- */
 	core_init(&cs, recording_sink, NULL);
 	bind_one(&cfg, CORE_SA_RSTICK_XPOS, CORE_ACT_KEY, 0x07, 0); /* D */
@@ -1535,50 +1574,108 @@ static int test_control(void)
 	check_eq((long)list.device[0].index, 0, "at index 0");
 	check_eq(list.device[0].started, 1, "and reads as started");
 
-	/* --- RAWMOUSE SENDS EXACTLY THE BYTES IT WAS GIVEN ------------- */
+	/* --- GET_RAW SEES WHAT THE PAD SENT, MAPPED OR NOT ------------- */
 	{
-		XC_RAWMOUSE_REQUEST rm;
-		XC_REPORT_NODE      node;
-		u32                 k;
+		XC_RAW_INFO info;
+		u8          packet[CORE_RAW_PACKET_BYTES];
+		u32         k;
+		u32         first_seq;
+
+		request.index = 0;
+		memcpy(buffer, &request, sizeof(request));
+		status = XcControlCommand(IOCTL_XC_GET_RAW, buffer,
+		                          sizeof(request), sizeof(buffer),
+		                          &written);
+		check_eq(status, STATUS_SUCCESS, "GET_RAW answers");
+		check_eq((long)written, (long)sizeof(XC_RAW_INFO),
+		         "with the whole structure");
+		memcpy(&info, buffer, sizeof(info));
+		check_eq((long)info.valid, 0,
+		         "and says NOT VALID before any packet has arrived, rather"
+		         " than handing back a zeroed packet that reads as a pad"
+		         " sitting at rest");
 
 		/*
-		 * THE PAYLOAD IS THE WHOLE REPORT, so every byte of it has to
-		 * arrive and nothing beyond it may. A field shorter than a
-		 * report would be read past, and whatever followed it would go
-		 * out as motion - indistinguishable from the engine computing
-		 * nonsense, which is the one thing this command exists to rule
-		 * out.
+		 * A CONTROL BOUND TO A KEY IS INVISIBLE ON THE GAMEPAD REPORT.
+		 * The emit comparison stops short of the raw tail, so a press
+		 * that changes nothing an application can see emits nothing at
+		 * all - which is exactly the case a configurator asking "press
+		 * the control you want to bind" runs into. GET_RAW is the answer
+		 * and this is the test that it is.
 		 */
-		memset(&rm, 0, sizeof(rm));
-		rm.index = 0;
-		for (k = 0; k < CORE_MOUSE_PAYLOAD; k++) {
-			rm.payload[k] = (u8)(0xA0 + k);
+		make_packet(packet);
+		packet[CORE_RAW_ANALOG_BASE + 0] = 200;         /* A, hard */
+		core_set_config_default(&devext.Core);
+		{
+			static core_config keycfg;
+			u8                 keyblob[4096];
+			u32                keylen;
+
+			core_config_defaults(&keycfg);
+			keycfg.layout[0].binding[1].source = CORE_SA_A;
+			keycfg.layout[0].binding[1].action = CORE_ACT_KEY;
+			keycfg.layout[0].binding[1].code   = 0x2C;      /* space */
+			core_config_suppress(&keycfg);
+			keylen = core_config_save(&keycfg, keyblob,
+			                          (u32)sizeof(keyblob));
+			core_set_config(&devext.Core, keyblob, keylen, NULL);
 		}
-		memcpy(buffer, &rm, sizeof(rm));
-		status = XcControlCommand(IOCTL_XC_RAWMOUSE, buffer, sizeof(rm),
-		                          sizeof(buffer), &written);
-		check_eq(status, STATUS_SUCCESS, "RAWMOUSE is accepted");
-		check(XcDequeueReport(&devext, &node),
-		      "and queues one mouse report");
-		check_eq((long)node.Length, (long)(CORE_MOUSE_PAYLOAD + 1),
-		         "of the report ID plus a full mouse payload");
-		check_eq(node.Data[0], CORE_REPORT_ID_MOUSE, "with the mouse ID");
-		for (k = 0; k < CORE_MOUSE_PAYLOAD; k++) {
-			if (node.Data[1 + k] != (u8)(0xA0 + k)) {
+		devext.ReportCount = 0;
+		devext.ReportHead  = 0;
+		core_on_packet(&devext.Core, packet, CORE_RAW_PACKET_BYTES,
+		               1000000);
+
+		memcpy(buffer, &request, sizeof(request));
+		status = XcControlCommand(IOCTL_XC_GET_RAW, buffer,
+		                          sizeof(request), sizeof(buffer),
+		                          &written);
+		memcpy(&info, buffer, sizeof(info));
+		check_eq((long)info.valid, 1, "after a packet it reads valid");
+		for (k = 0; k < CORE_RAW_PACKET_BYTES; k++) {
+			if (info.packet[k] != packet[k]) {
 				break;
 			}
 		}
-		check_eq((long)k, (long)CORE_MOUSE_PAYLOAD,
-		         "and EVERY byte is the one that was sent - none of it"
-		         " read from past the end of the request");
+		check_eq((long)k, (long)CORE_RAW_PACKET_BYTES,
+		         "and every byte is the packet AS THE PAD SENT IT - no"
+		         " deadzone, no curve, no suppression");
+		check_eq(info.packet[CORE_RAW_ANALOG_BASE], 200,
+		         "including a control bound to a key, whose press reaches"
+		         " no gamepad report at all");
+		check_eq((long)info.layer, 1, "and it says which layer is live");
+		first_seq = info.sequence;
+		check(first_seq > 0, "the sequence counts packets");
 
-		/* A request one byte short of the structure is refused. */
-		status = XcControlCommand(IOCTL_XC_RAWMOUSE, buffer,
-		                          sizeof(rm) - 1, sizeof(buffer),
+		/* AN IDENTICAL PACKET IS STILL A PACKET. */
+		core_on_packet(&devext.Core, packet, CORE_RAW_PACKET_BYTES,
+		               2000000);
+		memcpy(buffer, &request, sizeof(request));
+		status = XcControlCommand(IOCTL_XC_GET_RAW, buffer,
+		                          sizeof(request), sizeof(buffer),
+		                          &written);
+		memcpy(&info, buffer, sizeof(info));
+		check(info.sequence > first_seq,
+		      "and a repeat of the same packet still advances it, so a"
+		      " poller can tell a fresh report from a held control");
+		check_eq((long)info.when_100ns, 2000000,
+		         "with the arrival time of the newest one");
+
+		/* A short request is refused, not padded. */
+		status = XcControlCommand(IOCTL_XC_GET_RAW, buffer,
+		                          sizeof(request) - 1, sizeof(buffer),
 		                          &written);
 		check_eq(status, STATUS_INVALID_PARAMETER,
-		         "and a short RAWMOUSE request is refused rather than"
-		         " padded with whatever was in the buffer");
+		         "a short GET_RAW request is refused");
+
+		/* And a buffer too small to hold the answer is refused. */
+		memcpy(buffer, &request, sizeof(request));
+		status = XcControlCommand(IOCTL_XC_GET_RAW, buffer,
+		                          sizeof(request),
+		                          sizeof(XC_RAW_INFO) - 1, &written);
+		check_eq(status, STATUS_BUFFER_TOO_SMALL,
+		         "and so is an output buffer that cannot hold it");
+
+		core_set_config_default(&devext.Core);
 	}
 
 	/* --- GET_STATS ------------------------------------------------ */
@@ -2992,10 +3089,8 @@ int main(int argc, char **argv)
 		       (unsigned long)IOCTL_XC_SET_RUMBLE);
 		printf("GET_TRACE     0x%08lX\n",
 		       (unsigned long)IOCTL_XC_GET_TRACE);
-		printf("NUDGE         0x%08lX\n",
-		       (unsigned long)IOCTL_XC_NUDGE);
-		printf("RAWMOUSE      0x%08lX\n",
-		       (unsigned long)IOCTL_XC_RAWMOUSE);
+		printf("GET_RAW       0x%08lX\n",
+		       (unsigned long)IOCTL_XC_GET_RAW);
 		return 0;
 	}
 

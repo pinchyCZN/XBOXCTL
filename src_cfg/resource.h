@@ -43,6 +43,26 @@
 #define IDC_CAPTURED            1200
 #define IDC_NEWNAME             1201
 
+/* Stick dialog. */
+#define IDD_STICK               105
+#define IDC_ST_WHICH            1300
+#define IDC_ST_MODE             1301
+#define IDC_ST_DEADZONE         1302
+#define IDC_ST_OUTER            1303
+#define IDC_ST_MAXSPEED         1304
+#define IDC_ST_SPEEDUNIT        1305
+#define IDC_ST_CURVE            1306
+#define IDC_ST_GAINX            1307
+#define IDC_ST_GAINY            1308
+#define IDC_ST_INVX             1309
+#define IDC_ST_INVY             1310
+#define IDC_ST_SMOOTH           1311
+#define IDC_ST_ATHRESH          1312
+#define IDC_ST_ARATE            1313
+#define IDC_ST_AMAX             1314
+#define IDC_ST_ADECAY           1315
+#define IDC_ST_HINT             1316
+
 /*
  * The pad control buttons are created at RUNTIME from a table keyed by
  * the CORE_SA_* constants rather than listed here, so a control cannot

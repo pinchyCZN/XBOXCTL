@@ -83,6 +83,7 @@
     <ClCompile Include="profile.c" />
     <ClCompile Include="driver.c" />
     <ClCompile Include="bind.c" />
+    <ClCompile Include="stick.c" />
     <ClCompile Include="main.c" />
   </ItemGroup>
   <ItemGroup>

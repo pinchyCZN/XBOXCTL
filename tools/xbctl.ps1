@@ -13,24 +13,15 @@
         xbctl.ps1 rumble 200 100       shake it: left, right, 0..255
         xbctl.ps1 rumble 0 0           stop
         xbctl.ps1 trace                the last 32 mouse reports emitted
-        xbctl.ps1 nudge 100 0          move the pointer exactly that far
-        xbctl.ps1 nudgetest            send known deltas, MEASURE the result
-        xbctl.ps1 drift                send ONE tiny report, then watch
+        xbctl.ps1 raw                  the last packet, untranslated
+        xbctl.ps1 raw -Watch           and again every time it changes
 
-    DRIFT ANSWERS ONE QUESTION: after a single mouse report, does the
-    cursor jump once and stop, or does it keep moving? A one-shot jump
-    means something reacts to our report; continued movement means
-    something starts and does not stop. They need looking for in
-    completely different places.
-
-    NUDGETEST TAKES THE EYE OUT OF IT. It parks the cursor, sends one
-    report with a known delta, reads the cursor back, and prints what
-    Windows actually did with it. DO NOT TOUCH THE PAD while it runs.
-
-    NUDGE SEPARATES TWO FAULTS THAT LOOK THE SAME. The numbers go
-    straight into one mouse report - no stick, no curve, no accumulator
-    - so if the pointer does not do what the numbers say, the fault is
-    above this driver rather than in it.
+    RAW IS THE PAD BEFORE ANYTHING IS DONE TO IT. No deadzone, no curve,
+    no binding, no suppression. It is how a configurator asks "which
+    control did you just press", and it works for a control already
+    bound to a key - which the gamepad report does not, because that
+    report is emitted only when the MAPPED state changes and a bound
+    control changes nothing an application can see.
 
     TRACE IS THE ONLY VIEW OF THE POINTER PATH on a live system. mouhid
     opens the mouse collection exclusively, so reading those reports from
@@ -52,8 +43,7 @@
 param(
     [Parameter(Position = 0)]
     [ValidateSet('version', 'devices', 'stats', 'get', 'set', 'reset',
-                 'rumble', 'trace', 'nudge', 'nudgetest', 'drift',
-                 'zerotest')]
+                 'rumble', 'trace', 'raw')]
     [string]$Command = 'version',
 
     # TAKEN AS TEXT, NOT AS NUMBERS. Typing a command where a level
@@ -65,7 +55,11 @@ param(
     [string[]]$Rest,
 
     [string]$Path,
-    [int]$Index = 0
+    [int]$Index = 0,
+
+    # 'raw -Watch' keeps printing as the pad changes, which is what
+    # makes it usable for "press the control you want to bind".
+    [switch]$Watch
 )
 
 $ErrorActionPreference = 'Stop'
@@ -81,34 +75,12 @@ function Show-Usage
     Write-Host "    xbctl.ps1 reset"
     Write-Host "    xbctl.ps1 rumble  <left 0-255> <right 0-255>"
     Write-Host "    xbctl.ps1 trace   [-Index 0]"
-    Write-Host "    xbctl.ps1 nudge   <dx> <dy>   (-32767..32767)"
-    Write-Host "    xbctl.ps1 nudgetest"
-    Write-Host "    xbctl.ps1 drift"
-    Write-Host "    xbctl.ps1 zerotest"
+    Write-Host "    xbctl.ps1 raw     [-Index 0] [-Watch]"
 }
 
 # Check the arguments before opening anything, so a typo does not need a
 # handle to the driver to be told about.
-if ($Command -eq 'nudge') {
-    if ($null -eq $Rest -or $Rest.Count -ne 2) {
-        Write-Host "  nudge takes two deltas, for example 'nudge 100 0'."
-        Show-Usage
-        exit 2
-    }
-    $parsedLeft = 0
-    $parsedRight = 0
-    if (-not [int]::TryParse($Rest[0], [ref]$parsedLeft) -or
-        -not [int]::TryParse($Rest[1], [ref]$parsedRight)) {
-        Write-Host ("  '{0} {1}' is not a pair of numbers." -f
-                    $Rest[0], $Rest[1])
-        exit 2
-    }
-    if ($parsedLeft -lt -32767 -or $parsedLeft -gt 32767 -or
-        $parsedRight -lt -32767 -or $parsedRight -gt 32767) {
-        Write-Host "  deltas are -32767 to 32767."
-        exit 2
-    }
-} elseif ($Command -eq 'rumble') {
+if ($Command -eq 'rumble') {
     if ($null -eq $Rest -or $Rest.Count -ne 2) {
         Write-Host "  rumble takes two levels, 0 to 255."
         Write-Host "  'rumble 200 200' to shake, 'rumble 0 0' to stop."
@@ -195,8 +167,7 @@ $IOCTL = @{
     reset   = Ctl (0x800 + 5) $FILE_WRITE_ACCESS
     rumble  = Ctl (0x800 + 6) $FILE_WRITE_ACCESS
     trace   = Ctl (0x800 + 7) $FILE_ANY_ACCESS
-    nudge   = Ctl (0x800 + 8) $FILE_WRITE_ACCESS
-    rawms   = Ctl (0x800 + 9) $FILE_WRITE_ACCESS
+    raw     = Ctl (0x800 + 8) $FILE_ANY_ACCESS
 }
 
 Add-Type -TypeDefinition @"
@@ -367,292 +338,6 @@ try {
         Write-Host ("  index {0} is back on the built-in default" -f $Index)
     }
 
-    'zerotest' {
-        # Does an ALL-ZERO mouse report move the cursor? If it does, the
-        # payload is irrelevant and the fault is in delivery, not content.
-        Write-Host "  DO NOT TOUCH THE PAD or the mouse."
-        Write-Host ""
-        Write-Host "  payload sent      cursor moved   gp  kb  ms   note"
-        # SIX BYTES, BECAUSE THE MOUSE REPORT IS SIX: buttons, X low,
-        # X high, Y low, Y high, wheel. The axes are 16-bit.
-        $cases = @(
-            @(@(0,0,0,0,0,0), 'all zero - should move NOTHING'),
-            @(@(0,1,0,0,0,0), 'dx=1'),
-            @(@(0,0,0,1,0,0), 'dy=1'),
-            @(@(0,0,0,0,0,0), 'all zero again')
-        )
-        foreach ($c in $cases) {
-            $null = [NativeCursor]::SetCursorPos(700, 400)
-            Start-Sleep -Milliseconds 250
-            $b1 = New-Object NativeCursor+POINT
-            $null = [NativeCursor]::GetCursorPos([ref]$b1)
-
-            $buf = New-Object byte[] 12
-            [Array]::Copy((Index-Bytes $Index), 0, $buf, 0, 4)
-            for ($k = 0; $k -lt 6; $k++) {
-                $buf[4 + $k] = [byte]$c[0][$k]
-            }
-            $null = Invoke-Ctl $IOCTL.rawms $buf 16
-            Start-Sleep -Milliseconds 400
-
-            $a1 = New-Object NativeCursor+POINT
-            $null = [NativeCursor]::GetCursorPos([ref]$a1)
-            # WHAT ELSE WENT OUT. A keyboard report emitted while only
-            # a mouse report was asked for is the whole answer.
-            $st = Invoke-Ctl $IOCTL.stats (Index-Bytes $Index) 128
-            $gp = [BitConverter]::ToUInt32($st[0], 13 * 4)
-            $kb = [BitConverter]::ToUInt32($st[0], 14 * 4)
-            $ms = [BitConverter]::ToUInt32($st[0], 15 * 4)
-            $bytes = (($c[0] | ForEach-Object { '{0:x2}' -f $_ }) -join ' ')
-            $line = "  {0}       {1,5},{2,-5}   {3,3} {4,3} {5,3}   {6}" -f $bytes, ($a1.X - $b1.X), ($a1.Y - $b1.Y), $gp, $kb, $ms, $c[1]
-            Write-Host $line
-        }
-        Write-Host ""
-        Write-Host "  An all-zero report that moves the cursor proves the"
-        Write-Host "  content is irrelevant - something reacts to the"
-        Write-Host "  report arriving, not to what is in it."
-    }
-
-    'drift' {
-        Write-Host "  DO NOT TOUCH THE PAD or the mouse while this runs."
-        Write-Host ""
-
-        $SPI_GETMOUSE = 3
-        $SPI_SETMOUSE = 4
-        $savedAccel = New-Object int[] 3
-        $haveSaved = [NativeCursor]::SystemParametersInfo($SPI_GETMOUSE, 0,
-                                                          $savedAccel, 0)
-        if ($haveSaved) {
-            $off = New-Object int[] 3
-            $null = [NativeCursor]::SystemParametersInfo($SPI_SETMOUSE, 0,
-                                                         $off, 0)
-        }
-
-        # PARK SOMEWHERE DIFFERENT EACH TIME.
-        #
-        # A single starting point cannot tell a constant PUSH from a fixed
-        # DESTINATION: parking at 700,400 and landing at 857,557 fits both
-        # "add 157" and "go to 857,557". Three starts settle it - a push
-        # gives three different landings, a destination gives one.
-        Write-Host "  start        after one dx=1 report   difference"
-        foreach ($start in @(@(200, 150), @(700, 400), @(1100, 700))) {
-            $null = [NativeCursor]::SetCursorPos($start[0], $start[1])
-            Start-Sleep -Milliseconds 300
-            $q = New-Object NativeCursor+POINT
-            $null = [NativeCursor]::GetCursorPos([ref]$q)
-            $sx = $q.X
-            $sy = $q.Y
-
-            $b2 = New-Object byte[] 8
-            [Array]::Copy((Index-Bytes $Index), 0, $b2, 0, 4)
-            [Array]::Copy([BitConverter]::GetBytes([int16]1), 0, $b2, 4, 2)
-            [Array]::Copy([BitConverter]::GetBytes([int16]0), 0, $b2, 6, 2)
-            $null = Invoke-Ctl $IOCTL.nudge $b2 16
-            Start-Sleep -Milliseconds 400
-
-            $null = [NativeCursor]::GetCursorPos([ref]$q)
-            $line = "  {0,5},{1,-5}  {2,5},{3,-5}          {4,5},{5}" -f $sx, $sy, $q.X, $q.Y, ($q.X - $sx), ($q.Y - $sy)
-            Write-Host $line
-        }
-        Write-Host ""
-        Write-Host "  Same landing point from all three starts means the"
-        Write-Host "  cursor is being PLACED, not pushed. Three different"
-        Write-Host "  landings with the same difference means it is being"
-        Write-Host "  pushed by a constant."
-        Write-Host ""
-
-        $null = [NativeCursor]::SetCursorPos(700, 400)
-        Start-Sleep -Milliseconds 300
-
-        $p = New-Object NativeCursor+POINT
-        $null = [NativeCursor]::GetCursorPos([ref]$p)
-        Write-Host "  now watching over time, parked at $($p.X),$($p.Y)"
-
-        # A quarter second of quiet first, to show the cursor is still.
-        Write-Host "  ms   cursor      moved since parking   note"
-        for ($t = 1; $t -le 3; $t++) {
-            Start-Sleep -Milliseconds 100
-            $null = [NativeCursor]::GetCursorPos([ref]$p)
-            $ms = $t * 100
-            $line = "  {0,4} {1,5},{2,-5} {3,6},{4,-6}   quiet" -f $ms, $p.X, $p.Y, ($p.X - 700), ($p.Y - 400)
-            Write-Host $line
-        }
-
-        # ONE report, as small as the engine will emit. A zero move is
-        # refused on purpose - an all-zero mouse report is not news - so
-        # one count is the smallest thing that can be sent.
-        $buf = New-Object byte[] 8
-        [Array]::Copy((Index-Bytes $Index), 0, $buf, 0, 4)
-        [Array]::Copy([BitConverter]::GetBytes([int16]1), 0, $buf, 4, 2)
-        [Array]::Copy([BitConverter]::GetBytes([int16]0), 0, $buf, 6, 2)
-        $null = Invoke-Ctl $IOCTL.nudge $buf 16
-        Write-Host "  ---- sent ONE report: dx 1, dy 0 ----"
-
-        for ($t = 1; $t -le 12; $t++) {
-            Start-Sleep -Milliseconds 100
-            $null = [NativeCursor]::GetCursorPos([ref]$p)
-            $ms = $t * 100
-            $line = "  {0,4} {1,5},{2,-5} {3,6},{4,-6}" -f $ms, $p.X, $p.Y, ($p.X - 700), ($p.Y - 400)
-            Write-Host $line
-        }
-
-        if ($haveSaved) {
-            $null = [NativeCursor]::SystemParametersInfo($SPI_SETMOUSE, 0,
-                                                         $savedAccel, 0)
-        }
-        Write-Host ""
-        Write-Host "  ONE count was sent. If the cursor settles about one"
-        Write-Host "  pixel right, everything is correct. If it jumps once"
-        Write-Host "  and stops, something reacts to our report. If it"
-        Write-Host "  keeps moving, something started and did not stop."
-    }
-
-    'nudgetest' {
-        Write-Host "  DO NOT TOUCH THE PAD while this runs."
-        Write-Host ""
-
-        # TURN POINTER ACCELERATION OFF FOR THE DURATION.
-        #
-        # With it on, Windows multiplies a delta by a curve keyed to how
-        # fast the pointer is moving, so 100 counts can become 400-odd
-        # pixels and the number means nothing. With it off the mapping
-        # is one count to one pixel and a wrong answer is unambiguous.
-        $SPI_GETMOUSE = 3
-        $SPI_SETMOUSE = 4
-        $savedAccel = New-Object int[] 3
-        $haveSaved = [NativeCursor]::SystemParametersInfo($SPI_GETMOUSE, 0,
-                                                          $savedAccel, 0)
-        if ($haveSaved) {
-            $accelWas = $savedAccel[2]
-            $t1 = $savedAccel[0]
-            $t2 = $savedAccel[1]
-            Write-Host "  pointer acceleration was $accelWas, thresholds $t1 $t2"
-            $off = New-Object int[] 3
-            $null = [NativeCursor]::SystemParametersInfo($SPI_SETMOUSE, 0,
-                                                         $off, 0)
-            Write-Host "  turned off for this test, restored at the end"
-        } else {
-            Write-Host "  could not read the acceleration setting;"
-            Write-Host "  magnitudes below may be scaled by it"
-        }
-        Write-Host ""
-
-        # MEASURE THE NOISE FLOOR FIRST. If the cursor moves while
-        # nothing is being sent, every measurement below is that drift
-        # plus whatever we sent, and reading them as a response to our
-        # reports would blame this driver for something else entirely.
-        $null = [NativeCursor]::SetCursorPos(700, 400)
-        Start-Sleep -Milliseconds 250
-        $b0 = New-Object NativeCursor+POINT
-        $null = [NativeCursor]::GetCursorPos([ref]$b0)
-        Start-Sleep -Milliseconds 400
-        $a0 = New-Object NativeCursor+POINT
-        $null = [NativeCursor]::GetCursorPos([ref]$a0)
-        $driftX = $a0.X - $b0.X
-        $driftY = $a0.Y - $b0.Y
-
-        Write-Host ("  baseline, nothing sent: cursor moved {0}, {1}" -f
-                    $driftX, $driftY)
-        if ([Math]::Abs($driftX) -gt 2 -or [Math]::Abs($driftY) -gt 2) {
-            Write-Host ""
-            Write-Host "  THE CURSOR IS MOVING ON ITS OWN, with this"
-            Write-Host "  driver sending nothing at all. Whatever is"
-            Write-Host "  driving it is not xboxctl, and no measurement"
-            Write-Host "  below can be read as a response to our reports."
-            Write-Host ""
-            Write-Host "  Most likely VirtualBox mouse integration: the"
-            Write-Host "  Guest Additions supply an absolute pointing"
-            Write-Host "  device and the host drags the guest cursor"
-            Write-Host "  toward wherever the host pointer sits."
-            Write-Host "  Turn it off with Input -> Mouse Integration"
-            Write-Host "  (Host+I), then run this again."
-            Write-Host ""
-        }
-        Write-Host ""
-        Write-Host "  sent dx  sent dy |  moved dx  moved dy | reports | verdict"
-        Write-Host "  ----------------+--------------------+---------+--------"
-        $cases = @(@(100, 0), @(-100, 0), @(0, 100), @(0, -100))
-        foreach ($c in $cases) {
-            # Park the cursor well away from every screen edge, so a
-            # move in any direction has room and nothing is clamped.
-            $null = [NativeCursor]::SetCursorPos(700, 400)
-            Start-Sleep -Milliseconds 250
-            $before = New-Object NativeCursor+POINT
-            $null = [NativeCursor]::GetCursorPos([ref]$before)
-            $emitBefore = Get-Emitted $IOCTL.trace $Index
-
-            $buf = New-Object byte[] 8
-            [Array]::Copy((Index-Bytes $Index), 0, $buf, 0, 4)
-            [Array]::Copy([BitConverter]::GetBytes([int16]$c[0]), 0,
-                          $buf, 4, 2)
-            [Array]::Copy([BitConverter]::GetBytes([int16]$c[1]), 0,
-                          $buf, 6, 2)
-            $null = Invoke-Ctl $IOCTL.nudge $buf 16
-
-            Start-Sleep -Milliseconds 400
-            $after = New-Object NativeCursor+POINT
-            $null = [NativeCursor]::GetCursorPos([ref]$after)
-            $emitAfter = Get-Emitted $IOCTL.trace $Index
-            $reports = $emitAfter - $emitBefore
-
-            $mx = $after.X - $before.X
-            $my = $after.Y - $before.Y
-
-            # Right sign and roughly the right size is a pass; Windows
-            # pointer ballistics scale the magnitude, so only the sign
-            # and the absence of cross-axis motion are judged here.
-            $verdict = 'ok'
-            if ($mx -eq 0 -and $my -eq 0) {
-                $verdict = 'NOTHING MOVED'
-            } else {
-                if ($c[0] -ne 0 -and
-                    [Math]::Sign($mx) -ne [Math]::Sign($c[0])) {
-                    $verdict = 'X WRONG WAY'
-                } elseif ($c[1] -ne 0 -and
-                          [Math]::Sign($my) -ne [Math]::Sign($c[1])) {
-                    $verdict = 'Y WRONG WAY'
-                } elseif ($c[0] -eq 0 -and [Math]::Abs($mx) -gt 5) {
-                    $verdict = 'X MOVED TOO'
-                } elseif ($c[1] -eq 0 -and [Math]::Abs($my) -gt 5) {
-                    $verdict = 'Y MOVED TOO'
-                } elseif ($haveSaved -and
-                          ([Math]::Abs([Math]::Abs($mx) -
-                                       [Math]::Abs($c[0])) -gt 20 -or
-                           [Math]::Abs([Math]::Abs($my) -
-                                       [Math]::Abs($c[1])) -gt 20)) {
-                    $verdict = 'WRONG DISTANCE'
-                }
-            }
-
-            if ($reports -ne 1) { $verdict = "$verdict (not 1 report)" }
-            Write-Host ("  {0,7}  {1,7} | {2,9}  {3,8} | {4,7} | {5}" -f
-                        $c[0], $c[1], $mx, $my, $reports, $verdict)
-        }
-        if ($haveSaved) {
-            $null = [NativeCursor]::SystemParametersInfo($SPI_SETMOUSE, 0,
-                                                         $savedAccel, 0)
-            Write-Host ""
-            Write-Host "  acceleration restored."
-            Write-Host ""
-            Write-Host "  WITH ACCELERATION OFF, one count is one pixel."
-            Write-Host "  A send of 100 that does not move about 100 is a"
-            Write-Host "  real discrepancy, not a scaled one."
-        }
-    }
-
-    'nudge' {
-        # XC_NUDGE_REQUEST: u32 index, s16 dx, s16 dy.
-        $buf = New-Object byte[] 8
-        [Array]::Copy((Index-Bytes $Index), 0, $buf, 0, 4)
-        [Array]::Copy([BitConverter]::GetBytes([int16]$parsedLeft), 0,
-                      $buf, 4, 2)
-        [Array]::Copy([BitConverter]::GetBytes([int16]$parsedRight), 0,
-                      $buf, 6, 2)
-        $null = Invoke-Ctl $IOCTL.nudge $buf 16
-        Write-Host ("  sent dx {0}, dy {1}" -f $parsedLeft, $parsedRight)
-        Write-Host "  negative dx is LEFT, negative dy is UP"
-    }
-
     'trace' {
         # XC_TRACE: u32 count, u32 emitted, then 32 entries of
         # { s16 dx, s16 dy, u8 buttons, 3 reserved }.
@@ -693,6 +378,53 @@ try {
         } else {
             Write-Host ("  left {0}, right {1}" -f $parsedLeft, $parsedRight)
             Write-Host "  runs until you set it back to 0 0"
+        }
+    }
+
+    'raw' {
+        # XC_RAW_INFO: u32 index, u32 valid, u32 sequence, u32 layer,
+        # u64 when_100ns, then the 20 packet bytes and 4 reserved.
+        #
+        # THE PACKET AS THE PAD SENT IT. Nothing here has been through a
+        # deadzone, a curve or a binding, and a control bound to a key
+        # shows up exactly the same as one that is not - which is the
+        # whole reason this exists rather than reading the raw tail off
+        # the gamepad report.
+        function Show-Raw
+        {
+            $r = Invoke-Ctl $IOCTL.raw (Index-Bytes $Index) 64
+            $b = $r[0]
+            $valid = [BitConverter]::ToUInt32($b, 4)
+            $seq   = [BitConverter]::ToUInt32($b, 8)
+            $layer = [BitConverter]::ToUInt32($b, 12)
+            if ($valid -eq 0) {
+                Write-Host "  no packet decoded yet - is the pad plugged in?"
+                return $null
+            }
+            $hex = ''
+            for ($i = 0; $i -lt 20; $i++) {
+                $hex += '{0:x2} ' -f $b[24 + $i]
+            }
+            Write-Host ("  seq {0,-6} layer {1}   {2}" -f $seq, $layer,
+                        $hex.TrimEnd())
+            return $seq
+        }
+
+        if ($Watch) {
+            Write-Host "  press controls on the pad. Ctrl-C to stop."
+            Write-Host ""
+            $last = -1
+            while ($true) {
+                $r = Invoke-Ctl $IOCTL.raw (Index-Bytes $Index) 64
+                $seq = [BitConverter]::ToUInt32($r[0], 8)
+                if ($seq -ne $last) {
+                    $null = Show-Raw
+                    $last = $seq
+                }
+                Start-Sleep -Milliseconds 30
+            }
+        } else {
+            $null = Show-Raw
         }
     }
 

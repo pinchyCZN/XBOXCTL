@@ -34,14 +34,22 @@ const xb_name XB_SOURCES[] = {
 	{ "white",    CORE_SA_WHITE },
 	{ "ltrigger", CORE_SA_LTRIGGER },
 	{ "rtrigger", CORE_SA_RTRIGGER },
+	/*
+	 * UP IS THE NEGATIVE SEMIAXIS, AND THAT IS NOT A TYPO. The pad
+	 * reports Y up-positive and the decode negates it once so the
+	 * value is down-positive the way HID wants, which leaves a
+	 * physical UP push in the semiaxis named YNEG. Naming these the
+	 * other way round reads correctly against the struct and is wrong
+	 * against the thumb.
+	 */
 	{ "lstick_left",  CORE_SA_LSTICK_XNEG },
 	{ "lstick_right", CORE_SA_LSTICK_XPOS },
-	{ "lstick_down",  CORE_SA_LSTICK_YNEG },
-	{ "lstick_up",    CORE_SA_LSTICK_YPOS },
+	{ "lstick_up",    CORE_SA_LSTICK_YNEG },
+	{ "lstick_down",  CORE_SA_LSTICK_YPOS },
 	{ "rstick_left",  CORE_SA_RSTICK_XNEG },
 	{ "rstick_right", CORE_SA_RSTICK_XPOS },
-	{ "rstick_down",  CORE_SA_RSTICK_YNEG },
-	{ "rstick_up",    CORE_SA_RSTICK_YPOS },
+	{ "rstick_up",    CORE_SA_RSTICK_YNEG },
+	{ "rstick_down",  CORE_SA_RSTICK_YPOS },
 	{ "guide",    CORE_SA_GUIDE },
 	{ NULL, 0 }
 };
@@ -52,8 +60,8 @@ static const char *XB_SOURCE_LABELS[] = {
 	"Start", "Back", "L-Thumb", "R-Thumb",
 	"A", "B", "X", "Y",
 	"Black", "White", "L-Trigger", "R-Trigger",
-	"L-Stick Left", "L-Stick Right", "L-Stick Down", "L-Stick Up",
-	"R-Stick Left", "R-Stick Right", "R-Stick Down", "R-Stick Up",
+	"L-Stick Left", "L-Stick Right", "L-Stick Up", "L-Stick Down",
+	"R-Stick Left", "R-Stick Right", "R-Stick Up", "R-Stick Down",
 	"Guide"
 };
 

@@ -36,12 +36,45 @@ static char         g_ProfilePath[XB_MAX_PATH];
 static int          g_ProfileLoaded;    /* 0 while "standard" is up  */
 static u32          g_Layer;            /* which layer the pad edits */
 
-/* The control each pad button stands for, in core.h order. */
-static u8           g_PadSource[CORE_SEMIAXIS_COUNT];
-static u32          g_PadCount;
+/*
+ * THE PAD, LAID OUT AS A PAD. Three columns: the D-pad and the face
+ * buttons on the left, the left stick and the middle buttons next, the
+ * right stick and the shoulders last. The grid below IS the dialog - it
+ * is walked to create the buttons and walked again to label them, so
+ * moving a control means moving one entry.
+ *
+ * GUIDE IS NOT HERE ON PURPOSE. core.c pins that semiaxis to zero
+ * because it is a 360 control and the original pad has no equivalent, so
+ * a button for it could never do anything. A control an application can
+ * see and nothing can press is a dead row.
+ *
+ * UP IS THE NEGATIVE SEMIAXIS. The decode negates Y so the value is
+ * down-positive the way HID wants, which leaves a physical up push in
+ * YNEG. Reading these the other way round puts every stick direction on
+ * the wrong thumb movement.
+ */
+#define XB_CELL_NONE        0xFD
+#define XB_CELL_STICK_L     0xFE
+#define XB_CELL_STICK_R     0xFF
+
+#define XB_PAD_ROWS         9
+#define XB_PAD_COLS         3
+#define XB_PAD_CELLS        (XB_PAD_ROWS * XB_PAD_COLS)
+
+static const u8 XB_PAD_GRID[XB_PAD_ROWS][XB_PAD_COLS] = {
+	{ CORE_SA_DPAD_UP,    CORE_SA_LSTICK_YNEG, CORE_SA_RSTICK_YNEG },
+	{ CORE_SA_DPAD_DOWN,  CORE_SA_LSTICK_YPOS, CORE_SA_RSTICK_YPOS },
+	{ CORE_SA_DPAD_LEFT,  CORE_SA_LSTICK_XNEG, CORE_SA_RSTICK_XNEG },
+	{ CORE_SA_DPAD_RIGHT, CORE_SA_LSTICK_XPOS, CORE_SA_RSTICK_XPOS },
+	{ CORE_SA_A,          CORE_SA_WHITE,       CORE_SA_LTRIGGER    },
+	{ CORE_SA_B,          CORE_SA_BLACK,       CORE_SA_RTRIGGER    },
+	{ CORE_SA_X,          CORE_SA_START,       CORE_SA_LTHUMB      },
+	{ CORE_SA_Y,          CORE_SA_BACK,        CORE_SA_RTHUMB      },
+	{ XB_CELL_STICK_L,    XB_CELL_STICK_R,     XB_CELL_NONE        }
+};
 
 int xb_bind_dialog(HWND parent, xb_profile *p, u32 layer, u8 source);
-int xb_stick_dialog(HWND parent, xb_profile *p);
+int xb_stick_dialog(HWND parent, xb_profile *p, u32 which);
 
 /*
  * The module handle, for the dialogs in bind.c.
@@ -123,43 +156,73 @@ static void xb_status(HWND dlg, const char *text)
 	SetDlgItemTextA(dlg, IDC_STATUS, text);
 }
 
+/* The cell at a flat index, which is also its control id offset. */
+static u8 xb_cell(u32 index)
+{
+	if (index >= XB_PAD_CELLS) {
+		return XB_CELL_NONE;
+	}
+	return XB_PAD_GRID[index / XB_PAD_COLS][index % XB_PAD_COLS];
+}
+
 /* Refresh every pad button's caption with what it is bound to. */
 static void xb_pad_refresh(HWND dlg)
 {
 	u32 i;
 
-	for (i = 0; i < g_PadCount; i++) {
-		u8          src = g_PadSource[i];
-		const char *label = xb_source_label(src);
-		char        caption[128];
-		u32         k;
-		int         bound = 0;
+	for (i = 0; i < XB_PAD_CELLS; i++) {
+		u8   cell = xb_cell(i);
+		HWND w    = GetDlgItem(dlg, (int)(IDC_PAD_BASE + i));
+		char caption[128];
 
-		if (g_ProfileLoaded) {
-			const core_layout *lay = &g_Profile.cfg.layout[g_Layer];
+		if (cell == XB_CELL_NONE || w == NULL) {
+			continue;
+		}
 
-			for (k = 0; k < CORE_MAX_BINDINGS; k++) {
-				const core_binding *b = &lay->binding[k];
-				char                text[256];
-				const char         *arrow;
+		if (cell == XB_CELL_STICK_L || cell == XB_CELL_STICK_R) {
+			/* A STICK SHOWS ITS MODE, not a binding: it has none. */
+			u32         which = (cell == XB_CELL_STICK_L) ? 0u : 1u;
+			const char *mode  = xb_value_to_name(
+			                        XB_STICK_MODES,
+			                        g_Profile.cfg.stick[which].mode);
 
-				if (b->action == CORE_ACT_NONE || b->source != src) {
-					continue;
+			snprintf(caption, sizeof(caption), "%s Stick : %s...",
+			         which == 0 ? "Left" : "Right",
+			         mode != NULL ? mode : "off");
+		} else {
+			const char *label = xb_source_label(cell);
+			u32         k;
+			int         bound = 0;
+
+			if (g_ProfileLoaded) {
+				const core_layout *lay =
+				    &g_Profile.cfg.layout[g_Layer];
+
+				for (k = 0; k < CORE_MAX_BINDINGS; k++) {
+					const core_binding *b = &lay->binding[k];
+					char                text[256];
+					const char         *arrow;
+
+					if (b->action == CORE_ACT_NONE ||
+					    b->source != cell) {
+						continue;
+					}
+					xb_binding_text(&g_Profile.cfg, b, text,
+					                sizeof(text));
+					arrow = strstr(text, "-> ");
+					snprintf(caption, sizeof(caption), "%s : %s",
+					         label,
+					         arrow != NULL ? arrow + 3 : text);
+					bound = 1;
+					break;
 				}
-				xb_binding_text(&g_Profile.cfg, b, text, sizeof(text));
-				arrow = strstr(text, "-> ");
-				snprintf(caption, sizeof(caption), "%s : %s", label,
-				         arrow != NULL ? arrow + 3 : text);
-				bound = 1;
-				break;
+			}
+			if (!bound) {
+				snprintf(caption, sizeof(caption), "%s", label);
 			}
 		}
-		if (!bound) {
-			snprintf(caption, sizeof(caption), "%s", label);
-		}
-		SetDlgItemTextA(dlg, (int)(IDC_PAD_BASE + i), caption);
-		EnableWindow(GetDlgItem(dlg, (int)(IDC_PAD_BASE + i)),
-		             g_ProfileLoaded ? TRUE : FALSE);
+		SetWindowTextA(w, caption);
+		EnableWindow(w, g_ProfileLoaded ? TRUE : FALSE);
 	}
 }
 
@@ -172,32 +235,30 @@ static void xb_pad_refresh(HWND dlg)
  */
 static void xb_pad_create(HWND dlg)
 {
-	const int COLS  = 3;
-	const int X0    = 145;
-	const int Y0    = 16;
-	const int W     = 84;
-	const int H     = 15;
-	const int DX    = 88;
-	const int DY    = 17;
-	HFONT     font  = (HFONT)SendMessageA(dlg, WM_GETFONT, 0, 0);
+	const int X0   = 145;
+	const int Y0   = 16;
+	const int W    = 84;
+	const int H    = 15;
+	const int DX   = 88;
+	const int DY   = 17;
+	HFONT     font = (HFONT)SendMessageA(dlg, WM_GETFONT, 0, 0);
 	u32       i;
 
-	g_PadCount = 0;
-	for (i = 0; i < CORE_SEMIAXIS_COUNT; i++) {
-		g_PadSource[g_PadCount++] = (u8)i;
-	}
-
-	for (i = 0; i < g_PadCount; i++) {
+	for (i = 0; i < XB_PAD_CELLS; i++) {
 		RECT r;
 		HWND b;
 
-		r.left   = X0 + (int)(i % COLS) * DX;
-		r.top    = Y0 + (int)(i / COLS) * DY;
+		if (xb_cell(i) == XB_CELL_NONE) {
+			continue;
+		}
+
+		r.left   = X0 + (int)(i % XB_PAD_COLS) * DX;
+		r.top    = Y0 + (int)(i / XB_PAD_COLS) * DY;
 		r.right  = r.left + W;
 		r.bottom = r.top + H;
 		MapDialogRect(dlg, &r);
 
-		b = CreateWindowExA(0, "BUTTON", xb_source_label(g_PadSource[i]),
+		b = CreateWindowExA(0, "BUTTON", "",
 		                    WS_CHILD | WS_VISIBLE | WS_TABSTOP |
 		                    BS_PUSHBUTTON,
 		                    r.left, r.top, r.right - r.left,
@@ -435,14 +496,22 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 		int id   = LOWORD(wp);
 		int code = HIWORD(wp);
 
-		if (id >= IDC_PAD_BASE && id < IDC_PAD_BASE + (int)g_PadCount) {
-			u8 src = g_PadSource[id - IDC_PAD_BASE];
+		if (id >= IDC_PAD_BASE &&
+			id < IDC_PAD_BASE + (int)XB_PAD_CELLS) {
+			u8 cell = xb_cell((u32)(id - IDC_PAD_BASE));
 
-			if (!g_ProfileLoaded) {
+			if (!g_ProfileLoaded || cell == XB_CELL_NONE) {
 				return TRUE;
 			}
-			if (xb_bind_dialog(dlg, &g_Profile, g_Layer, src)) {
-				/* NO SAVE BUTTON: OK in the binding dialog is the save. */
+			/* NO SAVE BUTTON: OK in either dialog is the save. */
+			if (cell == XB_CELL_STICK_L || cell == XB_CELL_STICK_R) {
+				u32 which = (cell == XB_CELL_STICK_L) ? 0u : 1u;
+
+				if (xb_stick_dialog(dlg, &g_Profile, which)) {
+					xb_profile_write(dlg);
+					xb_pad_refresh(dlg);
+				}
+			} else if (xb_bind_dialog(dlg, &g_Profile, g_Layer, cell)) {
 				xb_profile_write(dlg);
 				xb_pad_refresh(dlg);
 			}
@@ -473,15 +542,6 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 
 		case IDC_APPLY:
 			xb_apply(dlg);
-			return TRUE;
-
-		case IDC_STICKS:
-			if (!g_ProfileLoaded) {
-				return TRUE;
-			}
-			if (xb_stick_dialog(dlg, &g_Profile)) {
-				xb_profile_write(dlg);
-			}
 			return TRUE;
 
 		case IDCANCEL:

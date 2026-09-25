@@ -2100,6 +2100,39 @@ static NTSTATUS XcCmdGetStats(PXC_DEVEXT dev, ULONG index, void *buffer,
 	return STATUS_SUCCESS;
 }
 
+/*
+ * The last packet, untranslated.
+ *
+ * TAKEN UNDER THE CORE LOCK because the poll completion writes it at
+ * DISPATCH_LEVEL, and a twenty-byte copy torn across an update would
+ * read as the pad doing something it never did.
+ */
+static NTSTATUS XcCmdGetRaw(PXC_DEVEXT dev, ULONG index, void *buffer,
+                            ULONG out_len, ULONG *written)
+{
+	XC_RAW_INFO info;
+	KIRQL       irql;
+
+	if (out_len < sizeof(info)) {
+		return STATUS_BUFFER_TOO_SMALL;
+	}
+
+	RtlZeroMemory(&info, sizeof(info));
+	info.index = index;
+
+	KeAcquireSpinLock(&dev->CoreLock, &irql);
+	info.valid      = (u32)(dev->Core.raw_valid ? 1 : 0);
+	info.sequence   = dev->Core.packets_accepted;
+	info.layer      = (u32)dev->Core.layout + 1;
+	info.when_100ns = dev->Core.last_packet_100ns;
+	RtlCopyMemory(info.packet, dev->Core.raw, CORE_RAW_PACKET_BYTES);
+	KeReleaseSpinLock(&dev->CoreLock, irql);
+
+	RtlCopyMemory(buffer, &info, sizeof(info));
+	*written = (ULONG)sizeof(info);
+	return STATUS_SUCCESS;
+}
+
 static NTSTATUS XcCmdGetConfig(PXC_DEVEXT dev, void *buffer, ULONG out_len,
                                ULONG *written)
 {
@@ -2167,8 +2200,7 @@ NTSTATUS XcControlCommand(ULONG code, void *buffer, ULONG in_len,
 	case IOCTL_XC_RESET_CONFIG:
 	case IOCTL_XC_SET_CONFIG:
 	case IOCTL_XC_SET_RUMBLE:
-	case IOCTL_XC_NUDGE:
-	case IOCTL_XC_RAWMOUSE:
+	case IOCTL_XC_GET_RAW:
 		if (in_len < sizeof(request)) {
 			status = STATUS_INVALID_PARAMETER;
 			break;
@@ -2206,36 +2238,9 @@ NTSTATUS XcControlCommand(ULONG code, void *buffer, ULONG in_len,
 			status = STATUS_SUCCESS;
 			break;
 		}
-		if (code == IOCTL_XC_RAWMOUSE) {
-			XC_RAWMOUSE_REQUEST rm;
-
-			if (in_len < sizeof(rm)) {
-				status = STATUS_INVALID_PARAMETER;
-				break;
-			}
-			RtlCopyMemory(&rm, buffer, sizeof(rm));
-
-			/* Straight to the sink: no engine, no filtering. */
-			XcReportSink(dev, CORE_REPORT_ID_MOUSE, rm.payload,
-			             CORE_MOUSE_PAYLOAD);
-			status = STATUS_SUCCESS;
-			break;
-		}
-		if (code == IOCTL_XC_NUDGE) {
-			XC_NUDGE_REQUEST nr;
-			KIRQL            irql;
-
-			if (in_len < sizeof(nr)) {
-				status = STATUS_INVALID_PARAMETER;
-				break;
-			}
-			RtlCopyMemory(&nr, buffer, sizeof(nr));
-
-			KeAcquireSpinLock(&dev->CoreLock, &irql);
-			core_mouse_move(&dev->Core, nr.dx, nr.dy);
-			KeReleaseSpinLock(&dev->CoreLock, irql);
-
-			status = STATUS_SUCCESS;
+		if (code == IOCTL_XC_GET_RAW) {
+			status = XcCmdGetRaw(dev, request.index, buffer,
+			                     out_len, written);
 			break;
 		}
 		if (code == IOCTL_XC_SET_RUMBLE) {

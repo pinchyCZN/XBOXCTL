@@ -583,6 +583,22 @@ Table of Contents
    +----------------+---------------------------------------------------+
    | SET_RUMBLE     | in: device index, then two actuator levels        |
    +----------------+---------------------------------------------------+
+   | GET_TRACE      | in: device index. out: the last 32 mouse reports  |
+   |                | emitted, which is the only view of that path      |
+   +----------------+---------------------------------------------------+
+   | GET_RAW        | in: device index. out: the last packet the pad    |
+   |                | sent, before anything was done to it              |
+   +----------------+---------------------------------------------------+
+
+   GET_RAW IS THE ONLY VIEW OF UNTRANSLATED INPUT. The packet also
+   rides along on the gamepad report, but that report is emitted only
+   when the MAPPED state changes - the comparison stops short of the raw
+   tail deliberately, because a stick moves constantly and including it
+   would emit a report per packet. A control already bound to a key
+   therefore changes nothing an application can see, no report goes out,
+   and the raw tail never updates for exactly the controls a
+   configurator most needs to watch. Asking for the packet costs nothing
+   until something wants it and cannot flood anybody.
 
    HidRegisterMinidriver OVERWRITES THE DISPATCH TABLE, and that is the
    one awkward fact this design has to live with. A single driver object

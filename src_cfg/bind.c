@@ -459,22 +459,3 @@ int xb_bind_dialog(HWND parent, xb_profile *p, u32 layer, u8 source)
 	                            MAKEINTRESOURCEA(IDD_BIND), parent,
 	                            xb_bind_proc, 0);
 }
-
-/*
- * Stick parameters are still edited in the profile text. The pad's
- * stick DIRECTIONS are bindable from the main dialog like any other
- * control; this is about mode, curve, deadzone and speed.
- */
-int xb_stick_dialog(HWND parent, xb_profile *p)
-{
-	(void)p;
-	MessageBoxA(parent,
-	            "Stick mode, curve, deadzone and speed are still edited "
-	            "in the profile .txt - open it in a text editor and the "
-	            "configurator will read it back.\n\n"
-	            "The stick DIRECTIONS are already on the main dialog: "
-	            "bind L-Stick Up to a key and it behaves like any other "
-	            "control.",
-	            "XBOXCTL", MB_OK | MB_ICONINFORMATION);
-	return 0;
-}

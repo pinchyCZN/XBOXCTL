@@ -339,8 +339,7 @@ typedef struct _XC_DEVEXT {
 #define IOCTL_XC_RESET_CONFIG   XC_IOCTL_WRITE(5)
 #define IOCTL_XC_SET_RUMBLE     XC_IOCTL_WRITE(6)
 #define IOCTL_XC_GET_TRACE      XC_IOCTL_READ(7)
-#define IOCTL_XC_NUDGE          XC_IOCTL_WRITE(8)
-#define IOCTL_XC_RAWMOUSE       XC_IOCTL_WRITE(9)
+#define IOCTL_XC_GET_RAW        XC_IOCTL_READ(8)
 
 /* More pads than anyone has. The array is walked, not searched. */
 #define XC_MAX_DEVICES          8
@@ -419,53 +418,42 @@ typedef struct _XC_CONFIG_REQUEST {
  * report; no game will ever send one. Both paths end in the same
  * XcRumbleSet, so the hardware path is exercised either way.
  */
-/*
- * NUDGE. Emit one mouse report carrying exactly these deltas.
- *
- * IT EXISTS TO SEPARATE TWO FAULTS THAT LOOK IDENTICAL: a driver that
- * computes the wrong motion, and a host that misreads correct motion.
- * Nothing about the stick, the curve or the accumulator is involved -
- * the numbers go straight into a report - so if the pointer does not do
- * what the numbers say, the fault is above this driver.
- */
-typedef struct _XC_NUDGE_REQUEST {
-	u32 index;
-	s16 dx;
-	s16 dy;
-} XC_NUDGE_REQUEST;
-
-/*
- * RAWMOUSE. Emit a mouse report containing exactly these four bytes,
- * bypassing the engine entirely - no accumulator, no zero-move check.
- *
- * IT EXISTS TO ASK ONE QUESTION: does an ALL-ZERO mouse report move
- * the cursor? If it does, nothing in the payload matters and the
- * fault is in how the report is delivered rather than what is in it.
- * core_mouse_move refuses a zero move on purpose, so this is the only
- * way to send one.
- */
-typedef struct _XC_RAWMOUSE_REQUEST {   /* 12 bytes */
-	u32 index;
-	u8  payload[CORE_MOUSE_PAYLOAD];    /* EXACTLY a mouse report */
-	u8  reserved[2];
-} XC_RAWMOUSE_REQUEST;
-
-/*
- * THE PAYLOAD IS THE REPORT, SO IT IS SIZED BY THE REPORT. Sending a
- * report from a field smaller than one reads past the field and puts
- * whatever follows it on the wire as motion, which looks exactly like
- * the driver computing nonsense.
- */
-typedef char xc_rawmouse_fits[
-    sizeof(((XC_RAWMOUSE_REQUEST *)0)->payload) >= CORE_MOUSE_PAYLOAD
-    ? 1 : -1];
-
 typedef struct _XC_RUMBLE_REQUEST {
 	u32 index;
 	u8  left;
 	u8  right;
 	u8  reserved[2];
 } XC_RUMBLE_REQUEST;
+
+/*
+ * GET_RAW. The last packet the pad sent, before anything was done to it.
+ *
+ * THIS IS THE ONLY WAY TO SEE UNTRANSLATED INPUT. The packet also rides
+ * along on the gamepad report, but that report is emitted only when the
+ * MAPPED state changes - the comparison stops short of the raw tail on
+ * purpose, because a stick moves constantly and including it would emit
+ * a report per packet. The consequence is that a control already bound
+ * to a key changes nothing an application can see, so no report goes out
+ * and the raw tail never updates for exactly the controls a configurator
+ * most needs to watch.
+ *
+ * ASKED FOR, NOT PUSHED, so it costs nothing until something wants it
+ * and it cannot flood anybody.
+ *
+ * sequence IS WHAT SEPARATES NEW DATA FROM A REPEAT. Two polls returning
+ * the same packet AND the same sequence saw one packet; the same packet
+ * with a higher sequence means the pad sent an identical one again,
+ * which is a different fact about the hardware.
+ */
+typedef struct _XC_RAW_INFO {       /* 48 bytes */
+	u32 index;
+	u32 valid;          /* 0 until a packet has been decoded    */
+	u32 sequence;       /* packets accepted, as a change marker */
+	u32 layer;          /* the live layer, 1-based, for context */
+	u64 when_100ns;     /* when it arrived, on the driver clock */
+	u8  packet[CORE_RAW_PACKET_BYTES];
+	u8  reserved[4];
+} XC_RAW_INFO;
 
 /*
  * The commands, with the IRP plumbing stripped off. buffer is the single

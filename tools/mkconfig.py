@@ -63,10 +63,16 @@ SOURCES = {
     "start": 4, "back": 5, "lthumb": 6, "rthumb": 7,
     "a": 8, "b": 9, "x": 10, "y": 11,
     "black": 12, "white": 13, "ltrigger": 14, "rtrigger": 15,
+# UP IS THE NEGATIVE SEMIAXIS, AND THAT IS NOT A TYPO. The pad reports
+# Y up-positive and the decode negates it once so the value is
+# down-positive the way HID wants, which leaves a physical UP push in
+# the semiaxis named YNEG. Naming these the other way round reads
+# correctly against the struct and is wrong against the thumb: a
+# profile saying "lstick_up" would fire on pushing down.
     "lstick_left": 16, "lstick_right": 17,
-    "lstick_down": 18, "lstick_up": 19,
+    "lstick_up": 18, "lstick_down": 19,
     "rstick_left": 20, "rstick_right": 21,
-    "rstick_down": 22, "rstick_up": 23,
+    "rstick_up": 22, "rstick_down": 23,
     "guide": 24,
 }
 
@@ -449,17 +455,17 @@ def dump(blob):
 
     hdr = struct.unpack(HDR_FMT, blob[:HDR_SIZE])
     (sig, ver, hbytes, lbytes, sbytes, lcount, bcount, ccount,
-     coll, tick, _) = hdr
+     coll, _) = hdr
     print("signature   %08X %s" % (sig, "ok" if sig == SIGNATURE else "BAD"))
     print("version     %d" % ver)
     print("strides     header %d  layout %d  stick %d"
           % (hbytes, lbytes, sbytes))
     print("counts      layouts %d  bindings %d  chords %d"
           % (lcount, bcount, ccount))
-    print("collections %s%s%s   tick %d Hz"
+    print("collections %s%s%s"
           % ("gamepad " if coll & 1 else "",
              "keyboard " if coll & 2 else "",
-             "mouse" if coll & 4 else "", tick))
+             "mouse" if coll & 4 else ""))
     print("total       %d bytes" % len(blob))
 
     off = hbytes
