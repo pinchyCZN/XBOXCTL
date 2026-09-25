@@ -74,8 +74,8 @@ static const u8 XB_PAD_GRID[XB_PAD_ROWS][XB_PAD_COLS] = {
 	{ CORE_SA_B,          CORE_SA_BLACK,       CORE_SA_RTRIGGER    },
 	{ CORE_SA_X,          CORE_SA_START,       CORE_SA_LTHUMB      },
 	{ CORE_SA_Y,          CORE_SA_BACK,        CORE_SA_RTHUMB      },
-	{ XB_CELL_STICK_L,    XB_CELL_STICK_R,     XB_CELL_CHORD_1     },
-	{ XB_CELL_CYCLE,      XB_CELL_HOLD,        XB_CELL_CHORD_2     }
+	{ XB_CELL_STICK_L,    XB_CELL_CYCLE,       XB_CELL_CHORD_1     },
+	{ XB_CELL_STICK_R,    XB_CELL_HOLD,        XB_CELL_CHORD_2     }
 };
 
 int  xb_bind_dialog(HWND parent, xb_profile *p, u32 layer, u8 source);
