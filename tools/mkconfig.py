@@ -125,6 +125,15 @@ KEYS.update({
     "right": 0x4F, "left": 0x50, "down": 0x51, "up": 0x52,
     "lctrl": 0xE0, "lshift": 0xE1, "lalt": 0xE2, "lgui": 0xE3,
     "rctrl": 0xE4, "rshift": 0xE5, "ralt": 0xE6, "rgui": 0xE7,
+    # THE KEYPAD IS ITS OWN SET OF USAGES: keypad Enter is 0x58
+    # and the Enter above it is 0x28. A scan code tells them
+    # apart, so they need names to be written back as.
+    "numlock": 0x53, "kpslash": 0x54, "kpstar": 0x55,
+    "kpminus": 0x56, "kpplus": 0x57, "kpenter": 0x58,
+    "kp1": 0x59, "kp2": 0x5A, "kp3": 0x5B, "kp4": 0x5C,
+    "kp5": 0x5D, "kp6": 0x5E, "kp7": 0x5F, "kp8": 0x60,
+    "kp9": 0x61, "kp0": 0x62, "kpperiod": 0x63,
+    "nonusbackslash": 0x64, "menu": 0x65,
 })
 
 MOUSE_BUTTONS = {"left": 1, "right": 2, "middle": 3, "x1": 4, "x2": 5}
@@ -302,9 +311,20 @@ def parse_code(action, word):
 
     if action == ACTIONS["key"]:
         key = KEYS.get(word.lower())
-        if key is None:
-            raise ValueError("unknown key name '%s'" % word)
-        return key
+        if key is not None:
+            return key
+        # A BARE USAGE IS ACCEPTED TOO. Capture can reach keys the name
+        # table does not carry, and the writer already emits "key 0x54"
+        # for them; without this a profile could be saved and not read
+        # back. The range is the driver's - core_cfg_key_ok.
+        try:
+            n = int(word, 0)
+        except ValueError:
+            n = -1
+        if 0x04 <= n <= 0xA4 or 0xE0 <= n <= 0xE7:
+            return n
+        raise ValueError("'%s' is not a key name or a usage in"
+                         " 0x04..0xA4 or 0xE0..0xE7" % word)
     if action == ACTIONS["mouse_button"]:
         if word.lower() in MOUSE_BUTTONS:
             return MOUSE_BUTTONS[word.lower()]

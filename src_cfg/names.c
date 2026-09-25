@@ -138,7 +138,7 @@ int xb_curve_find(const char *name, double *y1, double *y2)
  * chances to transpose a number.
  */
 static char XB_KEY_NAMES[26 + 10 + 12][4];
-static xb_name XB_KEYS_TABLE[26 + 10 + 12 + 64];
+static xb_name XB_KEYS_TABLE[26 + 10 + 12 + 80];
 static int XB_KEYS_BUILT;
 
 static const xb_name XB_KEYS_NAMED[] = {
@@ -155,6 +155,21 @@ static const xb_name XB_KEYS_NAMED[] = {
 	{ "lctrl", 0xE0 }, { "lshift", 0xE1 }, { "lalt", 0xE2 },
 	{ "lgui", 0xE3 }, { "rctrl", 0xE4 }, { "rshift", 0xE5 },
 	{ "ralt", 0xE6 }, { "rgui", 0xE7 },
+
+	/*
+	 * THE KEYPAD IS ITS OWN SET OF USAGES. Keypad Enter is 0x58 and the
+	 * Enter above it is 0x28; keypad 4 is 0x5C and the 4 on the number
+	 * row is 0x21. A scan code tells them apart, so they need names to
+	 * be written back as.
+	 */
+	{ "numlock", 0x53 },
+	{ "kpslash", 0x54 }, { "kpstar", 0x55 },
+	{ "kpminus", 0x56 }, { "kpplus", 0x57 }, { "kpenter", 0x58 },
+	{ "kp1", 0x59 }, { "kp2", 0x5A }, { "kp3", 0x5B },
+	{ "kp4", 0x5C }, { "kp5", 0x5D }, { "kp6", 0x5E },
+	{ "kp7", 0x5F }, { "kp8", 0x60 }, { "kp9", 0x61 },
+	{ "kp0", 0x62 }, { "kpperiod", 0x63 },
+	{ "nonusbackslash", 0x64 }, { "menu", 0x65 },
 	{ NULL, 0 }
 };
 

@@ -161,12 +161,29 @@ static int xb_parse_code(xb_profile *p, int line, u8 action,
 		return 1;
 	}
 	if (action == CORE_ACT_KEY) {
-		if (!xb_name_to_value(xb_keys(), word, &v)) {
-			xb_fail(p, line, "unknown key name '%s'", word);
-			return 0;
+		if (xb_name_to_value(xb_keys(), word, &v)) {
+			*out = (u16)v;
+			return 1;
 		}
-		*out = (u16)v;
-		return 1;
+		/*
+		 * A BARE USAGE IS ACCEPTED TOO, because capture can reach keys
+		 * the name table does not carry and the writer already emits
+		 * "key 0x54" for them. Without this the configurator could save
+		 * a profile it refused to read back.
+		 *
+		 * The range is the driver's: core_cfg_key_ok drops anything
+		 * outside it, and a binding silently disarmed is worse than a
+		 * profile that says why.
+		 */
+		if (xb_number(word, &n) &&
+		    ((n >= 0x04 && n <= 0xA4) || (n >= 0xE0 && n <= 0xE7))) {
+			*out = (u16)n;
+			return 1;
+		}
+		xb_fail(p, line,
+		        "'%s' is not a key name or a usage in 0x04..0xA4 or"
+		        " 0xE0..0xE7", word);
+		return 0;
 	}
 	if (action == CORE_ACT_MOUSE_BUTTON &&
 	    xb_name_to_value(XB_MOUSE_BUTTONS, word, &v)) {

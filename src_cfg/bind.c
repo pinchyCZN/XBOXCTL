@@ -64,56 +64,92 @@ static u8 xb_list_action(HWND dlg)
  * ====================================================================== */
 
 /*
- * Virtual key to HID usage.
+ * SCAN CODE TO HID USAGE, not virtual key to HID usage.
  *
- * Letters, digits and function keys are computed - they are contiguous
- * in both encodings - and the rest is a table. A key with no usage
- * returns 0 rather than guessing.
+ * A VIRTUAL KEY CANNOT TELL THESE APART and the pad has to: keypad
+ * Enter from the Enter above it, keypad 4 from the 4 on the number row,
+ * right Alt from left. Windows folds all of those into one VK. The scan
+ * code does not, and the E0 prefix is exactly what separates them.
+ *
+ * These are PS/2 set 1 codes, which is what RAWKEYBOARD.MakeCode
+ * carries whatever the keyboard is physically wired as.
+ *
+ * A KEY WITH NO USAGE RETURNS 0 AND IS IGNORED. Media and browser keys
+ * are real keys with nothing to send, and binding one to a usage it
+ * does not have would be inventing a keystroke.
  */
-static u16 xb_vk_to_usage(int vk)
+static u16 xb_scan_to_usage(u16 make, int e0, int e1)
 {
-	static const struct { int vk; u16 usage; } NAMED[] = {
-		{ VK_RETURN, 0x28 }, { VK_ESCAPE, 0x29 }, { VK_BACK, 0x2A },
-		{ VK_TAB, 0x2B },    { VK_SPACE, 0x2C },
-		{ VK_OEM_MINUS, 0x2D }, { VK_OEM_PLUS, 0x2E },
-		{ VK_OEM_4, 0x2F },  { VK_OEM_6, 0x30 }, { VK_OEM_5, 0x31 },
-		{ VK_OEM_1, 0x33 },  { VK_OEM_7, 0x34 }, { VK_OEM_3, 0x35 },
-		{ VK_OEM_COMMA, 0x36 }, { VK_OEM_PERIOD, 0x37 },
-		{ VK_OEM_2, 0x38 },  { VK_CAPITAL, 0x39 },
-		{ VK_SNAPSHOT, 0x46 }, { VK_SCROLL, 0x47 }, { VK_PAUSE, 0x48 },
-		{ VK_INSERT, 0x49 }, { VK_HOME, 0x4A }, { VK_PRIOR, 0x4B },
-		{ VK_DELETE, 0x4C }, { VK_END, 0x4D },  { VK_NEXT, 0x4E },
-		{ VK_RIGHT, 0x4F },  { VK_LEFT, 0x50 }, { VK_DOWN, 0x51 },
-		{ VK_UP, 0x52 },
-		{ VK_LCONTROL, 0xE0 }, { VK_LSHIFT, 0xE1 }, { VK_LMENU, 0xE2 },
-		{ VK_LWIN, 0xE3 },
-		{ VK_RCONTROL, 0xE4 }, { VK_RSHIFT, 0xE5 }, { VK_RMENU, 0xE6 },
-		{ VK_RWIN, 0xE7 },
+	/* Pause arrives as E1 1D 45 and is the only E1 sequence there is. */
+	static const u16 PLAIN[] = {
+	/* 00 */ 0,    0x29, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23,
+	/* 08 */ 0x24, 0x25, 0x26, 0x27, 0x2D, 0x2E, 0x2A, 0x2B,
+	/* 10 */ 0x14, 0x1A, 0x08, 0x15, 0x17, 0x1C, 0x18, 0x0C,
+	/* 18 */ 0x12, 0x13, 0x2F, 0x30, 0x28, 0xE0, 0x04, 0x16,
+	/* 20 */ 0x07, 0x09, 0x0A, 0x0B, 0x0D, 0x0E, 0x0F, 0x33,
+	/* 28 */ 0x34, 0x35, 0xE1, 0x31, 0x1D, 0x1B, 0x06, 0x19,
+	/* 30 */ 0x05, 0x11, 0x10, 0x36, 0x37, 0x38, 0xE5, 0x55,
+	/* 38 */ 0xE2, 0x2C, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E,
+	/* 40 */ 0x3F, 0x40, 0x41, 0x42, 0x43, 0x53, 0x47, 0x5F,
+	/* 48 */ 0x60, 0x61, 0x56, 0x5C, 0x5D, 0x5E, 0x57, 0x59,
+	/* 50 */ 0x5A, 0x5B, 0x62, 0x63, 0,    0,    0x64, 0x44,
+	/* 58 */ 0x45
+	};
+	static const struct { u16 make; u16 usage; } EXTENDED[] = {
+		{ 0x1C, 0x58 },     /* keypad Enter    */
+		{ 0x1D, 0xE4 },     /* right Ctrl      */
+		{ 0x35, 0x54 },     /* keypad /        */
+		{ 0x37, 0x46 },     /* Print Screen    */
+		{ 0x38, 0xE6 },     /* right Alt       */
+		{ 0x47, 0x4A },     /* Home            */
+		{ 0x48, 0x52 },     /* Up              */
+		{ 0x49, 0x4B },     /* Page Up         */
+		{ 0x4B, 0x50 },     /* Left            */
+		{ 0x4D, 0x4F },     /* Right           */
+		{ 0x4F, 0x4D },     /* End             */
+		{ 0x50, 0x51 },     /* Down            */
+		{ 0x51, 0x4E },     /* Page Down       */
+		{ 0x52, 0x49 },     /* Insert          */
+		{ 0x53, 0x4C },     /* Delete          */
+		{ 0x5B, 0xE3 },     /* left Windows    */
+		{ 0x5C, 0xE7 },     /* right Windows   */
+		{ 0x5D, 0x65 },     /* Application     */
 		{ 0, 0 }
 	};
-	int i;
+	u32 i;
 
-	if (vk >= 'A' && vk <= 'Z') {
-		return (u16)(0x04 + (vk - 'A'));
+	if (e1) {
+		return (make == 0x1D || make == 0x45) ? (u16)0x48 : (u16)0;
 	}
-	if (vk >= '1' && vk <= '9') {
-		return (u16)(0x1E + (vk - '1'));
-	}
-	if (vk == '0') {
-		return 0x27;
-	}
-	if (vk >= VK_F1 && vk <= VK_F12) {
-		return (u16)(0x3A + (vk - VK_F1));
-	}
-	for (i = 0; NAMED[i].vk != 0; i++) {
-		if (NAMED[i].vk == vk) {
-			return NAMED[i].usage;
+	if (e0) {
+		for (i = 0; EXTENDED[i].make != 0; i++) {
+			if (EXTENDED[i].make == make) {
+				return EXTENDED[i].usage;
+			}
 		}
+		return 0;
+	}
+	if (make < sizeof(PLAIN) / sizeof(PLAIN[0])) {
+		return PLAIN[make];
 	}
 	return 0;
 }
 
 static u16 g_Captured;
+
+/* Defined below, with the rest of the dialog entry points. */
+int xb_capture_key(HWND parent, u16 *usage);
+
+static void xb_capture_listen(HWND dlg, int on)
+{
+	RAWINPUTDEVICE rid;
+
+	rid.usUsagePage = 0x01;     /* generic desktop */
+	rid.usUsage     = 0x06;     /* keyboard        */
+	rid.dwFlags     = on ? 0 : RIDEV_REMOVE;
+	rid.hwndTarget  = on ? dlg : NULL;
+	RegisterRawInputDevices(&rid, 1, (UINT)sizeof(rid));
+}
 
 static INT_PTR CALLBACK xb_capture_proc(HWND dlg, UINT msg, WPARAM wp,
                                         LPARAM lp)
@@ -121,47 +157,70 @@ static INT_PTR CALLBACK xb_capture_proc(HWND dlg, UINT msg, WPARAM wp,
 	switch (msg) {
 	case WM_INITDIALOG:
 		g_Captured = 0;
-		/* THE DIALOG ITSELF HAS TO SEE THE KEY. Without this the edit
-		 * and button controls swallow it first. */
-		SetTimer(dlg, 1, 20, NULL);
-		return TRUE;
+		xb_capture_listen(dlg, 1);
 
-	case WM_TIMER:
+		/*
+		 * NO CONTROL GETS THE FOCUS. With the Cancel button focused,
+		 * Enter activates it and the keystroke never arrives - which
+		 * is the whole reason Enter could not be captured. Focused on
+		 * the dialog itself, Enter reaches nothing and Escape still
+		 * cancels, because the dialog manager maps it whatever has
+		 * focus.
+		 */
+		SetFocus(dlg);
+		return FALSE;       /* FALSE: the focus is already set */
+
+	case WM_INPUT:
 	{
-		int vk;
+		RAWINPUT ri;
+		UINT     size = (UINT)sizeof(ri);
+		u16      usage;
 
-		for (vk = 8; vk < 256; vk++) {
-			if (vk == VK_LBUTTON || vk == VK_RBUTTON ||
-				vk == VK_MBUTTON) {
-				continue;
-			}
-			if ((GetAsyncKeyState(vk) & 0x8000) == 0) {
-				continue;
-			}
-			if (vk == VK_ESCAPE) {
-				KillTimer(dlg, 1);
-				EndDialog(dlg, 0);
-				return TRUE;
-			}
-			g_Captured = xb_vk_to_usage(vk);
-			if (g_Captured != 0) {
-				KillTimer(dlg, 1);
-				EndDialog(dlg, 1);
-				return TRUE;
-			}
+		if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &ri, &size,
+			                (UINT)sizeof(RAWINPUTHEADER)) == (UINT)-1) {
+			break;
 		}
+		if (ri.header.dwType != RIM_TYPEKEYBOARD) {
+			break;
+		}
+		/*
+		 * MAKES ONLY, WHICH ALSO SOLVES THE SELF-CAPTURE RACE. The
+		 * key that opened this dialog was pressed before the
+		 * registration, so only its BREAK arrives here - and a break
+		 * is not a capture.
+		 */
+		if (ri.data.keyboard.Flags & RI_KEY_BREAK) {
+			break;
+		}
+
+		usage = xb_scan_to_usage(ri.data.keyboard.MakeCode,
+			        (ri.data.keyboard.Flags & RI_KEY_E0) != 0,
+			        (ri.data.keyboard.Flags & RI_KEY_E1) != 0);
+
+		/* A key with no usage is ignored, and so is Escape - which
+		 * cancels instead, and can be typed in by name. */
+		if (usage == 0 || usage == 0x29) {
+			break;
+		}
+
+		g_Captured = usage;
+		xb_capture_listen(dlg, 0);
+		EndDialog(dlg, 1);
 		return TRUE;
 	}
 
 	case WM_COMMAND:
 		if (LOWORD(wp) == IDCANCEL) {
-			KillTimer(dlg, 1);
+			xb_capture_listen(dlg, 0);
 			EndDialog(dlg, 0);
 			return TRUE;
 		}
 		break;
+
+	case WM_DESTROY:
+		xb_capture_listen(dlg, 0);
+		break;
 	}
-	(void)lp;
 	return FALSE;
 }
 
@@ -409,22 +468,26 @@ static INT_PTR CALLBACK xb_bind_proc(HWND dlg, UINT msg, WPARAM wp,
 
 		switch (id) {
 		case IDC_CAPTURE:
-			if (DialogBoxParamA(xb_instance(),
-				                MAKEINTRESOURCEA(IDD_CAPTURE), dlg,
-				                xb_capture_proc, 0)) {
-				const char *k = xb_value_to_name(xb_keys(), g_Captured);
+		{
+			u16 usage = 0;
+
+			/* SHARED WITH THE CHORD DIALOG, so both get the same key
+			 * table and the same tidy-up afterwards. */
+			if (xb_capture_key(dlg, &usage)) {
+				const char *k = xb_value_to_name(xb_keys(), usage);
 				char        text[32];
 
 				if (k != NULL) {
 					snprintf(text, sizeof(text), "%s", k);
 				} else {
 					snprintf(text, sizeof(text), "0x%02X",
-						     (unsigned)g_Captured);
+							 (unsigned)usage);
 				}
 				SetDlgItemTextA(dlg, IDC_CODE, text);
 				xb_update_preview(dlg);
 			}
 			return TRUE;
+		}
 
 		case IDC_CLEAR:
 			SendDlgItemMessageA(dlg, IDC_ACTION, LB_SETCURSEL, 0, 0);
@@ -503,8 +566,31 @@ static INT_PTR CALLBACK xb_bind_proc(HWND dlg, UINT msg, WPARAM wp,
  */
 int xb_capture_key(HWND parent, u16 *usage)
 {
-	if (!DialogBoxParamA(xb_instance(), MAKEINTRESOURCEA(IDD_CAPTURE),
-	                     parent, xb_capture_proc, 0)) {
+	INT_PTR took;
+	MSG     msg;
+
+	took = DialogBoxParamA(xb_instance(), MAKEINTRESOURCEA(IDD_CAPTURE),
+	                       parent, xb_capture_proc, 0);
+
+	/*
+	 * THROW AWAY WHAT IS STILL IN FLIGHT. The dialog closes on the key
+	 * going DOWN, so its release - and any auto-repeat while a finger
+	 * stays on it - is still queued. Capture Enter and those repeats
+	 * would land on the OK button below and close this dialog too, from
+	 * one keypress.
+	 */
+	while (PeekMessageA(&msg, NULL, WM_KEYFIRST, WM_KEYLAST, PM_REMOVE)) {
+		/* discarded on purpose */
+	}
+
+	/*
+	 * AND THEN ENTER MEANS OK. Leaving the focus on the Capture button
+	 * makes Enter reopen capture, which is the last thing anybody wants
+	 * having just finished with it.
+	 */
+	SetFocus(GetDlgItem(parent, IDOK));
+
+	if (!took) {
 		return 0;
 	}
 	*usage = g_Captured;
