@@ -32,7 +32,42 @@ extern HINSTANCE xb_instance(void);
 static xb_profile *g_LP;
 static u8          g_Action;
 
-/* The controls offered, in core.h order, guide excluded. */
+/*
+ * The controls offered, in the order they are listed.
+ *
+ * READING ORDER, NOT core.h ORDER. The enumeration puts the D-pad first
+ * because that is where it sits in the pad's packet, which is no reason
+ * for it to be the first thing somebody scrolls past when picking a
+ * layer control. Buttons first, then the D-pad, then the stick
+ * directions.
+ *
+ * GUIDE IS ABSENT, not filtered: core.c pins that semiaxis to zero
+ * because it is a 360 control this pad has no equivalent for, so it
+ * could never complete a chord. A dead choice is worse than none.
+ */
+static const u8 XB_CHOICE_ORDER[] = {
+	CORE_SA_START,        CORE_SA_BACK,
+	CORE_SA_LTHUMB,       CORE_SA_RTHUMB,
+	CORE_SA_A,            CORE_SA_B,
+	CORE_SA_X,            CORE_SA_Y,
+	CORE_SA_BLACK,        CORE_SA_WHITE,
+	CORE_SA_LTRIGGER,     CORE_SA_RTRIGGER,
+	CORE_SA_DPAD_UP,      CORE_SA_DPAD_DOWN,
+	CORE_SA_DPAD_LEFT,    CORE_SA_DPAD_RIGHT,
+	CORE_SA_LSTICK_XNEG,  CORE_SA_LSTICK_XPOS,
+	CORE_SA_LSTICK_YNEG,  CORE_SA_LSTICK_YPOS,
+	CORE_SA_RSTICK_XNEG,  CORE_SA_RSTICK_XPOS,
+	CORE_SA_RSTICK_YNEG,  CORE_SA_RSTICK_YPOS
+};
+
+/*
+ * EVERY SOURCE BUT GUIDE, OR IT DOES NOT BUILD. Rearranging a list is
+ * exactly the edit that loses an entry, and a control missing from here
+ * simply cannot be chosen - with nothing to say so.
+ */
+typedef char xb_choice_order_complete[
+    (sizeof(XB_CHOICE_ORDER) == CORE_SEMIAXIS_COUNT - 1) ? 1 : -1];
+
 static u8  g_Choice[CORE_SEMIAXIS_COUNT];
 static u32 g_ChoiceCount;
 
@@ -41,18 +76,8 @@ static void xb_choices_build(void)
 	u32 i;
 
 	g_ChoiceCount = 0;
-	for (i = 0; XB_SOURCES[i].name != NULL; i++) {
-		u8 src = (u8)XB_SOURCES[i].value;
-
-		/*
-		 * GUIDE IS PINNED TO ZERO by core.c - it is a 360 control and
-		 * this pad has no equivalent - so it could never complete a
-		 * chord. Offering it would be offering a dead choice.
-		 */
-		if (src == CORE_SA_GUIDE) {
-			continue;
-		}
-		g_Choice[g_ChoiceCount++] = src;
+	for (i = 0; i < sizeof(XB_CHOICE_ORDER); i++) {
+		g_Choice[g_ChoiceCount++] = XB_CHOICE_ORDER[i];
 	}
 }
 
