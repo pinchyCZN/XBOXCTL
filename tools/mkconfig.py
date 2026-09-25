@@ -176,7 +176,9 @@ class Binding(object):
 
 class Stick(object):
     def __init__(self):
-        self.deadzone = 2000
+        # 8000: a stick rests some thousands of units off centre, so a
+        # smaller one drifts. See core.c core_binding_clear.
+        self.deadzone = 8000
         self.outer = 33000
         self.max_speed = 2800
         self.accel_threshold = 58000

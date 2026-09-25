@@ -1764,7 +1764,7 @@ static void core_stick_defaults(core_stick *st)
 	 * decides whether the pointer pipeline claims it instead.
 	 */
 	st->mode            = CORE_STICK_OFF;
-	st->deadzone        = 2000;
+	st->deadzone        = 4000;
 	st->outer           = 33000;
 	st->max_speed       = 2800;
 	st->gain_x          = 128;

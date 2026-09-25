@@ -725,11 +725,21 @@ int xb_profile_save(const xb_profile *p, const char *path)
 		mname = xb_value_to_name(XB_STICK_MODES, st->mode);
 		fprintf(f, "\n[stick %s]\n", i == 0 ? "left" : "right");
 		fprintf(f, "mode = %s\n", mname != NULL ? mname : "off");
-		if (st->mode == CORE_STICK_OFF) {
-			continue;
-		}
+
+		/*
+		 * THE DEADZONE IS WRITTEN WHATEVER THE MODE IS. It is not part
+		 * of the pointer pipeline alone: a stick DIRECTION bound to a
+		 * key is tested against it too, so it means something on a
+		 * stick whose mode is off. Skipping it there loses a value the
+		 * profile set, silently, on the next save.
+		 */
 		fprintf(f, "deadzone = %u\n", (unsigned)st->deadzone);
 		fprintf(f, "outer = %u\n", (unsigned)st->outer);
+
+		/* The rest only means something to a mode that makes a rate. */
+		if (st->mode != CORE_STICK_MOUSE && st->mode != CORE_STICK_WHEEL) {
+			continue;
+		}
 		fprintf(f, "max_speed = %u\n", (unsigned)st->max_speed);
 		cname = xb_curve_name(st->curve);
 		if (cname != NULL) {

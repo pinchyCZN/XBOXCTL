@@ -15,13 +15,16 @@
 # Both sticks stay plain joystick axes. Set mode = mouse to hand a stick to
 # the pointer pipeline instead; the curve is computed here and shipped as a
 # 33-entry table, so the driver never evaluates one.
+# A deadzone still matters with mode = off: it is what a stick DIRECTION
+# bound to a key is tested against, and a resting stick is several
+# thousand units off centre.
 [stick left]
 mode = off
-deadzone = 2000
+deadzone = 8000
 
 [stick right]
 mode = off
-deadzone = 2000
+deadzone = 8000
 curve = linear          # linear | quad | cubic | smoothstep | <y1> <y2>
 
 [layer 1]

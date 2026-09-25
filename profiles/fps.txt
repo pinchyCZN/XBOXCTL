@@ -17,12 +17,16 @@ mode = off
 
 [stick right]
 mode = mouse
-# DEADZONE IS MEASURED, NOT GUESSED. The stick jitters one or two raw
-# counts out of 32767 at rest, which is about two units out of 35000.
-# 1500 is a generous margin over that. A large deadzone does not make
-# the pointer steadier - it throws away the whole fine-control region
-# near centre, which is exactly where slow movement comes from.
-deadzone = 1500         # radial, in 35000ths
+# DEADZONE IS MEASURED, AND THE MEASUREMENT IS NOT JITTER. A stick at
+# rest does not sit at centre at all: this pad's right stick sits some
+# 3900 units of 35000 off it with nothing touching it. Anything under
+# that leaves the resting position permanently outside the deadzone, so
+# the pointer drifts on its own.
+#
+# It does throw away the fine-control region near centre, and that cost
+# is real - but the curve is where slow movement comes from, not a small
+# deadzone.
+deadzone = 8000         # radial, in 35000ths
 outer = 32000           # deflection treated as full
 
 # SLOW CONTROL COMES FROM THE CURVE, NOT FROM A LOW TOP SPEED. A cubic
