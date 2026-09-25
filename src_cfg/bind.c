@@ -506,13 +506,23 @@ static INT_PTR CALLBACK xb_bind_proc(HWND dlg, UINT msg, WPARAM wp,
 			core_binding b;
 			int          slot;
 
+			if (GetFocus() == GetDlgItem(dlg, IDC_ACTION) &&
+				xb_list_action(dlg) == CORE_ACT_KEY) {
+				SendMessageA(dlg, WM_NEXTDLGCTL,
+						     (WPARAM)GetDlgItem(dlg,
+						                        IDC_CAPTURE),
+						     TRUE);
+				return TRUE;
+			}
+
 			xb_dialog_to_binding(dlg, &b);
 			slot = xb_find_binding(g_P, g_Layer, g_Source);
 
 			if (b.action == CORE_ACT_NONE) {
 				if (slot >= 0) {
 					core_binding *t =
-						&g_P->cfg.layout[g_Layer].binding[slot];
+						&g_P->cfg.layout[g_Layer]
+						 .binding[slot];
 
 					memset(t, 0, sizeof(*t));
 					t->source = CORE_SA_NONE;
@@ -522,6 +532,26 @@ static INT_PTR CALLBACK xb_bind_proc(HWND dlg, UINT msg, WPARAM wp,
 				g_P->cfg.layout[g_Layer].binding[slot] = b;
 			} else {
 				u32 i;
+
+			/*
+			 * ENTER ON THE ACTION LIST MOVES TO CAPTURE, it does not
+			 * accept the dialog. Picking "key" and pressing Enter reads
+			 * as "yes, that one", and closing there would leave the value
+			 * box empty - the one thing the choice needs next.
+			 *
+			 * WM_NEXTDLGCTL, NOT SetFocus. Which button Enter presses is
+			 * the dialog's DEFAULT, which is a separate thing from what
+			 * has the focus: SetFocus moves the caret and leaves OK still
+			 * the default, so Enter would close the dialog anyway. Only
+			 * the dialog manager moves both, and this is how it is asked.
+			 */
+			if (GetFocus() == GetDlgItem(dlg, IDC_ACTION) &&
+				xb_list_action(dlg) == CORE_ACT_KEY) {
+				SendMessageA(dlg, WM_NEXTDLGCTL,
+							 (WPARAM)GetDlgItem(dlg, IDC_CAPTURE),
+							 TRUE);
+				return TRUE;
+			}
 
 				for (i = 0; i < CORE_MAX_BINDINGS; i++) {
 					core_binding *t =
@@ -587,8 +617,14 @@ int xb_capture_key(HWND parent, u16 *usage)
 	 * AND THEN ENTER MEANS OK. Leaving the focus on the Capture button
 	 * makes Enter reopen capture, which is the last thing anybody wants
 	 * having just finished with it.
+	 *
+	 * WM_NEXTDLGCTL AGAIN, for the same reason: it moves the default
+	 * button as well as the focus. SetFocus happens to work here only
+	 * because OK is already the default, which is a coincidence and not
+	 * a reason.
 	 */
-	SetFocus(GetDlgItem(parent, IDOK));
+	SendMessageA(parent, WM_NEXTDLGCTL,
+	             (WPARAM)GetDlgItem(parent, IDOK), TRUE);
 
 	if (!took) {
 		return 0;

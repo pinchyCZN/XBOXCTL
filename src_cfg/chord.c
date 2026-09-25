@@ -402,6 +402,14 @@ static INT_PTR CALLBACK xb_chord_proc(HWND dlg, UINT msg, WPARAM wp,
 				return TRUE;
 			}
 
+			if (GetFocus() == GetDlgItem(dlg, IDC_CH_ACTION) &&
+				xb_ch_action(dlg) == CORE_ACT_KEY) {
+				SendMessageA(dlg, WM_NEXTDLGCTL,
+						     (WPARAM)GetDlgItem(dlg, IDC_CH_CAPTURE),
+						     TRUE);
+				return TRUE;
+			}
+
 			/*
 			 * NOT THE CONTROLS A LAYER BUTTON ALREADY OWNS. Both
 			 * would fire, which nobody means, and the layer
