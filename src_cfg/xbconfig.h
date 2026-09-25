@@ -109,6 +109,37 @@ int xb_profile_load(xb_profile *p, const char *path);
 int xb_profile_save(const xb_profile *p, const char *path);
 
 /* ======================================================================
+ * CHORD SLOTS ARE RESERVED, NOT ALLOCATED
+ *
+ * The blob carries eight per layer and the configurator exposes four of
+ * them at fixed indices, because the thing addressing a slot is a BUTTON
+ * ON A DIALOG and a button cannot point at "whichever slot was free".
+ * First-come allocation would let a layer control and a chord swap
+ * places between one save and the next, and the profile text names the
+ * slot outright - [layer 1 chord 1] IS slot 0.
+ *
+ * Four sit idle. That is 16 bytes a layer for an arrangement nobody has
+ * to reason about.
+ * ====================================================================== */
+
+#define XB_CHORD_SLOT_1         0   /* the Chord 1 button, per layer   */
+#define XB_CHORD_SLOT_2         1   /* the Chord 2 button, per layer   */
+#define XB_CHORD_SLOT_CYCLE     6   /* Layer Cycle, same in every layer */
+#define XB_CHORD_SLOT_HOLD      7   /* Layer Hold, same in every layer  */
+
+#define XB_CHORD_BUTTONS        2   /* how many the main dialog shows  */
+
+/* The members and the action of one chord slot in one layer. Returns 0
+ * when the slot is empty; *binding is the slot's binding, if any. */
+int  xb_chord_get(const core_config *cfg, u32 layer, u32 slot,
+                  u8 members[CORE_CHORD_MEMBERS], core_binding *binding);
+
+/* Write both. members[0] of CORE_SA_NONE clears the slot. */
+void xb_chord_set(core_config *cfg, u32 layer, u32 slot,
+                  const u8 members[CORE_CHORD_MEMBERS],
+                  const core_binding *binding);
+
+/* ======================================================================
  * LAYER CONTROLS
  *
  * A control that changes layer is not an ordinary binding: the same
@@ -133,6 +164,13 @@ void xb_layer_binding_get(const core_config *cfg, u8 action,
 /* One binding as it is written in a profile, e.g.
  * "a -> key space repeat 12 hard 75%". Used by the save path and by the
  * binding dialog to show what it is about to write. */
+/* Just the action half: "key f1 repeat 12". */
+void xb_action_text(const core_binding *b, char *out, u32 out_bytes);
+
+/* The members of a chord source, as "a+b+x". */
+void xb_members_text(const core_config *cfg, u32 layer, u8 source,
+                     char *out, u32 out_bytes);
+
 void xb_binding_text(const core_config *cfg, u32 layer,
                      const core_binding *b, char *out, u32 out_bytes);
 

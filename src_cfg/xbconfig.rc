@@ -210,3 +210,43 @@ BEGIN
     DEFPUSHBUTTON   "OK", IDOK, 141, 137, 50, 14
     PUSHBUTTON      "Cancel", IDCANCEL, 195, 137, 50, 14
 END
+
+IDD_CHORD DIALOGEX 0, 0, 266, 209
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION |
+      WS_SYSMENU
+CAPTION "Chord"
+FONT 8, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_CH_WHICH, 7, 7, 252, 8
+    COMBOBOX        IDC_CH_M1, 7, 19, 80, 160,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    COMBOBOX        IDC_CH_M2, 90, 19, 80, 160,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    COMBOBOX        IDC_CH_M3, 173, 19, 80, 160,
+                    CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "&Action", -1, 7, 42, 40, 8
+    LISTBOX         IDC_CH_ACTION, 7, 53, 110, 100,
+                    LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "&Value", -1, 125, 42, 60, 8
+    EDITTEXT        IDC_CH_CODE, 125, 53, 80, 13, ES_AUTOHSCROLL
+    PUSHBUTTON      "&Capture...", IDC_CH_CAPTURE, 209, 53, 50, 13
+
+    CONTROL         "&Toggle (latch)", IDC_CH_TOGGLE, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 125, 74, 120, 10
+    CONTROL         "&Repeat (autofire)", IDC_CH_REPEAT, "Button",
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 125, 87, 120, 10
+
+    LTEXT           "Rate (Hz)", -1, 125, 104, 40, 8
+    EDITTEXT        IDC_CH_HZ, 168, 102, 37, 13, ES_AUTOHSCROLL | ES_NUMBER
+    LTEXT           "Delay (ms)", -1, 125, 121, 40, 8
+    EDITTEXT        IDC_CH_DELAY, 168, 119, 37, 13,
+                    ES_AUTOHSCROLL | ES_NUMBER
+
+    LTEXT           "", IDC_CH_PREVIEW, 7, 158, 252, 18
+
+    PUSHBUTTON      "C&lear Chord", IDC_CH_CLEAR, 7, 188, 60, 14
+    DEFPUSHBUTTON   "OK", IDOK, 155, 188, 50, 14
+    PUSHBUTTON      "Cancel", IDCANCEL, 209, 188, 50, 14
+END

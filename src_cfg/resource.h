@@ -67,12 +67,28 @@
 
 /* Layer dialog. */
 #define IDD_LAYER               106
+#define IDD_CHORD               107
 #define IDC_LY_WHICH            1400
 #define IDC_LY_BTN1             1401
 #define IDC_LY_BTN2             1402
 #define IDC_LY_PREVIEW          1403
 #define IDC_LY_HINT             1404
 #define IDC_LY_CLEAR            1405
+
+/* Chord dialog. */
+#define IDC_CH_WHICH            1420
+#define IDC_CH_M1               1421
+#define IDC_CH_M2               1422
+#define IDC_CH_M3               1423
+#define IDC_CH_ACTION           1424
+#define IDC_CH_CODE             1425
+#define IDC_CH_CAPTURE          1426
+#define IDC_CH_TOGGLE           1427
+#define IDC_CH_REPEAT           1428
+#define IDC_CH_HZ               1429
+#define IDC_CH_DELAY            1430
+#define IDC_CH_PREVIEW          1431
+#define IDC_CH_CLEAR            1432
 
 /*
  * The pad control buttons are created at RUNTIME from a table keyed by

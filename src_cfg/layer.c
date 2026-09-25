@@ -71,6 +71,13 @@ typedef char xb_choice_order_complete[
 static u8  g_Choice[CORE_SEMIAXIS_COUNT];
 static u32 g_ChoiceCount;
 
+/* The order the dialogs list controls in, shared with chord.c. */
+const u8 *xb_choice_order(u32 *count)
+{
+	*count = (u32)sizeof(XB_CHOICE_ORDER);
+	return XB_CHOICE_ORDER;
+}
+
 static void xb_choices_build(void)
 {
 	u32 i;

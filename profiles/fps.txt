@@ -48,8 +48,10 @@ accel_rate = 0
 accel_max = 512
 accel_decay = 1024
 
+[layer cycle]
+members = start+back
+
 [layer 1]
-start+back -> layer_cycle 1
 ltrigger -> mouse_button 2      # aim
 rtrigger -> mouse_button 1      # fire
 a -> key space                  # jump
@@ -59,5 +61,4 @@ y -> key e                      # use
 lthumb -> key lshift            # sprint
 
 [layer 2]
-start+back -> layer_cycle 1
 rtrigger -> mouse_button 1 repeat 10

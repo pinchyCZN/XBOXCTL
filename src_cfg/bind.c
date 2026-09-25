@@ -34,7 +34,7 @@ static u8          g_Source;
  * by an older build may have put a layer action on a control, and a list
  * that could not represent it would quietly destroy it on OK.
  */
-static int xb_action_is_layer(u8 action)
+int xb_action_is_layer(u8 action)
 {
 	return action == CORE_ACT_LAYER_HOLD ||
 	       action == CORE_ACT_LAYER_SET ||
@@ -494,6 +494,21 @@ static INT_PTR CALLBACK xb_bind_proc(HWND dlg, UINT msg, WPARAM wp,
 	}
 	}
 	return FALSE;
+}
+
+/*
+ * Ask for a key and give back its HID usage. Shared with the chord
+ * dialog, which needs the same thing and should not carry a second
+ * virtual-key table to get it.
+ */
+int xb_capture_key(HWND parent, u16 *usage)
+{
+	if (!DialogBoxParamA(xb_instance(), MAKEINTRESOURCEA(IDD_CAPTURE),
+	                     parent, xb_capture_proc, 0)) {
+		return 0;
+	}
+	*usage = g_Captured;
+	return 1;
 }
 
 int xb_bind_dialog(HWND parent, xb_profile *p, u32 layer, u8 source)

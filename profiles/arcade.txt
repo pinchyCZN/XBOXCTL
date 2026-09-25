@@ -27,12 +27,13 @@ mode = off
 deadzone = 8000
 curve = linear          # linear | quad | cubic | smoothstep | <y1> <y2>
 
+[layer cycle]
+members = start+back
+
 [layer 1]
-start+back -> layer_cycle 1
 a -> key w
 
 [layer 2]
-start+back -> layer_cycle 1
 a -> joy_button 1 repeat 12
 b -> joy_button 2 repeat 12
 x -> joy_button 3 repeat 12

@@ -50,6 +50,15 @@ assert CHORD_SIZE == 4, CHORD_SIZE
 assert STICK_SIZE == 88, STICK_SIZE
 assert LAYOUT_SIZE == 420, LAYOUT_SIZE
 
+# CHORD SLOTS ARE RESERVED, NOT ALLOCATED. The configurator addresses
+# them from buttons, and the profile text names them outright, so
+# [layer 1 chord 1] IS slot 0 and nothing can move between saves.
+CHORD_SLOT_1 = 0
+CHORD_SLOT_2 = 1
+CHORD_SLOT_CYCLE = 6
+CHORD_SLOT_HOLD = 7
+CHORD_BUTTONS = 2
+
 MAX_VALUE = 35000
 SA_NONE = 0xFF
 SA_CHORD_BASE = 64
@@ -302,6 +311,23 @@ def parse_code(action, word):
     return int(word, 0) & 0xFFFF
 
 
+def parse_members(text):
+    """'a+b+x' -> a padded list of source indices."""
+    members = []
+    for part in text.split("+"):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if name not in SOURCES:
+            raise ValueError("unknown control '%s'" % name)
+        members.append(SOURCES[name])
+    if not members:
+        raise ValueError("members names no control")
+    if len(members) > CHORD_MEMBERS:
+        raise ValueError("a chord takes at most %d controls" % CHORD_MEMBERS)
+    return members + [SA_NONE] * (CHORD_MEMBERS - len(members))
+
+
 def parse_binding(text, chords):
     """'a -> key w repeat 12 delay 300'"""
     left, _, right = text.partition("->")
@@ -312,23 +338,23 @@ def parse_binding(text, chords):
 
     b = Binding()
 
+    # A CHORD IS NOT WRITTEN ON A BINDING LINE. It has a section of its
+    # own, which is what gives the two chord buttons a slot they can
+    # count on.
     if "+" in source_name:
-        members = [SOURCES[m.strip()] for m in source_name.split("+")]
-        if len(members) > CHORD_MEMBERS:
-            raise ValueError("a chord takes at most %d members"
-                             % CHORD_MEMBERS)
-        members += [SA_NONE] * (CHORD_MEMBERS - len(members))
-        if members not in chords:
-            free = [i for i, c in enumerate(chords)
-                    if c == [SA_NONE] * CHORD_MEMBERS]
-            if not free:
-                raise ValueError("more than %d chords" % MAX_CHORDS)
-            chords[free[0]] = members
-        b.source = SA_CHORD_BASE + chords.index(members)
-    else:
-        if source_name not in SOURCES:
-            raise ValueError("unknown source '%s'" % source_name)
-        b.source = SOURCES[source_name]
+        raise ValueError("a chord goes in its own section now - put"
+                         " 'members = %s' under [layer N chord 1]"
+                         % source_name)
+    if source_name not in SOURCES:
+        raise ValueError("unknown source '%s'" % source_name)
+    b.source = SOURCES[source_name]
+    return parse_action(words, b)
+
+
+def parse_action(words, b):
+    """The right-hand side, shared with a chord section's 'action ='."""
+    if not words:
+        raise ValueError("no action")
 
     action_name = words[0].lower()
     if action_name not in ACTIONS:
@@ -391,6 +417,10 @@ def parse_profile(text):
     section = None
     stick = None
     layout = None
+    ch_layer = 0
+    ch_slot = 0
+    ch_all = False
+    ch_action = None
 
     for lineno, raw in enumerate(text.splitlines(), 1):
         line = raw.split("#")[0].strip()
@@ -398,20 +428,92 @@ def parse_profile(text):
             continue
         try:
             if line.startswith("[") and line.endswith("]"):
-                parts = line[1:-1].split()
-                section = parts[0].lower()
+                parts = [w.lower() for w in line[1:-1].split()]
+                section = parts[0] if parts else ""
+
+                # [layer cycle] and [layer hold] ARE NOT PER LAYER. A
+                # control that changes layer has to exist in the layer
+                # it lands in or there is no way back, and a section
+                # that cannot be written for one layer alone cannot get
+                # that wrong.
+                if (len(parts) == 2 and parts[0] == "layer" and
+                        parts[1] in ("cycle", "hold")):
+                    ch_all = True
+                    ch_layer = 0
+                    ch_action = (ACTIONS["layer_cycle"]
+                                 if parts[1] == "cycle"
+                                 else ACTIONS["layer_hold"])
+                    ch_slot = (CHORD_SLOT_CYCLE if parts[1] == "cycle"
+                               else CHORD_SLOT_HOLD)
+                    section = "chord"
+                    continue
+
+                # [layer N chord M] - M names the slot outright.
+                if (len(parts) == 4 and parts[0] == "layer" and
+                        parts[2] == "chord"):
+                    ch_layer = int(parts[1]) - 1
+                    if not 0 <= ch_layer < MAX_LAYOUTS:
+                        raise ValueError("layer must be 1..%d" % MAX_LAYOUTS)
+                    m = int(parts[3])
+                    if not 1 <= m <= CHORD_BUTTONS:
+                        raise ValueError("chord must be 1..%d"
+                                         % CHORD_BUTTONS)
+                    ch_slot = m - 1
+                    ch_all = False
+                    ch_action = None
+                    section = "chord"
+                    continue
+
                 if section == "layer":
                     index = int(parts[1]) - 1
                     if not 0 <= index < MAX_LAYOUTS:
                         raise ValueError("layer must be 1..%d" % MAX_LAYOUTS)
                     layout = cfg.layouts[index]
                 elif section == "stick":
-                    stick = cfg.sticks[0 if parts[1].lower() == "left" else 1]
+                    stick = cfg.sticks[0 if parts[1] == "left" else 1]
                 elif section != "global":
                     raise ValueError("unknown section '%s'" % section)
                 continue
 
-            if section == "global":
+            if section == "chord":
+                key, _, value = line.partition("=")
+                key = key.strip().lower()
+                value = value.strip()
+                targets = (range(MAX_LAYOUTS) if ch_all else [ch_layer])
+
+                if key == "members":
+                    members = parse_members(value)
+                    named = [m for m in members if m != SA_NONE]
+                    for li in targets:
+                        lay = cfg.layouts[li]
+                        # ONE CONTROL IS NOT A CHORD: binding it through
+                        # a slot would make the driver wait for a second
+                        # control that does not exist.
+                        if len(named) > 1:
+                            lay.chords[ch_slot] = members
+                        if ch_action is not None:
+                            b = Binding()
+                            b.source = (SA_CHORD_BASE + ch_slot
+                                        if len(named) > 1 else named[0])
+                            b.action = ch_action
+                            b.code = (1 if ch_action == ACTIONS["layer_cycle"]
+                                      else MAX_LAYOUTS - 1)
+                            lay.add(b)
+                elif key == "action":
+                    named = [m for m in cfg.layouts[ch_layer].chords[ch_slot]
+                             if m != SA_NONE]
+                    if len(named) < 2:
+                        raise ValueError("'members' has to come before"
+                                         " 'action'")
+                    src = SA_CHORD_BASE + ch_slot
+                    lay = cfg.layouts[ch_layer]
+                    b = Binding()
+                    b.source = src
+                    lay.add(parse_action(value.split(), b))
+                else:
+                    raise ValueError("a chord section takes 'members'"
+                                     " and 'action'")
+            elif section == "global":
                 # [global] HAS NO SETTINGS. An empty section header still
                 # parses, so an existing profile is not broken by its
                 # presence, but a key in it is an error rather than a

@@ -182,31 +182,21 @@ static int xb_parse_code(xb_profile *p, int line, u8 action,
 }
 
 /*
- * A chord source. Finds the slot these members already occupy in THIS
- * layer, or takes a free one.
+ * The members of one chord, from "a+b+x".
  *
- * THE CHORD TABLE IS PER LAYER, because core_layout carries one and
- * core_chords_evaluate scans the table of the layer that is live. A
- * chord declared only in layer 1 therefore does not exist in layer 2,
- * and the source byte 64+N means "slot N of whichever layer is running".
- *
- * SO A CHORD THAT CHANGES LAYER HAS TO BE DECLARED IN EVERY LAYER IT
- * MUST WORK FROM, its own destination included - otherwise there is no
- * way back. Every shipped profile writes the line twice for that reason.
- * Copying it into the other layers here would be convenient and would
- * also make a chord that is deliberately local to one layer impossible
- * to express.
+ * NO SLOT IS CHOSEN HERE. A slot is named by the section that carries
+ * the members - [layer 1 chord 1] is slot 0 - so there is nothing to
+ * search for and nothing that can move between one save and the next.
  */
-static int xb_parse_chord(xb_profile *p, int line, char *text,
-                          core_layout *lay, u8 *out)
+static int xb_parse_members(xb_profile *p, int line, char *text,
+                            u8 out[CORE_CHORD_MEMBERS])
 {
-	u8    members[CORE_CHORD_MEMBERS];
 	u32   i;
 	u32   n = 0;
 	char *tok = text;
 
 	for (i = 0; i < CORE_CHORD_MEMBERS; i++) {
-		members[i] = CORE_SA_NONE;
+		out[i] = CORE_SA_NONE;
 	}
 
 	while (tok != NULL && *tok != 0) {
@@ -218,83 +208,44 @@ static int xb_parse_chord(xb_profile *p, int line, char *text,
 			*plus = 0;
 		}
 		name = xb_clean(tok);
-		if (n >= CORE_CHORD_MEMBERS) {
-			xb_fail(p, line, "a chord takes at most %d members",
-			        CORE_CHORD_MEMBERS);
-			return 0;
+		if (*name != 0) {
+			if (n >= CORE_CHORD_MEMBERS) {
+				xb_fail(p, line, "a chord takes at most %d controls",
+				        CORE_CHORD_MEMBERS);
+				return 0;
+			}
+			if (!xb_name_to_value(XB_SOURCES, name, &v)) {
+				xb_fail(p, line, "unknown control '%s'", name);
+				return 0;
+			}
+			out[n++] = (u8)v;
 		}
-		if (!xb_name_to_value(XB_SOURCES, name, &v)) {
-			xb_fail(p, line, "unknown source '%s'", name);
-			return 0;
-		}
-		members[n++] = (u8)v;
 		tok = (plus != NULL) ? plus + 1 : NULL;
 	}
 
-	for (i = 0; i < CORE_MAX_CHORDS; i++) {
-		const core_chord *c = &lay->chord[i];
-
-		if (memcmp(c->member, members, CORE_CHORD_MEMBERS) == 0) {
-			*out = (u8)(CORE_SA_CHORD_BASE + i);
-			return 1;
-		}
-	}
-	for (i = 0; i < CORE_MAX_CHORDS; i++) {
-		core_chord *c = &lay->chord[i];
-		u32         k;
-		int         is_free = 1;
-
-		for (k = 0; k < CORE_CHORD_MEMBERS; k++) {
-			if (c->member[k] != CORE_SA_NONE) {
-				is_free = 0;
-			}
-		}
-		if (is_free) {
-			memcpy(c->member, members, CORE_CHORD_MEMBERS);
-			*out = (u8)(CORE_SA_CHORD_BASE + i);
-			return 1;
-		}
-	}
-	xb_fail(p, line, "more than %d chords", CORE_MAX_CHORDS);
-	return 0;
-}
-
-static int xb_parse_binding(xb_profile *p, int line, char *text,
-                            core_layout *lay)
-{
-	char        *words[24];
-	char        *arrow;
-	char        *left;
-	char        *right;
-	int          n;
-	int          i;
-	u32          v;
-	s32          num;
-	core_binding b;
-	u32          slot;
-
-	arrow = strstr(text, "->");
-	if (arrow == NULL) {
-		xb_fail(p, line, "a binding needs '->'");
+	if (n == 0) {
+		xb_fail(p, line, "members names no control");
 		return 0;
 	}
-	*arrow = 0;
-	left   = xb_clean(text);
-	right  = arrow + 2;
+	return 1;
+}
 
-	memset(&b, 0, sizeof(b));
-
-	if (strchr(left, '+') != NULL) {
-		if (!xb_parse_chord(p, line, left, lay, &b.source)) {
-			return 0;
-		}
-	} else {
-		if (!xb_name_to_value(XB_SOURCES, left, &v)) {
-			xb_fail(p, line, "unknown source '%s'", left);
-			return 0;
-		}
-		b.source = (u8)v;
-	}
+/*
+ * The right-hand side of a binding: the action, its value and its
+ * options. b->source is left alone.
+ *
+ * SHARED, BECAUSE A CHORD SECTION'S "action =" IS THE SAME GRAMMAR. Two
+ * readers of one syntax drift, and the drift shows up as an option that
+ * works on a button and not on a chord.
+ */
+static int xb_parse_action(xb_profile *p, int line, char *right,
+                           core_binding *b)
+{
+	char *words[24];
+	int   n;
+	int   i;
+	u32   v;
+	s32   num;
 
 	n = xb_split(right, words, 24);
 	if (n < 1) {
@@ -305,15 +256,15 @@ static int xb_parse_binding(xb_profile *p, int line, char *text,
 		xb_fail(p, line, "unknown action '%s'", words[0]);
 		return 0;
 	}
-	b.action = (u8)v;
+	b->action = (u8)v;
 
 	i = 1;
-	if (b.action != CORE_ACT_NONE) {
+	if (b->action != CORE_ACT_NONE) {
 		if (i >= n) {
 			xb_fail(p, line, "action '%s' needs a value", words[0]);
 			return 0;
 		}
-		if (!xb_parse_code(p, line, b.action, words[i], &b.code)) {
+		if (!xb_parse_code(p, line, b->action, words[i], &b->code)) {
 			return 0;
 		}
 		i++;
@@ -326,11 +277,11 @@ static int xb_parse_binding(xb_profile *p, int line, char *text,
 					xb_fail(p, line, "'repeat' needs a rate in Hz");
 					return 0;
 				}
-				b.flags |= CORE_BF_REPEAT;
-				b.repeat_hz = (u8)num;
+				b->flags |= CORE_BF_REPEAT;
+				b->repeat_hz = (u8)num;
 				i += 2;
 			} else {
-				b.flags |= (u8)v;
+				b->flags |= (u8)v;
 				i++;
 			}
 		} else if (strcmp(words[i], "delay") == 0) {
@@ -338,7 +289,7 @@ static int xb_parse_binding(xb_profile *p, int line, char *text,
 				xb_fail(p, line, "'delay' needs milliseconds");
 				return 0;
 			}
-			b.repeat_delay_ms = (u16)num;
+			b->repeat_delay_ms = (u16)num;
 			i += 2;
 		} else if (strcmp(words[i], "hard") == 0) {
 			/*
@@ -368,7 +319,7 @@ static int xb_parse_binding(xb_profile *p, int line, char *text,
 					xb_fail(p, line, "hard must be 0 to 100 per cent");
 					return 0;
 				}
-				b.hard_at = (u16)((double)CORE_MAX_VALUE * pct / 100.0 +
+				b->hard_at = (u16)((double)CORE_MAX_VALUE * pct / 100.0 +
 				                  0.5);
 			} else {
 				if (!xb_number(arg, &num) || num < 0 ||
@@ -378,7 +329,7 @@ static int xb_parse_binding(xb_profile *p, int line, char *text,
 					        CORE_MAX_VALUE);
 					return 0;
 				}
-				b.hard_at = (u16)num;
+				b->hard_at = (u16)num;
 			}
 			i += 2;
 		} else {
@@ -387,9 +338,52 @@ static int xb_parse_binding(xb_profile *p, int line, char *text,
 		}
 	}
 
-	if (b.hard_at != 0 && !(b.flags & CORE_BF_REPEAT)) {
+	if (b->hard_at != 0 && !(b->flags & CORE_BF_REPEAT)) {
 		xb_fail(p, line, "'hard' needs 'repeat' - it is the pressure the"
 		                 " autofire starts at, not an activation point");
+		return 0;
+	}
+
+	return 1;
+}
+
+static int xb_parse_binding(xb_profile *p, int line, char *text,
+                            core_layout *lay)
+{
+	char        *arrow;
+	char        *left;
+	u32          v;
+	core_binding b;
+	u32          slot;
+
+	arrow = strstr(text, "->");
+	if (arrow == NULL) {
+		xb_fail(p, line, "a binding needs '->'");
+		return 0;
+	}
+	*arrow = 0;
+	left   = xb_clean(text);
+
+	memset(&b, 0, sizeof(b));
+
+	/*
+	 * A CHORD IS NOT WRITTEN ON A BINDING LINE. It has a section of its
+	 * own, which is what gives the two chord buttons a slot they can
+	 * count on. Saying so beats "unknown source 'a+b'".
+	 */
+	if (strchr(left, '+') != NULL) {
+		xb_fail(p, line,
+		        "a chord goes in its own section now - put"
+		        " 'members = %s' under [layer N chord 1]", left);
+		return 0;
+	}
+	if (!xb_name_to_value(XB_SOURCES, left, &v)) {
+		xb_fail(p, line, "unknown source '%s'", left);
+		return 0;
+	}
+	b.source = (u8)v;
+
+	if (!xb_parse_action(p, line, arrow + 2, &b)) {
 		return 0;
 	}
 
@@ -401,6 +395,140 @@ static int xb_parse_binding(xb_profile *p, int line, char *text,
 	}
 	xb_fail(p, line, "more than %d bindings in one layer",
 	        CORE_MAX_BINDINGS);
+	return 0;
+}
+
+/*
+ * A line inside a chord section. slot is where the members go; layers
+ * says how many layers get them - one for a chord, all of them for a
+ * layer control, which is what stops a layer you cannot leave.
+ */
+static int xb_parse_chord_line(xb_profile *p, int line, char *text,
+                               u32 layer, u32 slot, int all_layers,
+                               u8 action)
+{
+	char *eq = strchr(text, '=');
+	char *key;
+	char *value;
+	u32   lay;
+
+	if (eq == NULL) {
+		xb_fail(p, line, "a chord setting needs '='");
+		return 0;
+	}
+	*eq   = 0;
+	key   = xb_clean(text);
+	value = xb_clean(eq + 1);
+
+	if (strcmp(key, "members") == 0) {
+		u8 members[CORE_CHORD_MEMBERS];
+		u32 named = 0;
+		u32 m;
+
+		if (!xb_parse_members(p, line, value, members)) {
+			return 0;
+		}
+		for (m = 0; m < CORE_CHORD_MEMBERS; m++) {
+			if (members[m] != CORE_SA_NONE) {
+				named++;
+			}
+		}
+
+		for (lay = 0; lay < CORE_MAX_LAYOUTS; lay++) {
+			if (!all_layers && lay != layer) {
+				continue;
+			}
+			/*
+			 * ONE CONTROL IS NOT A CHORD. A layer control named by a
+			 * single button binds that button directly; taking a
+			 * chord slot for it would make core_member_down wait for
+			 * a second control that does not exist.
+			 */
+			if (named > 1) {
+				memcpy(p->cfg.layout[lay].chord[slot].member,
+				       members, CORE_CHORD_MEMBERS);
+			}
+			if (action != CORE_ACT_NONE) {
+				u32 i;
+
+				for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+					core_binding *b =
+					    &p->cfg.layout[lay].binding[i];
+
+					if (b->action != CORE_ACT_NONE) {
+						continue;
+					}
+					memset(b, 0, sizeof(*b));
+					b->source = (named > 1)
+					            ? (u8)(CORE_SA_CHORD_BASE + slot)
+					            : members[0];
+					b->action = action;
+					b->code   = (action == CORE_ACT_LAYER_CYCLE)
+					            ? (u16)1
+					            : (u16)(CORE_MAX_LAYOUTS - 1);
+					break;
+				}
+			}
+		}
+		return 1;
+	}
+
+	if (strcmp(key, "action") == 0) {
+		core_binding *b = NULL;
+		u8            source;
+		u32           named = 0;
+		u32           i;
+
+		/*
+		 * MEMBERS FIRST. The action has to be bound to SOMETHING, and
+		 * what that is comes from the members line - the chord slot if
+		 * it names two controls or more, the control itself if one.
+		 * Guessing would silently bind to whatever the slot held last.
+		 */
+		for (i = 0; i < CORE_CHORD_MEMBERS; i++) {
+			if (p->cfg.layout[layer].chord[slot].member[i] !=
+			    CORE_SA_NONE) {
+				named++;
+			}
+		}
+		if (named > 1) {
+			source = (u8)(CORE_SA_CHORD_BASE + slot);
+		} else {
+			xb_fail(p, line,
+			        "'members' has to come before 'action'");
+			return 0;
+		}
+
+		/* Reuse the slot's binding if members already made one. */
+		for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+			core_binding *c = &p->cfg.layout[layer].binding[i];
+
+			if (c->action != CORE_ACT_NONE && c->source == source) {
+				b = c;
+				break;
+			}
+		}
+		if (b == NULL) {
+			for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+				core_binding *c =
+				    &p->cfg.layout[layer].binding[i];
+
+				if (c->action == CORE_ACT_NONE) {
+					b = c;
+					break;
+				}
+			}
+		}
+		if (b == NULL) {
+			xb_fail(p, line, "no room for another binding");
+			return 0;
+		}
+		memset(b, 0, sizeof(*b));
+		b->source = source;
+		return xb_parse_action(p, line, value, b);
+	}
+
+	xb_fail(p, line, "a chord section takes 'members' and 'action'");
 	return 0;
 }
 
@@ -481,9 +609,14 @@ int xb_profile_load(xb_profile *p, const char *path)
 	char         raw[512];
 	char        *s;
 	int          line = 0;
-	int          section = 0;       /* 0 none, 1 layer, 2 stick, 3 global */
+	int          section = 0;   /* 0 none, 1 layer, 2 stick, 3 global,
+	                             * 4 a chord section */
 	core_layout *lay = NULL;
 	core_stick  *st = NULL;
+	u32          ch_layer = 0;
+	u32          ch_slot = 0;
+	int          ch_all = 0;
+	u8           ch_action = CORE_ACT_NONE;
 	u32          i;
 	u32          k;
 
@@ -535,6 +668,55 @@ int xb_profile_load(xb_profile *p, const char *path)
 			}
 			*close = 0;
 			n = xb_split(s + 1, words, 4);
+
+			/*
+			 * [layer cycle] AND [layer hold] ARE NOT PER LAYER, and
+			 * the format says so rather than trusting anyone to write
+			 * the same line under both. A control that changes layer
+			 * has to exist in the layer it lands in or there is no way
+			 * back, and a section that cannot be written for one layer
+			 * alone cannot get that wrong.
+			 */
+			if (n == 2 && strcmp(words[0], "layer") == 0 &&
+			    (strcmp(words[1], "cycle") == 0 ||
+			     strcmp(words[1], "hold") == 0)) {
+				ch_all    = 1;
+				ch_layer  = 0;
+				ch_action = (u8)(strcmp(words[1], "cycle") == 0
+				                 ? CORE_ACT_LAYER_CYCLE
+				                 : CORE_ACT_LAYER_HOLD);
+				ch_slot   = (ch_action == CORE_ACT_LAYER_CYCLE)
+				            ? XB_CHORD_SLOT_CYCLE
+				            : XB_CHORD_SLOT_HOLD;
+				section   = 4;
+				continue;
+			}
+
+			/* [layer N chord M] - M names the slot outright. */
+			if (n == 4 && strcmp(words[0], "layer") == 0 &&
+			    strcmp(words[2], "chord") == 0) {
+				s32 m;
+
+				if (!xb_number(words[1], &num) ||
+				    num < 1 || num > CORE_MAX_LAYOUTS) {
+					xb_fail(p, line, "layer must be 1..%d",
+					        CORE_MAX_LAYOUTS);
+					break;
+				}
+				if (!xb_number(words[3], &m) ||
+				    m < 1 || m > XB_CHORD_BUTTONS) {
+					xb_fail(p, line, "chord must be 1..%d",
+					        XB_CHORD_BUTTONS);
+					break;
+				}
+				ch_layer  = (u32)(num - 1);
+				ch_slot   = (u32)(m - 1);
+				ch_all    = 0;
+				ch_action = CORE_ACT_NONE;
+				section   = 4;
+				continue;
+			}
+
 			if (n >= 1 && strcmp(words[0], "layer") == 0) {
 				if (n < 2 || !xb_number(words[1], &num) ||
 				    num < 1 || num > CORE_MAX_LAYOUTS) {
@@ -566,6 +748,11 @@ int xb_profile_load(xb_profile *p, const char *path)
 			}
 		} else if (section == 2) {
 			if (!xb_parse_stick(p, line, s, st)) {
+				break;
+			}
+		} else if (section == 4) {
+			if (!xb_parse_chord_line(p, line, s, ch_layer, ch_slot,
+			                         ch_all, ch_action)) {
 				break;
 			}
 		} else if (section == 3) {
@@ -660,35 +847,16 @@ int xb_layer_binding_set(core_config *cfg, u8 action, u16 code,
 	}
 
 	if (members[1] != CORE_SA_NONE) {
-		u32 c;
-
 		/*
-		 * THE SAME SLOT INDEX IN EVERY LAYER. Each layer resolves
-		 * 64+N against its own table, so they need not agree - but a
-		 * slot that is free in one layer and taken in another would
-		 * make the binding mean two different chords.
+		 * A RESERVED SLOT, NOT A FREE ONE. The two layer controls own
+		 * slots 6 and 7 in every layer, so the button on the dialog
+		 * has something it can point at. Searching for a free slot
+		 * would let a layer control and a chord swap places between
+		 * one save and the next.
 		 */
-		for (c = 0; c < CORE_MAX_CHORDS; c++) {
-			int free_everywhere = 1;
-
-			for (lay = 0; lay < CORE_MAX_LAYOUTS; lay++) {
-				u32 k;
-
-				for (k = 0; k < CORE_CHORD_MEMBERS; k++) {
-					if (cfg->layout[lay].chord[c].member[k]
-					    != CORE_SA_NONE) {
-						free_everywhere = 0;
-					}
-				}
-			}
-			if (free_everywhere) {
-				chord_slot = (int)c;
-				break;
-			}
-		}
-		if (chord_slot < 0) {
-			return 0;
-		}
+		chord_slot = (action == CORE_ACT_LAYER_CYCLE)
+		             ? XB_CHORD_SLOT_CYCLE
+		             : XB_CHORD_SLOT_HOLD;
 	}
 
 	for (lay = 0; lay < CORE_MAX_LAYOUTS; lay++) {
@@ -782,14 +950,101 @@ void xb_layer_binding_get(const core_config *cfg, u8 action, u8 members[2])
 	}
 }
 
-/* ======================================================================
- * WRITING
- * ====================================================================== */
-
-void xb_binding_text(const core_config *cfg, u32 layer,
-                     const core_binding *b, char *out, u32 out_bytes)
+int xb_chord_get(const core_config *cfg, u32 layer, u32 slot,
+                 u8 members[CORE_CHORD_MEMBERS], core_binding *binding)
 {
-	char        source[80];
+	const core_chord *c;
+	u32               i;
+	int               named = 0;
+
+	memset(members, CORE_SA_NONE, CORE_CHORD_MEMBERS);
+	if (binding != NULL) {
+		memset(binding, 0, sizeof(*binding));
+		binding->source = CORE_SA_NONE;
+		binding->action = CORE_ACT_NONE;
+	}
+	if (layer >= CORE_MAX_LAYOUTS || slot >= CORE_MAX_CHORDS) {
+		return 0;
+	}
+
+	c = &cfg->layout[layer].chord[slot];
+	for (i = 0; i < CORE_CHORD_MEMBERS; i++) {
+		members[i] = c->member[i];
+		if (c->member[i] != CORE_SA_NONE) {
+			named++;
+		}
+	}
+	if (named == 0) {
+		return 0;
+	}
+
+	if (binding != NULL) {
+		for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+			const core_binding *b = &cfg->layout[layer].binding[i];
+
+			if (b->action != CORE_ACT_NONE &&
+			    b->source == (u8)(CORE_SA_CHORD_BASE + slot)) {
+				*binding = *b;
+				break;
+			}
+		}
+	}
+	return 1;
+}
+
+void xb_chord_set(core_config *cfg, u32 layer, u32 slot,
+                  const u8 members[CORE_CHORD_MEMBERS],
+                  const core_binding *binding)
+{
+	core_layout *l;
+	u32          i;
+
+	if (layer >= CORE_MAX_LAYOUTS || slot >= CORE_MAX_CHORDS) {
+		return;
+	}
+	l = &cfg->layout[layer];
+
+	/* Whatever was on this slot goes, members and binding together. */
+	for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+		core_binding *b = &l->binding[i];
+
+		if (b->action != CORE_ACT_NONE &&
+		    b->source == (u8)(CORE_SA_CHORD_BASE + slot)) {
+			memset(b, 0, sizeof(*b));
+			b->source = CORE_SA_NONE;
+			b->action = CORE_ACT_NONE;
+		}
+	}
+	memset(l->chord[slot].member, CORE_SA_NONE, CORE_CHORD_MEMBERS);
+
+	if (members == NULL || members[0] == CORE_SA_NONE) {
+		return;
+	}
+	memcpy(l->chord[slot].member, members, CORE_CHORD_MEMBERS);
+
+	if (binding == NULL || binding->action == CORE_ACT_NONE) {
+		return;
+	}
+	for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+		core_binding *b = &l->binding[i];
+
+		if (b->action == CORE_ACT_NONE) {
+			*b = *binding;
+			b->source = (u8)(CORE_SA_CHORD_BASE + slot);
+			return;
+		}
+	}
+}
+
+/*
+ * Just the action: "key f1 repeat 12".
+ *
+ * SHARED WITH THE CHORD SECTIONS, whose "action =" is the same grammar
+ * the parser reads. One writer and one reader for one syntax, or an
+ * option ends up working on a button and not on a chord.
+ */
+void xb_action_text(const core_binding *b, char *out, u32 out_bytes)
+{
 	const char *aname;
 	char        value[32];
 	char        extra[128];
@@ -800,32 +1055,6 @@ void xb_binding_text(const core_config *cfg, u32 layer,
 		return;
 	}
 
-	if (b->source >= CORE_SA_CHORD_BASE &&
-	    b->source < CORE_SA_CHORD_BASE + CORE_MAX_CHORDS) {
-		/* FROM THIS LAYER'S TABLE. Slot N can name different
-		 * controls in each layer, so layer 0 is not the answer. */
-		const core_chord *c =
-		    &cfg->layout[layer].chord[b->source - CORE_SA_CHORD_BASE];
-
-		source[0] = 0;
-		for (i = 0; i < CORE_CHORD_MEMBERS; i++) {
-			const char *m;
-
-			if (c->member[i] == CORE_SA_NONE) {
-				continue;
-			}
-			m = xb_value_to_name(XB_SOURCES, c->member[i]);
-			if (source[0] != 0) {
-				strcat(source, "+");
-			}
-			strcat(source, m != NULL ? m : "?");
-		}
-	} else {
-		const char *m = xb_value_to_name(XB_SOURCES, b->source);
-
-		snprintf(source, sizeof(source), "%s", m != NULL ? m : "?");
-	}
-
 	aname = xb_value_to_name(XB_ACTIONS, b->action);
 
 	if (b->action == CORE_ACT_KEY) {
@@ -834,7 +1063,8 @@ void xb_binding_text(const core_config *cfg, u32 layer,
 		if (k != NULL) {
 			snprintf(value, sizeof(value), "%s", k);
 		} else {
-			snprintf(value, sizeof(value), "0x%02X", (unsigned)b->code);
+			snprintf(value, sizeof(value), "0x%02X",
+			         (unsigned)b->code);
 		}
 	} else if (b->action == CORE_ACT_LAYER_HOLD ||
 	           b->action == CORE_ACT_LAYER_SET) {
@@ -872,9 +1102,9 @@ void xb_binding_text(const core_config *cfg, u32 layer,
 		char t[32];
 
 		/*
-		 * WRITTEN BACK AS A PERCENTAGE, ROUNDED TO WHOLE UNITS OF THE
-		 * SCALE. The pad's byte is coarser than one per cent, so a
-		 * whole number always reads back to the same byte.
+		 * WRITTEN BACK AS A PERCENTAGE, ROUNDED TO WHOLE UNITS OF
+		 * THE SCALE. The pad's byte is coarser than one per cent,
+		 * so a whole number always reads back to the same byte.
 		 */
 		snprintf(t, sizeof(t), " hard %u%%",
 		         (unsigned)(((u32)b->hard_at * 100u +
@@ -882,8 +1112,57 @@ void xb_binding_text(const core_config *cfg, u32 layer,
 		strcat(extra, t);
 	}
 
-	snprintf(out, out_bytes, "%s -> %s %s%s", source,
+	snprintf(out, out_bytes, "%s %s%s",
 	         aname != NULL ? aname : "?", value, extra);
+}
+
+/* The members of a chord source, as "a+b+x". */
+void xb_members_text(const core_config *cfg, u32 layer, u8 source,
+                     char *out, u32 out_bytes)
+{
+	const core_chord *c;
+	u32               i;
+
+	out[0] = 0;
+	if (source < CORE_SA_CHORD_BASE ||
+	    source >= CORE_SA_CHORD_BASE + CORE_MAX_CHORDS) {
+		const char *m = xb_value_to_name(XB_SOURCES, source);
+
+		snprintf(out, out_bytes, "%s", m != NULL ? m : "?");
+		return;
+	}
+
+	/* FROM THIS LAYER'S TABLE. Slot N can name different controls in
+	 * each layer, so layer 0 is not the answer. */
+	c = &cfg->layout[layer].chord[source - CORE_SA_CHORD_BASE];
+	for (i = 0; i < CORE_CHORD_MEMBERS; i++) {
+		const char *m;
+
+		if (c->member[i] == CORE_SA_NONE) {
+			continue;
+		}
+		m = xb_value_to_name(XB_SOURCES, c->member[i]);
+		if (out[0] != 0) {
+			strcat(out, "+");
+		}
+		strcat(out, m != NULL ? m : "?");
+	}
+}
+
+void xb_binding_text(const core_config *cfg, u32 layer,
+                     const core_binding *b, char *out, u32 out_bytes)
+{
+	char source[80];
+	char action[192];
+
+	out[0] = 0;
+	if (b->action == CORE_ACT_NONE) {
+		return;
+	}
+
+	xb_members_text(cfg, layer, b->source, source, sizeof(source));
+	xb_action_text(b, action, sizeof(action));
+	snprintf(out, out_bytes, "%s -> %s", source, action);
 }
 
 /* The curve as the preset name that produced it, when one did. */
@@ -957,6 +1236,34 @@ int xb_profile_save(const xb_profile *p, const char *path)
 		}
 	}
 
+	/*
+	 * THE LAYER CONTROLS FIRST, AND NOT PER LAYER. They are written
+	 * into every layer by the loader, so writing them once is the only
+	 * form that cannot describe a layer you get into and not out of.
+	 */
+	for (i = 0; i < 2; i++) {
+		u8          act = (u8)(i == 0 ? CORE_ACT_LAYER_CYCLE
+		                              : CORE_ACT_LAYER_HOLD);
+		const char *name = (i == 0) ? "cycle" : "hold";
+		u8          members[2];
+		const char *m0;
+		const char *m1;
+
+		xb_layer_binding_get(&p->cfg, act, members);
+		if (members[0] == CORE_SA_NONE) {
+			continue;
+		}
+		m0 = xb_value_to_name(XB_SOURCES, members[0]);
+		fprintf(f, "\n[layer %s]\n", name);
+		if (members[1] != CORE_SA_NONE) {
+			m1 = xb_value_to_name(XB_SOURCES, members[1]);
+			fprintf(f, "members = %s+%s\n",
+			        m0 != NULL ? m0 : "?", m1 != NULL ? m1 : "?");
+		} else {
+			fprintf(f, "members = %s\n", m0 != NULL ? m0 : "?");
+		}
+	}
+
 	for (lay = 0; lay < CORE_MAX_LAYOUTS; lay++) {
 		fprintf(f, "\n[layer %u]\n", (unsigned)(lay + 1));
 		for (i = 0; i < CORE_MAX_BINDINGS; i++) {
@@ -966,8 +1273,54 @@ int xb_profile_save(const xb_profile *p, const char *path)
 			if (b->action == CORE_ACT_NONE) {
 				continue;
 			}
+			/*
+			 * A CHORD HAS ITS OWN SECTION, and so does a layer
+			 * control. Writing them here too would load them twice -
+			 * once into the slot they name and once into a second
+			 * binding nobody asked for.
+			 */
+			if (b->source >= CORE_SA_CHORD_BASE) {
+				continue;
+			}
+			if (b->action == CORE_ACT_LAYER_CYCLE ||
+			    b->action == CORE_ACT_LAYER_HOLD) {
+				continue;
+			}
 			xb_binding_text(&p->cfg, lay, b, text, sizeof(text));
 			fprintf(f, "%s\n", text);
+		}
+
+		/* The two chord slots this layer exposes. */
+		for (i = 0; i < XB_CHORD_BUTTONS; i++) {
+			u8           members[CORE_CHORD_MEMBERS];
+			core_binding b;
+			char         text[192];
+			char         who[96];
+			u32          m;
+
+			if (!xb_chord_get(&p->cfg, lay, i, members, &b)) {
+				continue;
+			}
+			who[0] = 0;
+			for (m = 0; m < CORE_CHORD_MEMBERS; m++) {
+				const char *s;
+
+				if (members[m] == CORE_SA_NONE) {
+					continue;
+				}
+				s = xb_value_to_name(XB_SOURCES, members[m]);
+				if (who[0] != 0) {
+					strcat(who, "+");
+				}
+				strcat(who, s != NULL ? s : "?");
+			}
+			fprintf(f, "\n[layer %u chord %u]\n",
+			        (unsigned)(lay + 1), (unsigned)(i + 1));
+			fprintf(f, "members = %s\n", who);
+			if (b.action != CORE_ACT_NONE) {
+				xb_action_text(&b, text, sizeof(text));
+				fprintf(f, "action = %s\n", text);
+			}
 		}
 	}
 

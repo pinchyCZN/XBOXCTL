@@ -85,6 +85,7 @@
     <ClCompile Include="bind.c" />
     <ClCompile Include="stick.c" />
     <ClCompile Include="layer.c" />
+    <ClCompile Include="chord.c" />
     <ClCompile Include="main.c" />
   </ItemGroup>
   <ItemGroup>

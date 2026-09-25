@@ -40,13 +40,17 @@ accel_rate = 256        # +1.0x per second held past the threshold
 accel_max = 512         # ceiling of +2.0x
 accel_decay = 1024      # bleeds off quickly below the threshold
 
+[layer cycle]
+members = start+back
+
+[layer hold]
+members = ltrigger
+
 [layer 1]
-start+back -> layer_cycle 1
 
 # HELD LAYER. While the left trigger is down, layer 2 is live; release
 # and it reverts. This binding must exist in every layer it can return
 # from, which is why it is in both.
-ltrigger -> layer_hold 2
 
 # PRESS HARDER TO AUTOFIRE. A light squeeze holds the mouse button down
 # the way it always did; push the trigger past 'hard' and it starts
@@ -73,8 +77,6 @@ dleft -> mouse_pulse 0x00F4 repeat 20    # dx = -12
 dright -> mouse_pulse 0x000C repeat 20   # dx = +12
 
 [layer 2]
-start+back -> layer_cycle 1
-ltrigger -> layer_hold 2
 
 # PASSTHROUGH keeps the default gamepad button as well as sending the
 # key, which is the one case where a binding adds instead of replacing.

@@ -53,7 +53,9 @@ static u32          g_Layer;            /* which layer the pad edits */
  * YNEG. Reading these the other way round puts every stick direction on
  * the wrong thumb movement.
  */
-#define XB_CELL_NONE        0xFB
+#define XB_CELL_NONE        0xF9
+#define XB_CELL_CHORD_1     0xFA
+#define XB_CELL_CHORD_2     0xFB
 #define XB_CELL_CYCLE       0xFC
 #define XB_CELL_HOLD        0xFD
 #define XB_CELL_STICK_L     0xFE
@@ -72,14 +74,17 @@ static const u8 XB_PAD_GRID[XB_PAD_ROWS][XB_PAD_COLS] = {
 	{ CORE_SA_B,          CORE_SA_BLACK,       CORE_SA_RTRIGGER    },
 	{ CORE_SA_X,          CORE_SA_START,       CORE_SA_LTHUMB      },
 	{ CORE_SA_Y,          CORE_SA_BACK,        CORE_SA_RTHUMB      },
-	{ XB_CELL_STICK_L,    XB_CELL_STICK_R,     XB_CELL_NONE        },
-	{ XB_CELL_CYCLE,      XB_CELL_HOLD,        XB_CELL_NONE        }
+	{ XB_CELL_STICK_L,    XB_CELL_STICK_R,     XB_CELL_CHORD_1     },
+	{ XB_CELL_CYCLE,      XB_CELL_HOLD,        XB_CELL_CHORD_2     }
 };
 
 int  xb_bind_dialog(HWND parent, xb_profile *p, u32 layer, u8 source);
 int  xb_stick_dialog(HWND parent, xb_profile *p, u32 which);
 int  xb_layer_dialog(HWND parent, xb_profile *p, u8 action);
 void xb_layer_summary(const core_config *cfg, u8 action,
+                      char *out, u32 out_bytes);
+int  xb_chord_dialog(HWND parent, xb_profile *p, u32 layer, u32 slot);
+void xb_chord_summary(const core_config *cfg, u32 layer, u32 slot,
                       char *out, u32 out_bytes);
 
 /*
@@ -220,6 +225,18 @@ static void xb_pad_refresh(HWND dlg)
 			snprintf(caption, sizeof(caption), "%s Stick : %s...",
 			         which == 0 ? "Left" : "Right",
 			         mode != NULL ? mode : "off");
+		} else if (cell == XB_CELL_CHORD_1 ||
+		           cell == XB_CELL_CHORD_2) {
+			/* A CHORD IS PER LAYER, so this one does follow the
+			 * layer the grid is showing. */
+			u32  slot = (cell == XB_CELL_CHORD_1)
+			            ? XB_CHORD_SLOT_1 : XB_CHORD_SLOT_2;
+			char who[128];
+
+			xb_chord_summary(&g_Profile.cfg, g_Layer, slot,
+			                 who, sizeof(who));
+			snprintf(caption, sizeof(caption), "Chord %u : %s...",
+			         (unsigned)(slot + 1), who);
 		} else if (cell == XB_CELL_CYCLE || cell == XB_CELL_HOLD) {
 			/*
 			 * A LAYER CONTROL IS NOT PER LAYER, so it reads the same
@@ -566,6 +583,15 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 				u32 which = (cell == XB_CELL_STICK_L) ? 0u : 1u;
 
 				if (xb_stick_dialog(dlg, &g_Profile, which)) {
+					xb_profile_write(dlg);
+					xb_pad_refresh(dlg);
+				}
+			} else if (cell == XB_CELL_CHORD_1 ||
+				       cell == XB_CELL_CHORD_2) {
+				u32 slot = (cell == XB_CELL_CHORD_1)
+					       ? XB_CHORD_SLOT_1 : XB_CHORD_SLOT_2;
+
+				if (xb_chord_dialog(dlg, &g_Profile, g_Layer, slot)) {
 					xb_profile_write(dlg);
 					xb_pad_refresh(dlg);
 				}
