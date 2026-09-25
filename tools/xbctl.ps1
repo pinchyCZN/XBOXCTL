@@ -373,11 +373,13 @@ try {
         Write-Host "  DO NOT TOUCH THE PAD or the mouse."
         Write-Host ""
         Write-Host "  payload sent      cursor moved   gp  kb  ms   note"
+        # SIX BYTES, BECAUSE THE MOUSE REPORT IS SIX: buttons, X low,
+        # X high, Y low, Y high, wheel. The axes are 16-bit.
         $cases = @(
-            @(@(0,0,0,0),   'all zero - should move NOTHING'),
-            @(@(0,1,0,0),   'dx=1'),
-            @(@(0,0,1,0),   'dy=1'),
-            @(@(0,0,0,0),   'all zero again')
+            @(@(0,0,0,0,0,0), 'all zero - should move NOTHING'),
+            @(@(0,1,0,0,0,0), 'dx=1'),
+            @(@(0,0,0,1,0,0), 'dy=1'),
+            @(@(0,0,0,0,0,0), 'all zero again')
         )
         foreach ($c in $cases) {
             $null = [NativeCursor]::SetCursorPos(700, 400)
@@ -385,12 +387,11 @@ try {
             $b1 = New-Object NativeCursor+POINT
             $null = [NativeCursor]::GetCursorPos([ref]$b1)
 
-            $buf = New-Object byte[] 8
+            $buf = New-Object byte[] 12
             [Array]::Copy((Index-Bytes $Index), 0, $buf, 0, 4)
-            $buf[4] = [byte]$c[0][0]
-            $buf[5] = [byte]$c[0][1]
-            $buf[6] = [byte]$c[0][2]
-            $buf[7] = [byte]$c[0][3]
+            for ($k = 0; $k -lt 6; $k++) {
+                $buf[4 + $k] = [byte]$c[0][$k]
+            }
             $null = Invoke-Ctl $IOCTL.rawms $buf 16
             Start-Sleep -Milliseconds 400
 
@@ -402,7 +403,7 @@ try {
             $gp = [BitConverter]::ToUInt32($st[0], 13 * 4)
             $kb = [BitConverter]::ToUInt32($st[0], 14 * 4)
             $ms = [BitConverter]::ToUInt32($st[0], 15 * 4)
-            $bytes = '{0:x2} {1:x2} {2:x2} {3:x2}' -f $c[0][0], $c[0][1], $c[0][2], $c[0][3]
+            $bytes = (($c[0] | ForEach-Object { '{0:x2}' -f $_ }) -join ' ')
             $line = "  {0}       {1,5},{2,-5}   {3,3} {4,3} {5,3}   {6}" -f $bytes, ($a1.X - $b1.X), ($a1.Y - $b1.Y), $gp, $kb, $ms, $c[1]
             Write-Host $line
         }

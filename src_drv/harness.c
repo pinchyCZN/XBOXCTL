@@ -1535,6 +1535,52 @@ static int test_control(void)
 	check_eq((long)list.device[0].index, 0, "at index 0");
 	check_eq(list.device[0].started, 1, "and reads as started");
 
+	/* --- RAWMOUSE SENDS EXACTLY THE BYTES IT WAS GIVEN ------------- */
+	{
+		XC_RAWMOUSE_REQUEST rm;
+		XC_REPORT_NODE      node;
+		u32                 k;
+
+		/*
+		 * THE PAYLOAD IS THE WHOLE REPORT, so every byte of it has to
+		 * arrive and nothing beyond it may. A field shorter than a
+		 * report would be read past, and whatever followed it would go
+		 * out as motion - indistinguishable from the engine computing
+		 * nonsense, which is the one thing this command exists to rule
+		 * out.
+		 */
+		memset(&rm, 0, sizeof(rm));
+		rm.index = 0;
+		for (k = 0; k < CORE_MOUSE_PAYLOAD; k++) {
+			rm.payload[k] = (u8)(0xA0 + k);
+		}
+		memcpy(buffer, &rm, sizeof(rm));
+		status = XcControlCommand(IOCTL_XC_RAWMOUSE, buffer, sizeof(rm),
+		                          sizeof(buffer), &written);
+		check_eq(status, STATUS_SUCCESS, "RAWMOUSE is accepted");
+		check(XcDequeueReport(&devext, &node),
+		      "and queues one mouse report");
+		check_eq((long)node.Length, (long)(CORE_MOUSE_PAYLOAD + 1),
+		         "of the report ID plus a full mouse payload");
+		check_eq(node.Data[0], CORE_REPORT_ID_MOUSE, "with the mouse ID");
+		for (k = 0; k < CORE_MOUSE_PAYLOAD; k++) {
+			if (node.Data[1 + k] != (u8)(0xA0 + k)) {
+				break;
+			}
+		}
+		check_eq((long)k, (long)CORE_MOUSE_PAYLOAD,
+		         "and EVERY byte is the one that was sent - none of it"
+		         " read from past the end of the request");
+
+		/* A request one byte short of the structure is refused. */
+		status = XcControlCommand(IOCTL_XC_RAWMOUSE, buffer,
+		                          sizeof(rm) - 1, sizeof(buffer),
+		                          &written);
+		check_eq(status, STATUS_INVALID_PARAMETER,
+		         "and a short RAWMOUSE request is refused rather than"
+		         " padded with whatever was in the buffer");
+	}
+
 	/* --- GET_STATS ------------------------------------------------ */
 	request.index = 0;
 	memcpy(buffer, &request, sizeof(request));

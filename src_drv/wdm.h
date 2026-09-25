@@ -385,7 +385,7 @@ typedef struct _XC_DEVICE_LIST {
 	XC_DEVICE_ENTRY device[XC_MAX_DEVICES];
 } XC_DEVICE_LIST;
 
-typedef struct _XC_STATS {          /* 40 bytes */
+typedef struct _XC_STATS {          /* 80 bytes */
 	u32 index;
 	u32 packets_accepted;
 	u32 packets_rejected;
@@ -444,10 +444,21 @@ typedef struct _XC_NUDGE_REQUEST {
  * core_mouse_move refuses a zero move on purpose, so this is the only
  * way to send one.
  */
-typedef struct _XC_RAWMOUSE_REQUEST {
+typedef struct _XC_RAWMOUSE_REQUEST {   /* 12 bytes */
 	u32 index;
-	u8  payload[4];     /* buttons, X, Y, wheel */
+	u8  payload[CORE_MOUSE_PAYLOAD];    /* EXACTLY a mouse report */
+	u8  reserved[2];
 } XC_RAWMOUSE_REQUEST;
+
+/*
+ * THE PAYLOAD IS THE REPORT, SO IT IS SIZED BY THE REPORT. Sending a
+ * report from a field smaller than one reads past the field and puts
+ * whatever follows it on the wire as motion, which looks exactly like
+ * the driver computing nonsense.
+ */
+typedef char xc_rawmouse_fits[
+    sizeof(((XC_RAWMOUSE_REQUEST *)0)->payload) >= CORE_MOUSE_PAYLOAD
+    ? 1 : -1];
 
 typedef struct _XC_RUMBLE_REQUEST {
 	u32 index;
