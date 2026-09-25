@@ -182,14 +182,23 @@ static int xb_parse_code(xb_profile *p, int line, u8 action,
 }
 
 /*
- * A chord source. Finds the slot these members already occupy, or takes
- * a free one.
+ * A chord source. Finds the slot these members already occupy in THIS
+ * layer, or takes a free one.
  *
- * THE CHORD TABLE IS THE SAME IN EVERY LAYER. A chord declared only in
- * layer 2 could not be seen from layer 1, so there would be no way to
- * reach layer 2 in the first place.
+ * THE CHORD TABLE IS PER LAYER, because core_layout carries one and
+ * core_chords_evaluate scans the table of the layer that is live. A
+ * chord declared only in layer 1 therefore does not exist in layer 2,
+ * and the source byte 64+N means "slot N of whichever layer is running".
+ *
+ * SO A CHORD THAT CHANGES LAYER HAS TO BE DECLARED IN EVERY LAYER IT
+ * MUST WORK FROM, its own destination included - otherwise there is no
+ * way back. Every shipped profile writes the line twice for that reason.
+ * Copying it into the other layers here would be convenient and would
+ * also make a chord that is deliberately local to one layer impossible
+ * to express.
  */
-static int xb_parse_chord(xb_profile *p, int line, char *text, u8 *out)
+static int xb_parse_chord(xb_profile *p, int line, char *text,
+                          core_layout *lay, u8 *out)
 {
 	u8    members[CORE_CHORD_MEMBERS];
 	u32   i;
@@ -223,7 +232,7 @@ static int xb_parse_chord(xb_profile *p, int line, char *text, u8 *out)
 	}
 
 	for (i = 0; i < CORE_MAX_CHORDS; i++) {
-		const core_chord *c = &p->cfg.layout[0].chord[i];
+		const core_chord *c = &lay->chord[i];
 
 		if (memcmp(c->member, members, CORE_CHORD_MEMBERS) == 0) {
 			*out = (u8)(CORE_SA_CHORD_BASE + i);
@@ -231,7 +240,7 @@ static int xb_parse_chord(xb_profile *p, int line, char *text, u8 *out)
 		}
 	}
 	for (i = 0; i < CORE_MAX_CHORDS; i++) {
-		core_chord *c = &p->cfg.layout[0].chord[i];
+		core_chord *c = &lay->chord[i];
 		u32         k;
 		int         is_free = 1;
 
@@ -241,12 +250,7 @@ static int xb_parse_chord(xb_profile *p, int line, char *text, u8 *out)
 			}
 		}
 		if (is_free) {
-			u32 lay;
-
-			for (lay = 0; lay < CORE_MAX_LAYOUTS; lay++) {
-				memcpy(p->cfg.layout[lay].chord[i].member, members,
-				       CORE_CHORD_MEMBERS);
-			}
+			memcpy(c->member, members, CORE_CHORD_MEMBERS);
 			*out = (u8)(CORE_SA_CHORD_BASE + i);
 			return 1;
 		}
@@ -281,7 +285,7 @@ static int xb_parse_binding(xb_profile *p, int line, char *text,
 	memset(&b, 0, sizeof(b));
 
 	if (strchr(left, '+') != NULL) {
-		if (!xb_parse_chord(p, line, left, &b.source)) {
+		if (!xb_parse_chord(p, line, left, lay, &b.source)) {
 			return 0;
 		}
 	} else {
@@ -590,8 +594,8 @@ int xb_profile_load(xb_profile *p, const char *path)
  * WRITING
  * ====================================================================== */
 
-void xb_binding_text(const core_config *cfg, const core_binding *b,
-                     char *out, u32 out_bytes)
+void xb_binding_text(const core_config *cfg, u32 layer,
+                     const core_binding *b, char *out, u32 out_bytes)
 {
 	char        source[80];
 	const char *aname;
@@ -606,8 +610,10 @@ void xb_binding_text(const core_config *cfg, const core_binding *b,
 
 	if (b->source >= CORE_SA_CHORD_BASE &&
 	    b->source < CORE_SA_CHORD_BASE + CORE_MAX_CHORDS) {
+		/* FROM THIS LAYER'S TABLE. Slot N can name different
+		 * controls in each layer, so layer 0 is not the answer. */
 		const core_chord *c =
-		    &cfg->layout[0].chord[b->source - CORE_SA_CHORD_BASE];
+		    &cfg->layout[layer].chord[b->source - CORE_SA_CHORD_BASE];
 
 		source[0] = 0;
 		for (i = 0; i < CORE_CHORD_MEMBERS; i++) {
@@ -768,7 +774,7 @@ int xb_profile_save(const xb_profile *p, const char *path)
 			if (b->action == CORE_ACT_NONE) {
 				continue;
 			}
-			xb_binding_text(&p->cfg, b, text, sizeof(text));
+			xb_binding_text(&p->cfg, lay, b, text, sizeof(text));
 			fprintf(f, "%s\n", text);
 		}
 	}

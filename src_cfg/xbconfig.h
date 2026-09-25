@@ -111,8 +111,8 @@ int xb_profile_save(const xb_profile *p, const char *path);
 /* One binding as it is written in a profile, e.g.
  * "a -> key space repeat 12 hard 75%". Used by the save path and by the
  * binding dialog to show what it is about to write. */
-void xb_binding_text(const core_config *cfg, const core_binding *b,
-                     char *out, u32 out_bytes);
+void xb_binding_text(const core_config *cfg, u32 layer,
+                     const core_binding *b, char *out, u32 out_bytes);
 
 /* ======================================================================
  * THE DRIVER - driver.c

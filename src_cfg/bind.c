@@ -235,7 +235,7 @@ static void xb_update_preview(HWND dlg)
 	int          repeating;
 
 	xb_dialog_to_binding(dlg, &b);
-	xb_binding_text(&g_P->cfg, &b, text, sizeof(text));
+	xb_binding_text(&g_P->cfg, g_Layer, &b, text, sizeof(text));
 	SetDlgItemTextA(dlg, IDC_PREVIEW,
 	                text[0] != 0 ? text : "(nothing - this control keeps"
 	                                      " its normal pad behaviour)");

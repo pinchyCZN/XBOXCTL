@@ -232,8 +232,8 @@ static void xb_pad_refresh(HWND dlg)
 					    b->source != cell) {
 						continue;
 					}
-					xb_binding_text(&g_Profile.cfg, b, text,
-					                sizeof(text));
+					xb_binding_text(&g_Profile.cfg, g_Layer,
+					                b, text, sizeof(text));
 					arrow = strstr(text, "-> ");
 					snprintf(caption, sizeof(caption), "%s : %s",
 					         label,
