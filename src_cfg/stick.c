@@ -268,6 +268,52 @@ static void xb_graph_update(HWND dlg)
 	}
 }
 
+/*
+ * Put every field back to the driver's built-in default.
+ *
+ * READ OUT OF core_config_defaults, NOT LISTED AGAIN HERE. A second copy
+ * of the defaults is a second thing to forget when one of them moves,
+ * and the deadzone has already moved twice.
+ *
+ * THE MODE IS LEFT ALONE. It is the one field that says what the stick
+ * is FOR, and somebody resetting the numbers has not asked to stop using
+ * the stick as a pointer.
+ */
+static void xb_stick_defaults(HWND dlg)
+{
+	static core_config fresh;
+	const core_stick  *d;
+	int                pick;
+
+	core_config_defaults(&fresh);
+	d = &fresh.stick[g_Which];
+
+	xb_set_num(dlg, IDC_ST_DEADZONE, d->deadzone);
+	xb_set_num(dlg, IDC_ST_OUTER,    d->outer);
+	xb_set_num(dlg, IDC_ST_MAXSPEED, d->max_speed);
+	xb_set_num(dlg, IDC_ST_GAINX,    d->gain_x);
+	xb_set_num(dlg, IDC_ST_GAINY,    d->gain_y);
+	xb_set_num(dlg, IDC_ST_SMOOTH,   d->smooth_ms);
+	xb_set_num(dlg, IDC_ST_ATHRESH,  d->accel_threshold);
+	xb_set_num(dlg, IDC_ST_ARATE,    d->accel_rate);
+	xb_set_num(dlg, IDC_ST_AMAX,     d->accel_max);
+	xb_set_num(dlg, IDC_ST_ADECAY,   d->accel_decay);
+
+	CheckDlgButton(dlg, IDC_ST_INVX,
+	               d->invert_x ? BST_CHECKED : BST_UNCHECKED);
+	CheckDlgButton(dlg, IDC_ST_INVY,
+	               d->invert_y ? BST_CHECKED : BST_UNCHECKED);
+
+	/* The default table IS a preset, so the list can show which. */
+	pick = xb_curve_index(d->curve);
+	if (pick >= 0) {
+		SendDlgItemMessageA(dlg, IDC_ST_CURVE, CB_SETCURSEL,
+		                    (WPARAM)pick, 0);
+	}
+
+	xb_stick_units(dlg);            /* redraws the graph as well */
+}
+
 static INT_PTR CALLBACK xb_stick_proc(HWND dlg, UINT msg, WPARAM wp,
                                      LPARAM lp)
 {
@@ -360,6 +406,10 @@ static INT_PTR CALLBACK xb_stick_proc(HWND dlg, UINT msg, WPARAM wp,
 		     LOWORD(wp) == IDC_ST_OUTER ||
 		     LOWORD(wp) == IDC_ST_MAXSPEED)) {
 			xb_graph_update(dlg);
+			return TRUE;
+		}
+		if (LOWORD(wp) == IDC_ST_DEFAULT) {
+			xb_stick_defaults(dlg);
 			return TRUE;
 		}
 		if (LOWORD(wp) == IDOK) {

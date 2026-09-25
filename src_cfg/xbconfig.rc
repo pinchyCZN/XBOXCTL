@@ -180,6 +180,7 @@ BEGIN
 
     LTEXT           "", IDC_ST_HINT, 7, 220, 238, 26
 
+    PUSHBUTTON      "De&fault", IDC_ST_DEFAULT, 7, 252, 50, 14
     DEFPUSHBUTTON   "OK", IDOK, 141, 252, 50, 14
     PUSHBUTTON      "Cancel", IDCANCEL, 195, 252, 50, 14
 END
