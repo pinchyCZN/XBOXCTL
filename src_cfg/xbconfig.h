@@ -108,6 +108,28 @@ void xb_profile_defaults(xb_profile *p);
 int xb_profile_load(xb_profile *p, const char *path);
 int xb_profile_save(const xb_profile *p, const char *path);
 
+/* ======================================================================
+ * LAYER CONTROLS
+ *
+ * A control that changes layer is not an ordinary binding: the same
+ * source has to appear in EVERY layer, because a binding only fires in
+ * the layer it sits in and a chord is only scanned from the layer that
+ * is live. Getting that wrong means a layer you can enter and not leave,
+ * so it is done here rather than left to whoever edits a binding.
+ * ====================================================================== */
+
+/* Free every chord slot no binding names. An orphan is not inert - it
+ * still holds off its members' own bindings. */
+void xb_chords_gc(core_config *cfg);
+
+/* members[1] may be CORE_SA_NONE for a single control; members[0] too,
+ * which clears. Returns 0 if there is no room for it. */
+int  xb_layer_binding_set(core_config *cfg, u8 action, u16 code,
+                          const u8 members[2]);
+void xb_layer_binding_clear(core_config *cfg, u8 action);
+void xb_layer_binding_get(const core_config *cfg, u8 action,
+                          u8 members[2]);
+
 /* One binding as it is written in a profile, e.g.
  * "a -> key space repeat 12 hard 75%". Used by the save path and by the
  * binding dialog to show what it is about to write. */

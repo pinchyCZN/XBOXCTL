@@ -591,6 +591,198 @@ int xb_profile_load(xb_profile *p, const char *path)
 }
 
 /* ======================================================================
+ * CHORD SLOTS
+ * ====================================================================== */
+
+/*
+ * Free every chord slot no binding names any more.
+ *
+ * AN ORPHANED CHORD IS NOT INERT. core_chords_evaluate walks the whole
+ * table, and a slot that still has members sets the HOLD MASK whenever
+ * they are all down - which stops those controls' own bindings firing.
+ * So a chord left behind by a deleted binding silently swallows presses
+ * of the buttons that used to make it up.
+ *
+ * Called after anything removes a binding. Per layer, because the table
+ * is per layer.
+ */
+void xb_layer_binding_clear(core_config *cfg, u8 action);
+
+void xb_chords_gc(core_config *cfg)
+{
+	u32 lay;
+
+	for (lay = 0; lay < CORE_MAX_LAYOUTS; lay++) {
+		core_layout *l = &cfg->layout[lay];
+		u32          c;
+
+		for (c = 0; c < CORE_MAX_CHORDS; c++) {
+			u32 i;
+			int used = 0;
+
+			for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+				if (l->binding[i].action != CORE_ACT_NONE &&
+				    l->binding[i].source ==
+				    (u8)(CORE_SA_CHORD_BASE + c)) {
+					used = 1;
+					break;
+				}
+			}
+			if (!used) {
+				memset(l->chord[c].member, CORE_SA_NONE,
+				       CORE_CHORD_MEMBERS);
+			}
+		}
+	}
+}
+
+/*
+ * Put a binding on the same source into EVERY layer.
+ *
+ * WHICH IS WHAT A LAYER CONTROL NEEDS. A chord or button that changes
+ * layer has to exist in the layer it lands in as well, or there is no
+ * way back: core_chords_evaluate only scans the live layer's table, and
+ * a binding only fires in the layer it sits in.
+ *
+ * members[1] may be CORE_SA_NONE for a single control. Returns 0 if
+ * there is no room, having changed nothing.
+ */
+int xb_layer_binding_set(core_config *cfg, u8 action, u16 code,
+                         const u8 members[2])
+{
+	u32 lay;
+	int chord_slot = -1;
+
+	xb_layer_binding_clear(cfg, action);
+
+	if (members[0] == CORE_SA_NONE) {
+		return 1;               /* cleared, and nothing to add */
+	}
+
+	if (members[1] != CORE_SA_NONE) {
+		u32 c;
+
+		/*
+		 * THE SAME SLOT INDEX IN EVERY LAYER. Each layer resolves
+		 * 64+N against its own table, so they need not agree - but a
+		 * slot that is free in one layer and taken in another would
+		 * make the binding mean two different chords.
+		 */
+		for (c = 0; c < CORE_MAX_CHORDS; c++) {
+			int free_everywhere = 1;
+
+			for (lay = 0; lay < CORE_MAX_LAYOUTS; lay++) {
+				u32 k;
+
+				for (k = 0; k < CORE_CHORD_MEMBERS; k++) {
+					if (cfg->layout[lay].chord[c].member[k]
+					    != CORE_SA_NONE) {
+						free_everywhere = 0;
+					}
+				}
+			}
+			if (free_everywhere) {
+				chord_slot = (int)c;
+				break;
+			}
+		}
+		if (chord_slot < 0) {
+			return 0;
+		}
+	}
+
+	for (lay = 0; lay < CORE_MAX_LAYOUTS; lay++) {
+		core_layout *l = &cfg->layout[lay];
+		u32          i;
+		int          placed = 0;
+
+		if (chord_slot >= 0) {
+			u32 m;
+
+			/* Any member past the second is cleared, so reusing a
+			 * slot cannot leave a third control behind. */
+			for (m = 0; m < CORE_CHORD_MEMBERS; m++) {
+				l->chord[chord_slot].member[m] =
+				    (m < 2) ? members[m] : (u8)CORE_SA_NONE;
+			}
+		}
+
+		for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+			core_binding *b = &l->binding[i];
+
+			if (b->action != CORE_ACT_NONE) {
+				continue;
+			}
+			memset(b, 0, sizeof(*b));
+			b->source = (chord_slot >= 0)
+			            ? (u8)(CORE_SA_CHORD_BASE + chord_slot)
+			            : members[0];
+			b->action = action;
+			b->code   = code;
+			placed = 1;
+			break;
+		}
+		if (!placed) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+/* Take this action out of every layer, and free any chord it leaves. */
+void xb_layer_binding_clear(core_config *cfg, u8 action)
+{
+	u32 lay;
+
+	for (lay = 0; lay < CORE_MAX_LAYOUTS; lay++) {
+		u32 i;
+
+		for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+			core_binding *b = &cfg->layout[lay].binding[i];
+
+			if (b->action == action) {
+				memset(b, 0, sizeof(*b));
+				b->source = CORE_SA_NONE;
+				b->action = CORE_ACT_NONE;
+			}
+		}
+	}
+	xb_chords_gc(cfg);
+}
+
+/*
+ * What drives this action now: members[0] is CORE_SA_NONE when nothing
+ * does, and members[1] is CORE_SA_NONE for a single control.
+ */
+void xb_layer_binding_get(const core_config *cfg, u8 action, u8 members[2])
+{
+	u32 i;
+
+	members[0] = CORE_SA_NONE;
+	members[1] = CORE_SA_NONE;
+
+	for (i = 0; i < CORE_MAX_BINDINGS; i++) {
+		const core_binding *b = &cfg->layout[0].binding[i];
+
+		if (b->action != action) {
+			continue;
+		}
+		if (b->source >= CORE_SA_CHORD_BASE &&
+		    b->source < CORE_SA_CHORD_BASE + CORE_MAX_CHORDS) {
+			const core_chord *c =
+			    &cfg->layout[0].chord[b->source -
+			                          CORE_SA_CHORD_BASE];
+
+			members[0] = c->member[0];
+			members[1] = c->member[1];
+		} else {
+			members[0] = b->source;
+		}
+		return;
+	}
+}
+
+/* ======================================================================
  * WRITING
  * ====================================================================== */
 

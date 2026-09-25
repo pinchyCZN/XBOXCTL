@@ -63,6 +63,15 @@
 #define IDC_ST_ADECAY           1315
 #define IDC_ST_HINT             1316
 
+/* Layer dialog. */
+#define IDD_LAYER               106
+#define IDC_LY_WHICH            1400
+#define IDC_LY_BTN1             1401
+#define IDC_LY_BTN2             1402
+#define IDC_LY_PREVIEW          1403
+#define IDC_LY_HINT             1404
+#define IDC_LY_CLEAR            1405
+
 /*
  * The pad control buttons are created at RUNTIME from a table keyed by
  * the CORE_SA_* constants rather than listed here, so a control cannot

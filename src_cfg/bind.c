@@ -23,6 +23,42 @@ static xb_profile *g_P;
 static u32         g_Layer;
 static u8          g_Source;
 
+/*
+ * THE LAYER ACTIONS ARE NOT OFFERED HERE. A control that changes layer
+ * has to be written into every layer at once or it leaves a layer with
+ * no way out, so the two layer cells on the main dialog own that and
+ * this list has neither. It also spares every control three actions that
+ * most of the flags below do not apply to.
+ *
+ * AN EXISTING ONE IS STILL SHOWN, because a profile written by hand or
+ * by an older build may have put a layer action on a control, and a list
+ * that could not represent it would quietly destroy it on OK.
+ */
+static int xb_action_is_layer(u8 action)
+{
+	return action == CORE_ACT_LAYER_HOLD ||
+	       action == CORE_ACT_LAYER_SET ||
+	       action == CORE_ACT_LAYER_CYCLE;
+}
+
+/*
+ * The action a list row stands for.
+ *
+ * READ FROM THE ROW'S ITEM DATA, not from its index. The list is
+ * filtered, so a row number is no longer an index into XB_ACTIONS.
+ */
+static u8 xb_list_action(HWND dlg)
+{
+	int sel = (int)SendDlgItemMessageA(dlg, IDC_ACTION, LB_GETCURSEL,
+	                                   0, 0);
+
+	if (sel == LB_ERR) {
+		return CORE_ACT_NONE;
+	}
+	return (u8)SendDlgItemMessageA(dlg, IDC_ACTION, LB_GETITEMDATA,
+	                               (WPARAM)sel, 0);
+}
+
 /* ======================================================================
  * CAPTURE
  * ====================================================================== */
@@ -152,17 +188,12 @@ static int xb_find_binding(const xb_profile *p, u32 layer, u8 source)
 static void xb_dialog_to_binding(HWND dlg, core_binding *b)
 {
 	char text[128];
-	int  sel;
 	u32  v;
 
 	memset(b, 0, sizeof(*b));
 	b->source = g_Source;
 
-	sel = (int)SendDlgItemMessageA(dlg, IDC_ACTION, LB_GETCURSEL, 0, 0);
-	if (sel == LB_ERR) {
-		sel = 0;
-	}
-	b->action = (u8)XB_ACTIONS[sel].value;
+	b->action = xb_list_action(dlg);
 	if (b->action == CORE_ACT_NONE) {
 		return;
 	}
@@ -229,7 +260,6 @@ static void xb_update_preview(HWND dlg)
 {
 	core_binding b;
 	char         text[256];
-	int          sel;
 	u8           action;
 	int          is_key;
 	int          repeating;
@@ -240,8 +270,7 @@ static void xb_update_preview(HWND dlg)
 	                text[0] != 0 ? text : "(nothing - this control keeps"
 	                                      " its normal pad behaviour)");
 
-	sel = (int)SendDlgItemMessageA(dlg, IDC_ACTION, LB_GETCURSEL, 0, 0);
-	action = (u8)(sel == LB_ERR ? 0 : XB_ACTIONS[sel].value);
+	action = xb_list_action(dlg);
 	is_key = (action == CORE_ACT_KEY);
 	repeating = (IsDlgButtonChecked(dlg, IDC_REPEAT) == BST_CHECKED);
 
@@ -271,12 +300,23 @@ static INT_PTR CALLBACK xb_bind_proc(HWND dlg, UINT msg, WPARAM wp,
 			     xb_source_label(g_Source), (unsigned)(g_Layer + 1));
 		SetDlgItemTextA(dlg, IDC_CONTROL, title);
 
-		for (i = 0; XB_ACTIONS[i].name != NULL; i++) {
-			SendMessageA(list, LB_ADDSTRING, 0,
-				         (LPARAM)XB_ACTIONS[i].name);
-		}
-
 		slot = xb_find_binding(g_P, g_Layer, g_Source);
+
+		for (i = 0; XB_ACTIONS[i].name != NULL; i++) {
+			u8  act = (u8)XB_ACTIONS[i].value;
+			int at;
+
+			if (xb_action_is_layer(act) &&
+				(slot < 0 ||
+				 g_P->cfg.layout[g_Layer].binding[slot].action
+				 != act)) {
+				continue;
+			}
+			at = (int)SendMessageA(list, LB_ADDSTRING, 0,
+				                   (LPARAM)XB_ACTIONS[i].name);
+			SendMessageA(list, LB_SETITEMDATA, (WPARAM)at,
+				         (LPARAM)act);
+		}
 		if (slot < 0) {
 			SendMessageA(list, LB_SETCURSEL, 0, 0);
 			SetDlgItemTextA(dlg, IDC_HZ, "12");
@@ -285,10 +325,16 @@ static INT_PTR CALLBACK xb_bind_proc(HWND dlg, UINT msg, WPARAM wp,
 				&g_P->cfg.layout[g_Layer].binding[slot];
 			char text[64];
 
-			for (i = 0; XB_ACTIONS[i].name != NULL; i++) {
-				if (XB_ACTIONS[i].value == b->action) {
-					SendMessageA(list, LB_SETCURSEL, (WPARAM)i, 0);
-					break;
+			{
+				int rows = (int)SendMessageA(list, LB_GETCOUNT, 0, 0);
+				int r;
+
+				for (r = 0; r < rows; r++) {
+					if ((u8)SendMessageA(list, LB_GETITEMDATA,
+						                 (WPARAM)r, 0) == b->action) {
+						SendMessageA(list, LB_SETCURSEL, (WPARAM)r, 0);
+						break;
+					}
 				}
 			}
 

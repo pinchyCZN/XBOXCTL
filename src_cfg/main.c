@@ -53,11 +53,13 @@ static u32          g_Layer;            /* which layer the pad edits */
  * YNEG. Reading these the other way round puts every stick direction on
  * the wrong thumb movement.
  */
-#define XB_CELL_NONE        0xFD
+#define XB_CELL_NONE        0xFB
+#define XB_CELL_CYCLE       0xFC
+#define XB_CELL_HOLD        0xFD
 #define XB_CELL_STICK_L     0xFE
 #define XB_CELL_STICK_R     0xFF
 
-#define XB_PAD_ROWS         9
+#define XB_PAD_ROWS         10
 #define XB_PAD_COLS         3
 #define XB_PAD_CELLS        (XB_PAD_ROWS * XB_PAD_COLS)
 
@@ -70,11 +72,15 @@ static const u8 XB_PAD_GRID[XB_PAD_ROWS][XB_PAD_COLS] = {
 	{ CORE_SA_B,          CORE_SA_BLACK,       CORE_SA_RTRIGGER    },
 	{ CORE_SA_X,          CORE_SA_START,       CORE_SA_LTHUMB      },
 	{ CORE_SA_Y,          CORE_SA_BACK,        CORE_SA_RTHUMB      },
-	{ XB_CELL_STICK_L,    XB_CELL_STICK_R,     XB_CELL_NONE        }
+	{ XB_CELL_STICK_L,    XB_CELL_STICK_R,     XB_CELL_NONE        },
+	{ XB_CELL_CYCLE,      XB_CELL_HOLD,        XB_CELL_NONE        }
 };
 
-int xb_bind_dialog(HWND parent, xb_profile *p, u32 layer, u8 source);
-int xb_stick_dialog(HWND parent, xb_profile *p, u32 which);
+int  xb_bind_dialog(HWND parent, xb_profile *p, u32 layer, u8 source);
+int  xb_stick_dialog(HWND parent, xb_profile *p, u32 which);
+int  xb_layer_dialog(HWND parent, xb_profile *p, u8 action);
+void xb_layer_summary(const core_config *cfg, u8 action,
+                      char *out, u32 out_bytes);
 
 /*
  * The module handle, for the dialogs in bind.c.
@@ -214,6 +220,20 @@ static void xb_pad_refresh(HWND dlg)
 			snprintf(caption, sizeof(caption), "%s Stick : %s...",
 			         which == 0 ? "Left" : "Right",
 			         mode != NULL ? mode : "off");
+		} else if (cell == XB_CELL_CYCLE || cell == XB_CELL_HOLD) {
+			/*
+			 * A LAYER CONTROL IS NOT PER LAYER, so it reads the same
+			 * whichever layer the grid is showing - which is the
+			 * point of it living here instead of on a control.
+			 */
+			u8   act = (cell == XB_CELL_CYCLE)
+			           ? (u8)CORE_ACT_LAYER_CYCLE
+			           : (u8)CORE_ACT_LAYER_HOLD;
+			char who[64];
+
+			xb_layer_summary(&g_Profile.cfg, act, who, sizeof(who));
+			snprintf(caption, sizeof(caption), "Layer %s : %s...",
+			         cell == XB_CELL_CYCLE ? "Cycle" : "Hold", who);
 		} else {
 			const char *label = xb_source_label(cell);
 			u32         k;
@@ -541,11 +561,20 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 			if (!g_ProfileLoaded || cell == XB_CELL_NONE) {
 				return TRUE;
 			}
-			/* NO SAVE BUTTON: OK in either dialog is the save. */
+			/* NO SAVE BUTTON: OK in any of them is the save. */
 			if (cell == XB_CELL_STICK_L || cell == XB_CELL_STICK_R) {
 				u32 which = (cell == XB_CELL_STICK_L) ? 0u : 1u;
 
 				if (xb_stick_dialog(dlg, &g_Profile, which)) {
+					xb_profile_write(dlg);
+					xb_pad_refresh(dlg);
+				}
+			} else if (cell == XB_CELL_CYCLE || cell == XB_CELL_HOLD) {
+				u8 act = (cell == XB_CELL_CYCLE)
+					     ? (u8)CORE_ACT_LAYER_CYCLE
+					     : (u8)CORE_ACT_LAYER_HOLD;
+
+				if (xb_layer_dialog(dlg, &g_Profile, act)) {
 					xb_profile_write(dlg);
 					xb_pad_refresh(dlg);
 				}
