@@ -322,7 +322,7 @@ static void xb_pad_create(HWND dlg)
 
 		b = CreateWindowExA(0, "BUTTON", "",
 		                    WS_CHILD | WS_VISIBLE | WS_TABSTOP |
-		                    BS_PUSHBUTTON,
+		                    BS_PUSHBUTTON | BS_LEFT,
 		                    r.left, r.top, r.right - r.left,
 		                    r.bottom - r.top,
 		                    dlg, (HMENU)(INT_PTR)(IDC_PAD_BASE + i),
