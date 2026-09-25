@@ -25,6 +25,9 @@ extern HINSTANCE xb_instance(void);
 static xb_profile *g_SP;
 static u32         g_Which;     /* 0 left, 1 right */
 
+/* Defined below, past the helpers it needs. */
+static void xb_graph_update(HWND dlg);
+
 static void xb_set_num(HWND dlg, int id, u32 value)
 {
 	char text[32];
@@ -99,6 +102,12 @@ static void xb_stick_units(HWND dlg)
 	EnableWindow(GetDlgItem(dlg, IDC_ST_OUTER), live ? TRUE : FALSE);
 	EnableWindow(GetDlgItem(dlg, IDC_ST_INVX), rate ? TRUE : FALSE);
 	EnableWindow(GetDlgItem(dlg, IDC_ST_INVY), rate ? TRUE : FALSE);
+
+	/* HIDDEN, NOT GREYED. An empty black box invites the question
+	 * of what it is failing to show. */
+	ShowWindow(GetDlgItem(dlg, IDC_ST_GRAPH),
+	           rate ? SW_SHOW : SW_HIDE);
+	xb_graph_update(dlg);
 }
 
 /*
@@ -134,12 +143,136 @@ static int xb_curve_index(const u16 curve[CORE_CURVE_POINTS])
 	return -1;
 }
 
+/* ======================================================================
+ * THE CURVE, DRAWN
+ *
+ * WHAT IS PLOTTED IS THE WHOLE RESPONSE, not the Bezier alone:
+ * deflection across, speed up, with the deadzone and the outer clip in
+ * it. That is why it changes when any of those numbers change and not
+ * only when the preset does - the flat run at the left IS the deadzone,
+ * and the corner at the right IS outer.
+ *
+ * SMOOTHING AND ACCELERATION ARE ABSENT because neither is a function of
+ * deflection. One is a filter over time and the other grows with time
+ * held, so there is no honest way to put either on this axis.
+ *
+ * The maths is core_stick_speed's, step for step, so the picture cannot
+ * drift from what the driver will do.
+ * ====================================================================== */
+
+/* The table the dialog is currently describing. */
+static void xb_graph_curve(HWND dlg, const core_stick *st,
+                           u16 out[CORE_CURVE_POINTS])
+{
+	int sel = (int)SendDlgItemMessageA(dlg, IDC_ST_CURVE, CB_GETCURSEL,
+	                                   0, 0);
+
+	if (sel != CB_ERR && sel < (int)xb_curve_count()) {
+		xb_curve_build(XB_CURVES[sel].y1, XB_CURVES[sel].y2, out);
+		return;
+	}
+	/* "(custom)" - the stored table is the only description of it. */
+	memcpy(out, st->curve, sizeof(u16) * CORE_CURVE_POINTS);
+}
+
+static void xb_graph_paint(HWND dlg, const DRAWITEMSTRUCT *di)
+{
+	const core_stick *st = &g_SP->cfg.stick[g_Which];
+	u16      curve[CORE_CURVE_POINTS];
+	HBRUSH   back;
+	HPEN     pen;
+	HPEN     old_pen;
+	RECT     r = di->rcItem;
+	int      w = r.right - r.left;
+	int      h = r.bottom - r.top;
+	s32      deadzone;
+	s32      outer;
+	s32      max_speed;
+	int      px;
+
+	back = CreateSolidBrush(RGB(0, 0, 0));
+	FillRect(di->hDC, &r, back);
+	DeleteObject(back);
+
+	if (w < 4 || h < 4) {
+		return;
+	}
+
+	/*
+	 * READ FROM THE FIELDS, NOT FROM THE CONFIG, so the line follows
+	 * what is being typed rather than what was last saved.
+	 */
+	deadzone  = (s32)xb_get_num(dlg, IDC_ST_DEADZONE, CORE_MAX_VALUE);
+	outer     = (s32)xb_get_num(dlg, IDC_ST_OUTER, CORE_MAX_VALUE);
+	max_speed = (s32)xb_get_num(dlg, IDC_ST_MAXSPEED, 65535);
+	if (outer <= deadzone) {
+		outer = deadzone + 1;
+	}
+	if (max_speed <= 0) {
+		max_speed = 1;
+	}
+
+	xb_graph_curve(dlg, st, curve);
+
+	pen = CreatePen(PS_SOLID, 1, RGB(255, 255, 0));
+	old_pen = (HPEN)SelectObject(di->hDC, pen);
+
+	for (px = 0; px < w; px++) {
+		s32 magnitude = (s32)(((s64)px * CORE_MAX_VALUE) / (w - 1));
+		s32 speed = 0;
+		int y;
+
+		if (magnitude > deadzone) {
+			s32 rc = (magnitude < outer) ? magnitude : outer;
+			s32 u  = (s32)(((s64)(rc - deadzone) * 65535) /
+			               (outer - deadzone));
+			s32 i  = u >> 11;
+			s32 f  = u & 0x7FF;
+			s32 g;
+
+			if (i >= CORE_CURVE_POINTS - 1) {
+				i = CORE_CURVE_POINTS - 2;
+				f = 0x7FF;
+			}
+			g = (s32)curve[i] +
+			    (((s32)curve[i + 1] - (s32)curve[i]) * f >> 11);
+			speed = (s32)(((s64)max_speed * g) >> 16);
+		}
+
+		y = r.bottom - 1 -
+		    (int)(((s64)speed * (h - 1)) / max_speed);
+		if (y < r.top) {
+			y = r.top;
+		}
+		if (y > r.bottom - 1) {
+			y = r.bottom - 1;
+		}
+
+		if (px == 0) {
+			MoveToEx(di->hDC, r.left, y, NULL);
+		} else {
+			LineTo(di->hDC, r.left + px, y);
+		}
+	}
+
+	SelectObject(di->hDC, old_pen);
+	DeleteObject(pen);
+}
+
+static void xb_graph_update(HWND dlg)
+{
+	HWND g = GetDlgItem(dlg, IDC_ST_GRAPH);
+
+	if (g != NULL) {
+		InvalidateRect(g, NULL, TRUE);
+	}
+}
+
 static INT_PTR CALLBACK xb_stick_proc(HWND dlg, UINT msg, WPARAM wp,
                                      LPARAM lp)
 {
 	core_stick *st = &g_SP->cfg.stick[g_Which];
 
-	(void)lp;
 
 	switch (msg) {
 	case WM_INITDIALOG:
@@ -203,9 +336,30 @@ static INT_PTR CALLBACK xb_stick_proc(HWND dlg, UINT msg, WPARAM wp,
 		return TRUE;
 	}
 
+	case WM_DRAWITEM:
+		if (wp == IDC_ST_GRAPH) {
+			xb_graph_paint(dlg, (const DRAWITEMSTRUCT *)lp);
+			return TRUE;
+		}
+		break;
+
 	case WM_COMMAND:
 		if (LOWORD(wp) == IDC_ST_MODE && HIWORD(wp) == CBN_SELCHANGE) {
 			xb_stick_units(dlg);
+			return TRUE;
+		}
+		/* THE LINE FOLLOWS THE TYPING. Every field the shape
+		 * depends on redraws it. */
+		if (LOWORD(wp) == IDC_ST_CURVE &&
+		    HIWORD(wp) == CBN_SELCHANGE) {
+			xb_graph_update(dlg);
+			return TRUE;
+		}
+		if (HIWORD(wp) == EN_CHANGE &&
+		    (LOWORD(wp) == IDC_ST_DEADZONE ||
+		     LOWORD(wp) == IDC_ST_OUTER ||
+		     LOWORD(wp) == IDC_ST_MAXSPEED)) {
+			xb_graph_update(dlg);
 			return TRUE;
 		}
 		if (LOWORD(wp) == IDOK) {
