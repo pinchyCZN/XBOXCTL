@@ -106,6 +106,31 @@ static void xb_paths_init(void)
 	CreateDirectoryA(g_ProfileDir, NULL);
 }
 
+/*
+ * WHICH CONFIGURATION WAS OPEN, BY NAME AND NOT BY POSITION.
+ *
+ * The list is the profiles folder as the filesystem hands it over, so a
+ * new file, a rename or a decision to sort the list differently moves
+ * every entry after it. An index remembered across that reopens whatever
+ * happens to sit in the slot now, which is a silently wrong
+ * configuration rather than an error anybody would notice.
+ *
+ * A name that no longer names a file is not an error either: the file
+ * was renamed or deleted between runs, which is an ordinary thing to do.
+ * xb_list_fill falls back to the standard entry.
+ */
+static void xb_selected_save(const char *name)
+{
+	WritePrivateProfileStringA("profile", "name",
+	                           name != NULL ? name : "", g_IniPath);
+}
+
+static void xb_selected_load(char *name, u32 bytes)
+{
+	GetPrivateProfileStringA("profile", "name", "", name, bytes,
+	                         g_IniPath);
+}
+
 /* ======================================================================
  * THE PROFILE LIST
  * ====================================================================== */
@@ -284,6 +309,7 @@ static void xb_selection_changed(HWND dlg)
 	if (sel == LB_ERR || sel == 0) {
 		g_ProfileLoaded  = 0;
 		g_ProfilePath[0] = 0;
+		xb_selected_save("");
 		xb_profile_defaults(&g_Profile);
 		xb_status(dlg, "The standard configuration - the pad as Windows "
 		               "sees it with nothing remapped. Apply it to undo "
@@ -295,6 +321,13 @@ static void xb_selection_changed(HWND dlg)
 	SendMessageA(list, LB_GETTEXT, (WPARAM)sel, (LPARAM)name);
 	snprintf(g_ProfilePath, sizeof(g_ProfilePath), "%s\\%s.txt",
 	         g_ProfileDir, name);
+
+	/*
+	 * WRITTEN AS SOON AS IT CHANGES, not on the way out. A program that
+	 * only records its state while closing tidily loses it to a crash,
+	 * and this costs one small file write per click.
+	 */
+	xb_selected_save(name);
 
 	if (!xb_profile_load(&g_Profile, g_ProfilePath)) {
 		char msg[512];
@@ -485,7 +518,12 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 		g_Layer = 0;
 
 		xb_pad_create(dlg);
-		xb_list_fill(dlg, NULL);
+		{
+			char last[XB_MAX_NAME];
+
+			xb_selected_load(last, sizeof(last));
+			xb_list_fill(dlg, last[0] != 0 ? last : NULL);
+		}
 		xb_selection_changed(dlg);
 		xb_window_restore(dlg);
 		return TRUE;

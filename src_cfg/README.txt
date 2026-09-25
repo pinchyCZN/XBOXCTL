@@ -47,10 +47,27 @@ Abstract
 3.  Everything Lives Beside The Executable
 
    Profiles are .txt files in a profiles/ folder next to xbconfig.exe,
-   and the window position is in xbconfig.ini next to it as well.
-   Nothing is written to the registry, to AppData or to the working
-   directory, so the program can be copied to a stick and carried to the
-   test machine.
+   and xbconfig.ini sits beside it holding the window position and which
+   configuration was open. Nothing is written to the registry, to AppData
+   or to the working directory, so the program can be copied to a stick
+   and carried to the test machine.
+
+       [window]
+       x, y            where it was
+       [profile]
+       name            which configuration was selected
+
+   THE SELECTION IS REMEMBERED BY NAME, NOT BY POSITION. The list is the
+   profiles folder as the filesystem hands it over, so a new file, a
+   rename or a decision to sort the list differently moves every entry
+   after it; an index remembered across that reopens whatever now sits in
+   the slot, which is a silently wrong configuration rather than an error
+   anybody would notice. A name that no longer names a file falls back to
+   the standard entry, because a file being renamed or deleted between
+   runs is an ordinary thing to do.
+
+   IT IS WRITTEN WHEN IT CHANGES, not on the way out, so a crash does not
+   lose it.
 
    A CONFIGURATION IS NAMED BY ITS FILE. profiles/arcade.txt is the
    configuration called "arcade"; no name is stored inside the file that
@@ -60,6 +77,11 @@ Abstract
    out of the build directory gives it that directory's profiles folder,
    which is a different set of files from the repository's profiles/.
    Copy the executable to where the profiles are meant to live.
+
+   AND A REBUILD EMPTIES THE BUILD DIRECTORY. Profiles kept beside the
+   executable there are deleted by the next build, without warning,
+   because that whole tree is generated. It is the second reason not to
+   work in it.
 
 
 4.  There Is No Save Button
