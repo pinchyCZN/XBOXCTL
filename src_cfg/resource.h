@@ -18,7 +18,6 @@
 #define IDC_STATUS              1004
 #define IDC_PADGROUP            1005
 #define IDC_PROFILEGROUP        1006
-#define IDC_LAYERLABEL          1007
 #define IDC_STICKS              1008
 #define IDC_REFRESH             1009
 #define IDC_TOGGLELAYER         1010

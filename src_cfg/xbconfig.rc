@@ -13,7 +13,7 @@
 
 IDI_APP ICON "xbconfig.ico"
 
-IDD_MAIN DIALOGEX 0, 0, 483, 262
+IDD_MAIN DIALOGEX 0, 0, 483, 255
 STYLE DS_SETFONT | DS_CENTER | WS_MINIMIZEBOX | WS_POPUP | WS_CAPTION |
       WS_SYSMENU | WS_THICKFRAME
 CAPTION "XBOXCTL Configurator"
@@ -22,11 +22,12 @@ BEGIN
     LTEXT           "&Profile", IDC_PROFILEGROUP, 7, 7, 40, 8
     LISTBOX         IDC_PROFILES, 7, 18, 124, 186,
                     LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP
-    PUSHBUTTON      "&Add Config...", IDC_ADD, 7, 208, 60, 14
-    PUSHBUTTON      "A&pply to Pad", IDC_APPLY, 71, 208, 60, 14
+    PUSHBUTTON      "&Add...", IDC_ADD, 7, 208, 38, 14
+    PUSHBUTTON      "A&pply", IDC_APPLY, 50, 208, 38, 14
+    PUSHBUTTON      "&Clear", IDC_RESETPAD, 93, 208, 38, 14
 
-    LTEXT           "&Layer", IDC_LAYERLABEL, 7, 229, 24, 8
-    COMBOBOX        IDC_LAYER, 32, 226, 99, 60,
+    PUSHBUTTON      "&Layer", IDC_TOGGLELAYER, 7, 226, 30, 14
+    COMBOBOX        IDC_LAYER, 41, 226, 90, 60,
                     CBS_DROPDOWNLIST | WS_TABSTOP
 
     GROUPBOX        "Controls", IDC_PADGROUP, 138, 3, 338, 201
