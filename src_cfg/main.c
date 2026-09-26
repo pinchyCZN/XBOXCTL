@@ -900,8 +900,7 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 			if (xb_driver_reset(0, why, sizeof(why))) {
 				xb_status(dlg,
 					"PAD CLEARED - back on the built-in default, nothing"
-					" remapped. The selected profile is untouched; F2"
-					" puts it back.");
+					" remapped. The selected profile is untouched");
 			} else {
 				xb_status(dlg, why);
 			}
