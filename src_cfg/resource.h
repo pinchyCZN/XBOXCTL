@@ -8,6 +8,7 @@
 #define IDD_CAPTURE             102
 #define IDD_NEWNAME             103
 #define IDI_APP                 104
+#define IDA_MAIN                110
 
 /* Main dialog. */
 #define IDC_PROFILES            1000
@@ -19,6 +20,7 @@
 #define IDC_PROFILEGROUP        1006
 #define IDC_LAYERLABEL          1007
 #define IDC_STICKS              1008
+#define IDC_REFRESH             1009
 
 /* Binding dialog. */
 #define IDC_CONTROL             1100

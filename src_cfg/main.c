@@ -545,6 +545,24 @@ static void xb_selection_changed(HWND dlg)
 	xb_pad_refresh(dlg);
 }
 
+/*
+ * Reread the folder, keeping the selection if it still exists.
+ */
+static void xb_refresh(HWND dlg)
+{
+	HWND list = GetDlgItem(dlg, IDC_PROFILES);
+	int  sel  = (int)SendMessageA(list, LB_GETCURSEL, 0, 0);
+	char name[XB_MAX_NAME];
+
+	name[0] = 0;
+	if (sel != LB_ERR && sel != 0) {
+		SendMessageA(list, LB_GETTEXT, (WPARAM)sel, (LPARAM)name);
+	}
+
+	xb_list_fill(dlg, name[0] != 0 ? name : NULL);
+	xb_selection_changed(dlg);
+}
+
 static void xb_profile_write(HWND dlg)
 {
 	if (!g_ProfileLoaded || g_ProfilePath[0] == 0) {
@@ -794,6 +812,10 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 			}
 			return TRUE;
 
+		case IDC_REFRESH:
+			xb_refresh(dlg);
+			return TRUE;
+
 		case IDC_ADD:
 			xb_add_config(dlg);
 			return TRUE;
@@ -804,7 +826,7 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 
 		case IDCANCEL:
 			xb_window_save(dlg);
-			EndDialog(dlg, 0);
+			DestroyWindow(dlg);
 			return TRUE;
 		}
 		break;
@@ -848,7 +870,12 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 
 	case WM_CLOSE:
 		xb_window_save(dlg);
-		EndDialog(dlg, 0);
+		DestroyWindow(dlg);
+		return TRUE;
+
+	/* MODELESS, so nothing else ends the loop. */
+	case WM_DESTROY:
+		PostQuitMessage(0);
 		return TRUE;
 	}
 	return FALSE;
@@ -930,7 +957,33 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE prev, LPSTR cmd, int show)
 
 	xb_paths_init();
 	InitCommonControls();
-	DialogBoxParamA(inst, MAKEINTRESOURCEA(IDD_MAIN), NULL,
-	                xb_main_proc, 0);
+
+	{
+		HWND   dlg;
+		HACCEL acc;
+		MSG    msg;
+
+		dlg = CreateDialogParamA(inst, MAKEINTRESOURCEA(IDD_MAIN), NULL,
+		                         xb_main_proc, 0);
+		if (dlg == NULL) {
+			return 1;
+		}
+
+		ShowWindow(dlg, SW_SHOW);
+
+		acc = LoadAcceleratorsA(inst, MAKEINTRESOURCEA(IDA_MAIN));
+
+		while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+			if (acc != NULL &&
+			    TranslateAcceleratorA(dlg, acc, &msg)) {
+				continue;
+			}
+			if (IsDialogMessageA(dlg, &msg)) {
+				continue;
+			}
+			TranslateMessage(&msg);
+			DispatchMessageA(&msg);
+		}
+	}
 	return 0;
 }
