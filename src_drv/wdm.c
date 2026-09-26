@@ -737,7 +737,7 @@ static NTSTATUS XcPollAllocate(PXC_DEVEXT DevExt)
 			return STATUS_INSUFFICIENT_RESOURCES;
 		}
 		DevExt->Poll[i].Urb = (PURB)ExAllocatePoolWithTag(
-		        NonPagedPool,
+		        XC_POOL_NX,
 		        sizeof(struct _URB_BULK_OR_INTERRUPT_TRANSFER),
 		        XC_POOL_TAG);
 		if (DevExt->Poll[i].Urb == NULL) {
@@ -755,7 +755,7 @@ static NTSTATUS XcPollAllocate(PXC_DEVEXT DevExt)
 	        IoAllocateIrp(DevExt->LowerDeviceObject->StackSize, FALSE);
 	if (DevExt->Rumble.Irp != NULL) {
 		DevExt->Rumble.Urb = (PURB)ExAllocatePoolWithTag(
-		        NonPagedPool,
+		        XC_POOL_NX,
 		        sizeof(struct _URB_BULK_OR_INTERRUPT_TRANSFER),
 		        XC_POOL_TAG);
 	}
@@ -1252,7 +1252,7 @@ void XcResetPipe(PXC_DEVEXT DevExt)
 	}
 
 	urb = (struct _URB_PIPE_REQUEST *)ExAllocatePoolWithTag(
-	        NonPagedPool, sizeof(struct _URB_PIPE_REQUEST),
+	        XC_POOL_NX, sizeof(struct _URB_PIPE_REQUEST),
 	        XC_POOL_TAG);
 	if (urb == NULL) {
 		return;
@@ -1289,7 +1289,7 @@ NTSTATUS XcStartDevice(PDEVICE_OBJECT Fdo, PIRP Irp)
 	(void)Irp;
 
 	urb = (PURB)ExAllocatePoolWithTag(
-	        NonPagedPool, sizeof(struct _URB_CONTROL_DESCRIPTOR_REQUEST),
+	        XC_POOL_NX, sizeof(struct _URB_CONTROL_DESCRIPTOR_REQUEST),
 	        XC_POOL_TAG);
 	if (urb == NULL) {
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -1317,7 +1317,7 @@ NTSTATUS XcStartDevice(PDEVICE_OBJECT Fdo, PIRP Irp)
 	}
 
 	config = (PUSB_CONFIGURATION_DESCRIPTOR)ExAllocatePoolWithTag(
-	        NonPagedPool, probe.wTotalLength, XC_POOL_TAG);
+	        XC_POOL_NX, probe.wTotalLength, XC_POOL_TAG);
 	if (config == NULL) {
 		status = STATUS_INSUFFICIENT_RESOURCES;
 		goto done;

@@ -756,6 +756,112 @@ static void core_fold_default(core_state *cs, u32 suppress)
  * on says whether the binding is asserting; edge says whether it became so
  * in this packet. Held actions use the first, pulse actions the second.
  */
+/* Defined with the report builders, further down. */
+static void core_emit_keyboard(core_state *cs);
+static void core_emit_mouse(core_state *cs);
+
+/*
+ * Add a usage to what this pass wants held.
+ *
+ * MODIFIERS GO IN A BITMASK and everything else in an ordered list, the
+ * same split core_key_event uses, so the commit below can hand the list
+ * straight over without re-sorting it.
+ */
+static void core_key_want(core_state *cs, u8 usage)
+{
+	int i;
+
+	if (usage >= CORE_KEY_MOD_FIRST && usage <= CORE_KEY_MOD_LAST) {
+		cs->kb_want_mods |=
+		    (u8)(1u << (usage - CORE_KEY_MOD_FIRST));
+		return;
+	}
+	if (usage < CORE_KEY_FIRST || usage > CORE_KEY_LAST) {
+		return;
+	}
+	for (i = 0; i < (int)cs->kb_want_count; i++) {
+		if (cs->kb_want[i] == usage) {
+			return;                 /* two bindings, one key */
+		}
+	}
+	if (cs->kb_want_count < CORE_KEY_TRACK_MAX) {
+		cs->kb_want[cs->kb_want_count++] = usage;
+	}
+}
+
+/*
+ * Make the reported state match what the pass asked for, in one report.
+ *
+ * PRESS ORDER IS PRESERVED FOR KEYS THAT STAY HELD. The six slots the
+ * host sees are the six OLDEST keys down, so a key that was already held
+ * keeps its place and only new ones are appended. Rebuilding the list in
+ * binding order instead would reshuffle which six are visible every time
+ * anything else changed.
+ */
+static void core_keys_commit(core_state *cs)
+{
+	int i;
+	int k;
+	int changed = 0;
+
+	/* Gone: anything held that nothing asked for. */
+	i = 0;
+	while (i < (int)cs->kb.count) {
+		int wanted = 0;
+
+		for (k = 0; k < (int)cs->kb_want_count; k++) {
+			if (cs->kb_want[k] == cs->kb.keys[i]) {
+				wanted = 1;
+				break;
+			}
+		}
+		if (wanted) {
+			i++;
+			continue;
+		}
+		for (k = i; k < (int)cs->kb.count - 1; k++) {
+			cs->kb.keys[k] = cs->kb.keys[k + 1];
+		}
+		cs->kb.count--;
+		changed = 1;
+	}
+
+	/* New: anything asked for that is not held yet. */
+	for (k = 0; k < (int)cs->kb_want_count; k++) {
+		int held = 0;
+
+		for (i = 0; i < (int)cs->kb.count; i++) {
+			if (cs->kb.keys[i] == cs->kb_want[k]) {
+				held = 1;
+				break;
+			}
+		}
+		if (held || cs->kb.count >= CORE_KEY_TRACK_MAX) {
+			continue;
+		}
+		cs->kb.keys[cs->kb.count++] = cs->kb_want[k];
+		changed = 1;
+	}
+
+	if (cs->kb.modifiers != cs->kb_want_mods) {
+		cs->kb.modifiers = cs->kb_want_mods;
+		changed = 1;
+	}
+
+	if (changed) {
+		core_emit_keyboard(cs);
+	}
+}
+
+static void core_mouse_buttons_commit(core_state *cs)
+{
+	if (cs->ms.buttons == cs->ms_want_buttons) {
+		return;
+	}
+	cs->ms.buttons = cs->ms_want_buttons;
+	core_emit_mouse(cs);
+}
+
 static void core_apply_action(core_state *cs, const core_binding *b,
                               s32 value, int on, int edge)
 {
@@ -764,11 +870,18 @@ static void core_apply_action(core_state *cs, const core_binding *b,
 
 	switch (b->action) {
 	case CORE_ACT_KEY:
-		core_key_event(cs, (u8)b->code, on);
+		/* WANTED, NOT APPLIED. A binding that is not asserting says
+		 * nothing rather than releasing what another one holds. */
+		if (on) {
+			core_key_want(cs, (u8)b->code);
+		}
 		break;
 
 	case CORE_ACT_MOUSE_BUTTON:
-		core_mouse_button(cs, (u8)b->code, on);
+		if (on && b->code >= 1 && b->code <= CORE_MOUSE_BUTTONS) {
+			cs->ms_want_buttons |=
+			    (u8)(1u << (b->code - 1));
+		}
 		break;
 
 	case CORE_ACT_JOY_BUTTON:
@@ -1315,6 +1428,9 @@ static void core_evaluate(core_state *cs, u64 now_100ns)
 	}
 
 	core_zero(&cs->gp, (u32)sizeof(cs->gp));
+	cs->kb_want_count   = 0;
+	cs->kb_want_mods    = 0;
+	cs->ms_want_buttons = 0;
 
 	core_fold_default(cs, cs->cfg.suppress[layer] | cs->hold_mask |
 	                      cs->cfg.stick_claim);
@@ -1328,6 +1444,10 @@ static void core_evaluate(core_state *cs, u64 now_100ns)
 		}
 		core_apply_binding(cs, b, &cs->bind[layer][i], now_100ns);
 	}
+
+	/* One report each, however many bindings had an opinion. */
+	core_keys_commit(cs);
+	core_mouse_buttons_commit(cs);
 }
 
 static void core_build_gamepad(core_state *cs, u8 *payload)

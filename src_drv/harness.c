@@ -1292,6 +1292,68 @@ static int test_bindings(void)
 	bind_press(&cs, packet, 0, 0, t += 4000);
 	check_eq(cs.kb.count, 0, "and only zero releases it");
 
+	/* --- TWO CONTROLS, ONE KEY, AND ONLY ONE OF THEM DOWN --------- */
+	{
+		u32 k;
+		int kbreports = 0;
+		int n;
+
+		/*
+		 * A PERFECTLY ORDINARY PROFILE: two buttons that both mean the
+		 * same key, the way two controls might both mean jump. Applying
+		 * each binding as the walk reached it made the RELEASED one take
+		 * the key back off the HELD one, once per pass - which arrives at
+		 * the host as that key repeating at the tick rate for as long as
+		 * the button is down.
+		 */
+		core_init(&cs, recording_sink, NULL);
+		core_config_defaults(&cfg);
+		cfg.layout[0].binding[1].source = CORE_SA_A;
+		cfg.layout[0].binding[1].action = CORE_ACT_KEY;
+		cfg.layout[0].binding[1].code   = 0x05;     /* b */
+		cfg.layout[0].binding[2].source = CORE_SA_BLACK;
+		cfg.layout[0].binding[2].action = CORE_ACT_KEY;
+		cfg.layout[0].binding[2].code   = 0x05;     /* b as well */
+		bind_install(&cs, &cfg);
+
+		make_packet(packet);
+		bind_press(&cs, packet, 0, 0, t += 4000);
+		sink_reset();
+
+		/* Hold A alone, and let the tick run on. */
+		packet[CORE_RAW_ANALOG_BASE + 0] = 255;
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		for (n = 0; n < 100; n++) {
+			t += CORE_TICK_MS * CORE_100NS_PER_MS;
+			core_tick(&cs, t);
+		}
+
+		for (k = 0; k < g_SinkCount; k++) {
+			if (g_Sink[k].id == CORE_REPORT_ID_KEYBOARD) {
+				kbreports++;
+			}
+		}
+		check_eq(kbreports, 1,
+		         "TWO BINDINGS ON ONE KEY SEND ONE REPORT, not a stream."
+		         " The binding that is not asserting has to say nothing,"
+		         " not release what the other one holds");
+		check_eq(cs.kb.count, 1, "and the key is held exactly once");
+		check_eq(cs.kb.keys[0], 0x05, "and it is b");
+
+		/* Letting go still lets go. */
+		sink_reset();
+		packet[CORE_RAW_ANALOG_BASE + 0] = 0;
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		check_eq(cs.kb.count, 0, "releasing the one that was down frees it");
+
+		/* And the OTHER control drives the same key on its own. */
+		packet[CORE_RAW_ANALOG_BASE + 4] = 255;     /* black */
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		check_eq(cs.kb.count, 1, "and the other control holds it too");
+		packet[CORE_RAW_ANALOG_BASE + 4] = 0;
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+	}
+
 	/* --- WHICH SEMIAXIS EACH PHYSICAL PUSH LANDS IN --------------- */
 	{
 		/*

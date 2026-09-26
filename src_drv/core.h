@@ -665,6 +665,22 @@ typedef struct _core_state {
 	u8              gp_last[CORE_GAMEPAD_PAYLOAD];
 	int             gp_last_valid;
 
+	/*
+	 * WHAT THIS PASS WANTS HELD, before anything is emitted.
+	 *
+	 * THE KEYBOARD AND THE MOUSE BUTTONS ARE ACCUMULATORS FOR THE SAME
+	 * REASON THE GAMEPAD IS. Two bindings may name one key - two buttons
+	 * that both mean jump - and applying each binding as it is walked
+	 * makes the released one take the key back off the held one, once per
+	 * pass, which arrives at the host as a key repeating at the tick
+	 * rate. Every binding contributes here, and the difference is
+	 * reconciled once at the end.
+	 */
+	u8              kb_want[CORE_KEY_TRACK_MAX];
+	u8              kb_want_count;
+	u8              kb_want_mods;
+	u8              ms_want_buttons;
+
 	/* --- counters, read by the harness --- */
 	u32             packets_accepted;
 	u32             packets_rejected;

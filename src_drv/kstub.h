@@ -198,7 +198,13 @@ void KeFlushQueuedDpcs(void);
 
 /* ---- memory ------------------------------------------------------- */
 
-typedef enum _POOL_TYPE { NonPagedPool = 0, PagedPool = 1 } POOL_TYPE;
+typedef enum _POOL_TYPE {
+	NonPagedPool = 0,
+	PagedPool = 1,
+	/* Matches the real one, so wdm.c's pool type compiles both
+	 * ways. Nothing here allocates from a pool at all. */
+	NonPagedPoolNx = 512
+} POOL_TYPE;
 
 PVOID ExAllocatePoolWithTag(POOL_TYPE Type, ULONG Bytes, ULONG Tag);
 void  ExFreePoolWithTag(PVOID P, ULONG Tag);

@@ -76,6 +76,23 @@
  * off, to a work item that retries at PASSIVE_LEVEL and gives up.
  */
 #define XC_POLL_RETRY_MAX       3
+/*
+ * THE POOL EVERYTHING IS ALLOCATED FROM, AND WHY IT IS SPELLED OUT.
+ *
+ * NonPagedPool IS EXECUTABLE. Windows 8 added a non-executable
+ * non-paged pool for everything that does not need to run - which is
+ * everything this driver allocates, all of it URBs and a descriptor
+ * buffer. Driver Verifier's code integrity check faults the executable
+ * one on sight, and under HVCI the allocation can fail outright.
+ *
+ * THE 7.1 DDK HAS NO NAME FOR IT. Its POOL_TYPE stops at
+ * NonPagedPoolSession, so the value is given here rather than relying on
+ * a header that does not carry it. 512 is the documented constant, and
+ * naming it ourselves also builds against a modern WDK where the enum
+ * does have it.
+ */
+#define XC_POOL_NX              ((POOL_TYPE)512)
+
 #define XC_POLL_RETRY_MS        50
 
 typedef struct _XC_POLL_SLOT {
