@@ -31,18 +31,26 @@ Anything that trades this away is the wrong answer, however much simpler.
 
 ## src_drv/orig is reference, not a base
 
-XBCD is the 2005 GPL Xbox pad driver. We are **not** modifying it and **not**
-porting it. It is here for one purpose: it documents the 20-byte packet the pad
-emits, and that is a fact about hardware.
+XBCD is the 2005 Xbox pad driver by Helder Acevedo, under the GNU GPL version
+2 or later. We are **not** modifying it and **not** porting it. It is here for
+one purpose: it documents the 20-byte packet the pad emits, and that is a fact
+about hardware.
+
+**It is a local reference and is not in the repository.** `src_drv/orig/`
+carries a `.gitignore` excluding everything in it but itself, so a clone gets
+the folder and its explanation and none of the source. Never commit it, and do
+not assume it is present.
 
 - **Never modify, move, rename or rebuild anything under `src_drv/orig/`.**
 - **Do not paste XBCD code into the replacement.** Data layouts, register
   values, packet offsets and protocol constants are facts and may be used
   freely. Its *expression* - functions, structures, control flow, comments -
   may not.
-- XBCD is GPLv2. Copying its code makes this project GPLv2. Keeping to facts
-  keeps the licence question open. This is a project constraint to be decided
-  deliberately, not something to drift into.
+- **XBOXCTL is GPLv3** - see `COPYING`. That does not relax this rule, and
+  licence compatibility is not what the rule is about: XBCD's own terms permit
+  version 3. Copying its expression would make XBOXCTL a derivative work of
+  XBCD, carrying Acevedo's copyright and his attribution and notice terms into
+  our tree. Keeping to facts is what keeps the code ours to license.
 
 ## The core seam
 
