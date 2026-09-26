@@ -23,6 +23,7 @@
 #define IDC_REFRESH             1009
 #define IDC_TOGGLELAYER         1010
 #define IDC_RESETPAD            1011
+#define IDC_KEYHELP             1012
 
 /* Binding dialog. */
 #define IDC_CONTROL             1100

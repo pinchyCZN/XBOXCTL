@@ -255,9 +255,9 @@ END
 
 IDA_MAIN ACCELERATORS
 BEGIN
-    VK_F1,          IDC_TOGGLELAYER, VIRTKEY
-    VK_F2,          IDC_APPLY,      VIRTKEY
-    VK_F3,          IDC_RESETPAD,   VIRTKEY
-    VK_F4,          IDC_RESETPAD,   VIRTKEY
-    VK_F5,          IDC_REFRESH,    VIRTKEY
+    VK_F1,          IDC_KEYHELP,        VIRTKEY
+    VK_F2,          IDC_TOGGLELAYER, VIRTKEY
+    VK_F3,          IDC_APPLY,       VIRTKEY
+    VK_F4,          IDC_RESETPAD,    VIRTKEY
+    VK_F5,          IDC_REFRESH,     VIRTKEY
 END

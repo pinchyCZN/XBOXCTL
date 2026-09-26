@@ -868,6 +868,18 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 			}
 			return TRUE;
 
+		case IDC_KEYHELP:
+			MessageBoxA(dlg,
+				"F1    This list\n"
+				"\n"
+				"F2    Switch layer\n"
+				"F3    Push the configuration to the pad\n"
+				"F4    Clear the pad - back to the driver's own default,\n"
+				"         nothing remapped. The profile is left alone.\n"
+				"F5    Reread the profiles folder\n",
+				"Keys", MB_OK | MB_ICONINFORMATION);
+			return TRUE;
+
 		case IDC_TOGGLELAYER:
 		{
 			int sel = (int)SendDlgItemMessageA(dlg, IDC_LAYER,
