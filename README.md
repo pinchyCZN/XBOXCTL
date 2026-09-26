@@ -41,10 +41,10 @@ The one thing taken from XBCD is a fact about hardware: the layout of the
 20-byte packet the pad emits, and how to decode it. **No XBCD code is
 present in this repository** - see [Licence](#licence).
 
-**The Adaptoid** was a PlayStation-to-USB adapter whose driver did
-genuinely sophisticated remapping, including analog-stick-to-mouse. Its
-architecture is the model here: own the device, speak its protocol,
-manufacture a composite HID descriptor, push reports.
+**The Adaptoid** was an N64-to-USB adapter whose driver did genuinely
+sophisticated remapping, including analog-stick-to-mouse. Its architecture is
+the model here: own the device, speak its protocol, manufacture a composite
+HID descriptor, push reports.
 
 **Minus the Adaptoid's bytecode scripting engine.** That is the deliberate
 divergence. The Adaptoid compiled user scripts to bytecode and ran a VM in
