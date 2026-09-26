@@ -736,6 +736,26 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 		SendMessageA(layer, CB_SETCURSEL, 0, 0);
 		g_Layer = 0;
 
+		{
+			HICON big = (HICON)LoadImageA(g_Instance,
+				    MAKEINTRESOURCEA(IDI_APP), IMAGE_ICON,
+				    GetSystemMetrics(SM_CXICON),
+				    GetSystemMetrics(SM_CYICON), 0);
+			HICON small = (HICON)LoadImageA(g_Instance,
+				    MAKEINTRESOURCEA(IDI_APP), IMAGE_ICON,
+				    GetSystemMetrics(SM_CXSMICON),
+				    GetSystemMetrics(SM_CYSMICON), 0);
+
+			if (big != NULL) {
+				SendMessageA(dlg, WM_SETICON, ICON_BIG,
+					         (LPARAM)big);
+			}
+			if (small != NULL) {
+				SendMessageA(dlg, WM_SETICON, ICON_SMALL,
+					         (LPARAM)small);
+			}
+		}
+
 		xb_pad_create(dlg);
 		xb_resize_init(dlg);
 		{
