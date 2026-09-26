@@ -299,9 +299,9 @@ static void xb_pad_create(HWND dlg)
 {
 	const int X0   = 145;
 	const int Y0   = 16;
-	const int W    = 84;
+	const int W    = 105;
 	const int H    = 15;
-	const int DX   = 88;
+	const int DX   = 109;
 	const int DY   = 17;
 	HFONT     font = (HFONT)SendMessageA(dlg, WM_GETFONT, 0, 0);
 	u32       i;

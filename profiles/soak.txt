@@ -1,0 +1,167 @@
+# XBOXCTL soak profile - every binding action and every flag, in one file.
+#
+#   python tools\mkconfig.py profiles\soak.txt -o soak.bin
+#   B:\xboxctl\xbctl.ps1 set -Path soak.bin
+#
+# OPEN NOTEPAD AND WATCH IT. Every key here is a letter or a digit, so
+# nothing opens a menu, steals focus or needs a screenshot to verify.
+# Layer 1 is LETTERS, layer 2 is DIGITS where it can be - so which layer
+# is live is obvious from one keypress.
+#
+# START+BACK cycles the layer. LEFT TRIGGER holds layer 2 while pulled.
+#
+# CHORDS ARE ADJACENT FACE BUTTONS so they can be mashed with one thumb:
+#   A+B  is chord 1,  X+Y  is chord 2.
+#
+# WHAT IS WORTH WATCHING FOR
+#
+#   B and BLACK are both bound to the key b. Two bindings on one usage
+#   used to make the released one take the key off the held one every
+#   tick, which arrived as b repeating at 125 Hz. Hold B: one b.
+#
+#   A and B keep their own bindings while also being chord 1. Press A
+#   alone for "a", B alone for "b", both together for "z" - and neither
+#   a nor b while the chord is down.
+#
+#   RIGHT STICK UP types 1. If it types 2 the up/down naming is inverted
+#   again.
+#
+#   LEFT STICK aims the pointer AND drives gamepad buttons 1-4 from its
+#   four directions. Both happen at once, on purpose.
+#
+#   RIGHT TRIGGER in layer 1 types t once on a light pull and autofires
+#   past about 70 per cent of its travel.
+
+# The LEFT stick aims. Sticks are global - there is no per-layer mode -
+# so it aims in both layers.
+[stick left]
+mode = mouse
+deadzone = 4000
+outer = 33000
+max_speed = 2800
+curve = quad
+gain_x = 128
+gain_y = 54
+invert_x = 0
+invert_y = 0
+smooth_ms = 8
+
+# The RIGHT stick is off, so its four directions are clean key sources
+# with nothing else happening on them.
+[stick right]
+mode = off
+deadzone = 6000
+outer = 33000
+
+[layer cycle]
+members = start+back
+
+[layer hold]
+members = ltrigger
+
+# ======================================================================
+# LAYER 1 - letters, and the number row on the right stick
+# ======================================================================
+[layer 1]
+a -> key a
+b -> key b
+x -> key x
+y -> key y
+
+# THE SAME USAGE AS B, on purpose. Hold either and you get one b.
+black -> key b
+
+# TOGGLE latches. Press once and button 6 stays lit in joy.cpl, press
+# again and it goes out. On a joy button rather than a key, because a
+# latched key would sit on Windows auto-repeat and never stop.
+white -> joy_button 6 toggle
+
+# PRESS HARDER TO AUTOFIRE. A light pull is one t; past 70 per cent it
+# runs at 8 a second, and easing off goes back to one held t.
+rtrigger -> key t repeat 8 hard 70%
+
+# DELAY THEN REPEAT, the way a held keyboard key behaves.
+lthumb -> key l repeat 4 delay 400
+rthumb -> mouse_button 1
+
+dup -> key q
+ddown -> key e
+dleft -> key r
+dright -> key u
+
+# Both are chord members for the layer cycle and keep their own keys.
+start -> key s
+back -> key k
+
+# The stick that is aiming ALSO drives these, which is what makes the
+# two paths independent rather than exclusive.
+lstick_up -> joy_button 1
+lstick_down -> joy_button 2
+lstick_left -> joy_button 3
+lstick_right -> joy_button 4
+
+# UP HAD BETTER TYPE 1. The decode negates Y, so "up" is the negative
+# semiaxis; naming it the other way round put every stick direction on
+# the wrong thumb movement once already.
+rstick_up -> key 1
+rstick_down -> key 2
+rstick_left -> key 3
+rstick_right -> key 4
+
+[layer 1 chord 1]
+members = a+b
+action = key z
+
+[layer 1 chord 2]
+members = x+y
+action = key 5 repeat 6
+
+# ======================================================================
+# LAYER 2 - digits, and the actions that are not keys at all
+# ======================================================================
+[layer 2]
+a -> key 6
+b -> key 7
+x -> key 8
+y -> key 9
+black -> key 0
+
+white -> joy_button 7 toggle
+
+# ANALOG passes the trigger's pressure to the axis instead of
+# thresholding it. Watch Z in joy.cpl follow the pull.
+rtrigger -> joy_axis 4 analog
+
+lthumb -> joy_pov 0
+rthumb -> mouse_wheel 1
+
+# A D-PAD THAT NUDGES THE CURSOR. dx in the low byte, dy in the high,
+# both signed, twenty a second while held.
+dup -> mouse_pulse 0xF400 repeat 20
+ddown -> mouse_pulse 0x0C00 repeat 20
+dleft -> mouse_pulse 0x00F4 repeat 20
+dright -> mouse_pulse 0x000C repeat 20
+
+# PASSTHROUGH keeps the pad's own button as well as sending the key, so
+# Start lights button 5 in joy.cpl AND types g.
+start -> key g passthrough
+back -> key h
+
+# Typing while aiming, which is the case worth being sure about.
+lstick_up -> key c
+lstick_down -> key d
+lstick_left -> key f
+lstick_right -> key j
+
+rstick_up -> mouse_wheel -1
+rstick_down -> joy_button 8
+rstick_left -> joy_button 9
+rstick_right -> joy_button 10
+
+[layer 2 chord 1]
+members = a+b
+action = key i
+
+[layer 2 chord 2]
+members = x+y
+action = key o

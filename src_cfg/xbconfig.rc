@@ -11,7 +11,7 @@
 #include <windows.h>
 #include "resource.h"
 
-IDD_MAIN DIALOGEX 0, 0, 420, 262
+IDD_MAIN DIALOGEX 0, 0, 483, 262
 STYLE DS_SETFONT | DS_CENTER | WS_MINIMIZEBOX | WS_POPUP | WS_CAPTION |
       WS_SYSMENU
 CAPTION "XBOXCTL Configurator"
@@ -27,10 +27,10 @@ BEGIN
     COMBOBOX        IDC_LAYER, 32, 226, 99, 60,
                     CBS_DROPDOWNLIST | WS_TABSTOP
 
-    GROUPBOX        "Controls", IDC_PADGROUP, 138, 3, 275, 201
+    GROUPBOX        "Controls", IDC_PADGROUP, 138, 3, 338, 201
 
-    LTEXT           "", IDC_STATUS, 138, 230, 275, 18
-    DEFPUSHBUTTON   "Close", IDCANCEL, 363, 208, 50, 14
+    LTEXT           "", IDC_STATUS, 138, 230, 338, 18
+    DEFPUSHBUTTON   "Close", IDCANCEL, 426, 208, 50, 14
 END
 
 IDD_BIND DIALOGEX 0, 0, 266, 214
