@@ -25,6 +25,9 @@ extern HINSTANCE xb_instance(void);
 static xb_profile *g_SP;
 static u32         g_Which;     /* 0 left, 1 right */
 
+static core_config g_StickBefore;
+static int         g_StickPushed;
+
 /* Defined below, past the helpers it needs. */
 static void xb_graph_update(HWND dlg);
 
@@ -314,6 +317,54 @@ static void xb_stick_defaults(HWND dlg)
 	xb_stick_units(dlg);            /* redraws the graph as well */
 }
 
+/*
+ * The dialog's fields as a stick record.
+ *
+ * SHARED BY OK AND TEST, because they have to agree exactly. Reading the
+ * controls twice in two places is how Test ends up trying something
+ * subtly different from what OK would save.
+ */
+static void xb_stick_read(HWND dlg, core_stick *out)
+{
+	int sel;
+
+	sel = (int)SendDlgItemMessageA(dlg, IDC_ST_MODE, CB_GETCURSEL, 0, 0);
+	if (sel != CB_ERR) {
+		out->mode = (u8)XB_STICK_MODES[sel].value;
+	}
+
+	out->deadzone  = (u16)xb_get_num(dlg, IDC_ST_DEADZONE,
+	                                 CORE_MAX_VALUE);
+	out->outer     = (u16)xb_get_num(dlg, IDC_ST_OUTER, CORE_MAX_VALUE);
+	out->max_speed = (u16)xb_get_num(dlg, IDC_ST_MAXSPEED, 65535);
+	out->gain_x    = (u8)xb_get_num(dlg, IDC_ST_GAINX, 255);
+	out->gain_y    = (u8)xb_get_num(dlg, IDC_ST_GAINY, 255);
+	out->smooth_ms = (u8)xb_get_num(dlg, IDC_ST_SMOOTH, 255);
+	out->accel_threshold = (u16)xb_get_num(dlg, IDC_ST_ATHRESH, 65535);
+	out->accel_rate      = (u16)xb_get_num(dlg, IDC_ST_ARATE, 65535);
+	out->accel_max       = (u16)xb_get_num(dlg, IDC_ST_AMAX, 65535);
+	out->accel_decay     = (u16)xb_get_num(dlg, IDC_ST_ADECAY, 65535);
+	out->invert_x = (u8)(IsDlgButtonChecked(dlg, IDC_ST_INVX)
+	                     == BST_CHECKED ? 1 : 0);
+	out->invert_y = (u8)(IsDlgButtonChecked(dlg, IDC_ST_INVY)
+	                     == BST_CHECKED ? 1 : 0);
+
+	/*
+	 * OUTER ABOVE DEADZONE, or the rescale divides by zero. The driver
+	 * repairs this; repairing it here means the profile on disk says what
+	 * the pad will actually do.
+	 */
+	if (out->outer <= out->deadzone) {
+		out->outer = (u16)(out->deadzone + 1);
+	}
+
+	sel = (int)SendDlgItemMessageA(dlg, IDC_ST_CURVE, CB_GETCURSEL, 0, 0);
+	if (sel != CB_ERR && sel < (int)xb_curve_count()) {
+		xb_curve_build(XB_CURVES[sel].y1, XB_CURVES[sel].y2, out->curve);
+	}
+	/* "(custom)" leaves the table alone - see WM_INITDIALOG. */
+}
+
 static INT_PTR CALLBACK xb_stick_proc(HWND dlg, UINT msg, WPARAM wp,
                                      LPARAM lp)
 {
@@ -379,6 +430,9 @@ static INT_PTR CALLBACK xb_stick_proc(HWND dlg, UINT msg, WPARAM wp,
 			           st->invert_y ? BST_CHECKED : BST_UNCHECKED);
 
 		xb_stick_units(dlg);
+
+		g_StickBefore  = g_SP->cfg;
+		g_StickPushed  = 0;
 		return TRUE;
 	}
 
@@ -408,6 +462,23 @@ static INT_PTR CALLBACK xb_stick_proc(HWND dlg, UINT msg, WPARAM wp,
 			xb_graph_update(dlg);
 			return TRUE;
 		}
+		if (LOWORD(wp) == IDC_ST_TEST) {
+			static core_config trial;
+			char               why[512];
+
+			trial = g_SP->cfg;
+			xb_stick_read(dlg, &trial.stick[g_Which]);
+
+			if (xb_driver_push(&trial, 0, why, sizeof(why))) {
+				g_StickPushed = 1;
+				SetDlgItemTextA(dlg, IDC_ST_HINT,
+				    "On the pad now, and saved nowhere. Cancel puts"
+				    " the pad back to what it had.");
+			} else {
+				SetDlgItemTextA(dlg, IDC_ST_HINT, why);
+			}
+			return TRUE;
+		}
 		if (LOWORD(wp) == IDC_ST_OFF) {
 			u32 i;
 			for (i = 0; XB_STICK_MODES[i].name != NULL; i++) {
@@ -425,53 +496,35 @@ static INT_PTR CALLBACK xb_stick_proc(HWND dlg, UINT msg, WPARAM wp,
 			return TRUE;
 		}
 		if (LOWORD(wp) == IDOK) {
-			int sel;
-
-			sel = (int)SendDlgItemMessageA(dlg, IDC_ST_MODE,
-			                               CB_GETCURSEL, 0, 0);
-			if (sel != CB_ERR) {
-				st->mode = (u8)XB_STICK_MODES[sel].value;
-			}
-
-			st->deadzone  = (u16)xb_get_num(dlg, IDC_ST_DEADZONE,
-			                                CORE_MAX_VALUE);
-			st->outer     = (u16)xb_get_num(dlg, IDC_ST_OUTER,
-			                                CORE_MAX_VALUE);
-			st->max_speed = (u16)xb_get_num(dlg, IDC_ST_MAXSPEED,
-			                                65535);
-			st->gain_x    = (u8)xb_get_num(dlg, IDC_ST_GAINX, 255);
-			st->gain_y    = (u8)xb_get_num(dlg, IDC_ST_GAINY, 255);
-			st->smooth_ms = (u8)xb_get_num(dlg, IDC_ST_SMOOTH, 255);
-			st->accel_threshold =
-			    (u16)xb_get_num(dlg, IDC_ST_ATHRESH, 65535);
-			st->accel_rate  = (u16)xb_get_num(dlg, IDC_ST_ARATE, 65535);
-			st->accel_max   = (u16)xb_get_num(dlg, IDC_ST_AMAX, 65535);
-			st->accel_decay = (u16)xb_get_num(dlg, IDC_ST_ADECAY, 65535);
-			st->invert_x = (u8)(IsDlgButtonChecked(dlg, IDC_ST_INVX)
-			                    == BST_CHECKED ? 1 : 0);
-			st->invert_y = (u8)(IsDlgButtonChecked(dlg, IDC_ST_INVY)
-			                    == BST_CHECKED ? 1 : 0);
+			xb_stick_read(dlg, st);
 
 			/*
-			 * OUTER ABOVE DEADZONE, or the rescale divides by zero.
-			 * The driver repairs this; repairing it here means the
-			 * profile on disk says what the pad will actually do.
+			 * ONLY IF TEST ALREADY WORKED. The pad is holding a trial
+			 * and has to be brought in line with what was accepted -
+			 * but a dialog that cannot be closed with OK because no pad
+			 * is plugged in would be worse than the mismatch. Having
+			 * pushed once, a failure now is worth stopping for.
 			 */
-			if (st->outer <= st->deadzone) {
-				st->outer = (u16)(st->deadzone + 1);
-			}
+			if (g_StickPushed) {
+				char why[512];
 
-			sel = (int)SendDlgItemMessageA(dlg, IDC_ST_CURVE,
-			                               CB_GETCURSEL, 0, 0);
-			if (sel != CB_ERR && sel < (int)xb_curve_count()) {
-				xb_curve_build(XB_CURVES[sel].y1, XB_CURVES[sel].y2,
-				               st->curve);
+				if (!xb_driver_push(&g_SP->cfg, 0, why,
+				                    sizeof(why))) {
+					SetDlgItemTextA(dlg, IDC_ST_HINT, why);
+					return TRUE;
+				}
 			}
 
 			EndDialog(dlg, 1);
 			return TRUE;
 		}
 		if (LOWORD(wp) == IDCANCEL) {
+			if (g_StickPushed) {
+				char why[512];
+
+				(void)xb_driver_push(&g_StickBefore, 0, why,
+				                     sizeof(why));
+			}
 			EndDialog(dlg, 0);
 			return TRUE;
 		}
