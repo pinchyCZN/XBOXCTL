@@ -1550,6 +1550,57 @@ static int test_bindings(void)
 	check_eq(cs.kb.count, 1,
 	         "and the refusal did not disturb what was held");
 
+	/* --- AND PUTS THE PAD BACK ON LAYER 1 -------------------------- */
+	{
+		static core_config lcfg;
+		u8  lblob[4096];
+		u32 llen;
+
+		/*
+		 * THE LIVE LAYER IS NOT PART OF THE BLOB, so an install has
+		 * nothing to restore it from and no business keeping it: the
+		 * incoming table's layer 2 may mean something entirely
+		 * different from the outgoing one's.
+		 */
+		core_init(&cs, recording_sink, NULL);
+		core_config_defaults(&lcfg);
+		core_config_suppress(&lcfg);
+		llen = core_config_save(&lcfg, lblob, (u32)sizeof(lblob));
+		core_set_config(&cs, lblob, llen, NULL);
+
+		/* Start+Back is the default map's layer cycle. */
+		make_packet(packet);
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		packet[CORE_RAW_DIGITAL] = CORE_DIG_START | CORE_DIG_BACK;
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		packet[CORE_RAW_DIGITAL] = 0;
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		check_eq(cs.layout, 1, "the chord moved the pad to layer 2");
+
+		/* Pushing a configuration starts again from the top. */
+		core_set_config(&cs, lblob, llen, NULL);
+		check_eq(cs.layout, 0,
+		         "INSTALLING A CONFIGURATION LANDS ON LAYER 1, whatever"
+		         " was live before - the layer is not in the blob, so"
+		         " keeping it carries a number over from a map that is"
+		         " gone");
+		check_eq(cs.layer_base, 0, "and the latched base with it");
+		check_eq(cs.layer_pending_valid, 0,
+		         "and no change the old map asked for is still queued,"
+		         " which would move off layer 1 a packet later");
+
+		/* The same for the built-in default, which F3 and F4 send. */
+		packet[CORE_RAW_DIGITAL] = CORE_DIG_START | CORE_DIG_BACK;
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		packet[CORE_RAW_DIGITAL] = 0;
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		core_on_packet(&cs, packet, CORE_RAW_PACKET_BYTES, t += 4000);
+		check_eq(cs.layout, 1, "back on layer 2");
+		core_set_config_default(&cs);
+		check_eq(cs.layout, 0, "and RESET_CONFIG lands on layer 1 too");
+	}
+
 	return 0;
 }
 

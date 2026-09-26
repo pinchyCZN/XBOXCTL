@@ -56,7 +56,7 @@
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <!-- C only. No C++, no precompiled headers. -->
+      <TreatSpecificWarningsAsErrors>4013</TreatSpecificWarningsAsErrors>
       <CompileAs>CompileAsC</CompileAs>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PreprocessorDefinitions>_CRT_SECURE_NO_WARNINGS;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>

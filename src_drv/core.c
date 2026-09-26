@@ -2419,14 +2419,10 @@ static void core_config_installed(core_state *cs)
 	 */
 	core_release_all(cs);
 
-	/*
-	 * A LAYER THAT NO LONGER EXISTS WOULD INDEX PAST THE ARRAY. The
-	 * incoming configuration may carry fewer layouts than the one being
-	 * replaced, and the live layer is not part of the blob.
-	 */
-	if (cs->layout >= cs->cfg.layout_count) {
-		cs->layout = 0;
-	}
+	cs->layout              = 0;
+	cs->layer_base          = 0;
+	cs->layer_pending       = 0;
+	cs->layer_pending_valid = 0;
 
 	/* The next packet must look like the first one, or an unchanged
 	 * payload under a new map would be suppressed as "not news". */

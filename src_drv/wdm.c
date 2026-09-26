@@ -81,6 +81,22 @@ static int XcReportCoalesces(u8 report_id)
 	return (report_id == CORE_REPORT_ID_GAMEPAD);
 }
 
+/*
+ * How much room a pending read offers.
+ *
+ * HIDCLASS CREATES ONE CHILD DEVICE PER TOP-LEVEL COLLECTION AND SIZES
+ * EACH CHILD'S READS TO THAT COLLECTION'S LARGEST REPORT. The mouse
+ * child asks for five bytes, the keyboard for eight, the gamepad for
+ * thirty-seven. They all arrive here as IOCTL_HID_READ_REPORT on one
+ * device and nothing in the IRP says which child sent it.
+ */
+static ULONG XcReadCapacity(PIRP Irp)
+{
+	PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
+
+	return stack->Parameters.DeviceIoControl.OutputBufferLength;
+}
+
 static void XcCompleteRead(PIRP Irp, const UCHAR *Data, UCHAR Length)
 {
 	/*
@@ -116,27 +132,6 @@ static void XcCompleteRead(PIRP Irp, const UCHAR *Data, UCHAR Length)
 	Irp->IoStatus.Status = STATUS_SUCCESS;
 	Irp->IoStatus.Information = Length;
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
-}
-
-/*
- * Pull the oldest waiting read off the list, or NULL. The caller must not
- * hold QueueLock: the cancel spin lock is acquired here and the two must
- * always be taken in this order.
- */
-/*
- * How much room a pending read offers.
- *
- * HIDCLASS CREATES ONE CHILD DEVICE PER TOP-LEVEL COLLECTION AND SIZES
- * EACH CHILD'S READS TO THAT COLLECTION'S LARGEST REPORT. The mouse
- * child asks for five bytes, the keyboard for eight, the gamepad for
- * thirty-seven. They all arrive here as IOCTL_HID_READ_REPORT on one
- * device and nothing in the IRP says which child sent it.
- */
-static ULONG XcReadCapacity(PIRP Irp)
-{
-	PIO_STACK_LOCATION stack = IoGetCurrentIrpStackLocation(Irp);
-
-	return stack->Parameters.DeviceIoControl.OutputBufferLength;
 }
 
 /*

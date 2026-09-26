@@ -43,7 +43,7 @@
 
   <ItemDefinitionGroup>
     <ClCompile>
-      <!-- C only. No C++, no precompiled headers, no stdafx. -->
+      <TreatSpecificWarningsAsErrors>4013</TreatSpecificWarningsAsErrors>
       <CompileAs>CompileAsC</CompileAs>
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
