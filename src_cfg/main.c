@@ -715,10 +715,7 @@ static void xb_add_config(HWND dlg)
 		return;
 	}
 
-	/* A NEW CONFIGURATION STARTS AS THE STANDARD ONE, so a pad that has
-	 * just had one applied behaves exactly as it did before anything
-	 * was bound. */
-	xb_profile_defaults(&fresh);
+	xb_profile_empty(&fresh);
 	snprintf(path, sizeof(path), "%s\\%s.txt", g_ProfileDir, g_NewName);
 	if (!xb_profile_save(&fresh, path)) {
 		xb_status(dlg, "Could not create the file.");

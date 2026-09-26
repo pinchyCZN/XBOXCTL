@@ -62,6 +62,34 @@ void xb_profile_defaults(xb_profile *p)
 	core_config_suppress(&p->cfg);
 }
 
+/*
+ * NOTHING BOUND AT ALL: the stick records at their defaults, both modes off,
+ * and every binding and chord slot empty in every layer.
+ */
+void xb_profile_empty(xb_profile *p)
+{
+	u32 i;
+	u32 k;
+
+	memset(p, 0, sizeof(*p));
+	core_config_defaults(&p->cfg);
+
+	for (i = 0; i < CORE_MAX_LAYOUTS; i++) {
+		for (k = 0; k < CORE_MAX_BINDINGS; k++) {
+			core_binding *b = &p->cfg.layout[i].binding[k];
+
+			memset(b, 0, sizeof(*b));
+			b->source = CORE_SA_NONE;
+			b->action = CORE_ACT_NONE;
+		}
+		for (k = 0; k < CORE_MAX_CHORDS; k++) {
+			memset(p->cfg.layout[i].chord[k].member, CORE_SA_NONE,
+			       CORE_CHORD_MEMBERS);
+		}
+	}
+	core_config_suppress(&p->cfg);
+}
+
 /* ======================================================================
  * PARSING
  * ====================================================================== */
@@ -634,31 +662,8 @@ int xb_profile_load(xb_profile *p, const char *path)
 	u32          ch_slot = 0;
 	int          ch_all = 0;
 	u8           ch_action = CORE_ACT_NONE;
-	u32          i;
-	u32          k;
 
-	memset(p, 0, sizeof(*p));
-	core_config_defaults(&p->cfg);
-
-	/*
-	 * START FROM AN EMPTY LAYOUT. A profile describes the whole
-	 * configuration rather than a patch to the built-in one, and the
-	 * default carries bindings of its own that would otherwise survive
-	 * into a profile that never mentioned them.
-	 */
-	for (i = 0; i < CORE_MAX_LAYOUTS; i++) {
-		for (k = 0; k < CORE_MAX_BINDINGS; k++) {
-			core_binding *b = &p->cfg.layout[i].binding[k];
-
-			memset(b, 0, sizeof(*b));
-			b->source = CORE_SA_NONE;
-			b->action = CORE_ACT_NONE;
-		}
-		for (k = 0; k < CORE_MAX_CHORDS; k++) {
-			memset(p->cfg.layout[i].chord[k].member, CORE_SA_NONE,
-			       CORE_CHORD_MEMBERS);
-		}
-	}
+	xb_profile_empty(p);
 
 	f = fopen(path, "rb");
 	if (f == NULL) {

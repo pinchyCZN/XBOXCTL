@@ -102,6 +102,7 @@ typedef struct _xb_profile {
 
 /* Start from the built-in default - a stock pad with nothing remapped. */
 void xb_profile_defaults(xb_profile *p);
+void xb_profile_empty(xb_profile *p);
 
 /* Read and write the .txt form. Both return 1 on success; on a failed
  * read p->error and p->error_line say why. */
