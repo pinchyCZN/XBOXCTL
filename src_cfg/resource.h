@@ -64,6 +64,7 @@
 #define IDC_ST_HINT             1316
 #define IDC_ST_GRAPH            1317
 #define IDC_ST_DEFAULT          1318
+#define IDC_ST_OFF              1319
 
 /* Layer dialog. */
 #define IDD_LAYER               106

@@ -408,6 +408,18 @@ static INT_PTR CALLBACK xb_stick_proc(HWND dlg, UINT msg, WPARAM wp,
 			xb_graph_update(dlg);
 			return TRUE;
 		}
+		if (LOWORD(wp) == IDC_ST_OFF) {
+			u32 i;
+			for (i = 0; XB_STICK_MODES[i].name != NULL; i++) {
+				if (XB_STICK_MODES[i].value == CORE_STICK_OFF) {
+					SendDlgItemMessageA(dlg, IDC_ST_MODE,
+					                    CB_SETCURSEL, (WPARAM)i, 0);
+					break;
+				}
+			}
+			xb_stick_units(dlg);
+			return TRUE;
+		}
 		if (LOWORD(wp) == IDC_ST_DEFAULT) {
 			xb_stick_defaults(dlg);
 			return TRUE;
