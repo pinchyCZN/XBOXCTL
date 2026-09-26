@@ -829,6 +829,20 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 			return TRUE;
 		}
 
+		case IDC_RESETPAD:
+		{
+			char why[512];
+			if (xb_driver_reset(0, why, sizeof(why))) {
+				xb_status(dlg,
+					"PAD CLEARED - back on the built-in default, nothing"
+					" remapped. The selected profile is untouched; F2"
+					" puts it back.");
+			} else {
+				xb_status(dlg, why);
+			}
+			return TRUE;
+		}
+
 		case IDC_REFRESH:
 			xb_refresh(dlg);
 			return TRUE;
