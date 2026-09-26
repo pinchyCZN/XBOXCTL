@@ -812,6 +812,23 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 			}
 			return TRUE;
 
+		case IDC_TOGGLELAYER:
+		{
+			int sel = (int)SendDlgItemMessageA(dlg, IDC_LAYER,
+					                           CB_GETCURSEL, 0, 0);
+
+			if (sel == CB_ERR) {
+				sel = 0;
+			}
+			sel = (sel + 1) % (int)CORE_MAX_LAYOUTS;
+			SendDlgItemMessageA(dlg, IDC_LAYER, CB_SETCURSEL,
+					            (WPARAM)sel, 0);
+
+			g_Layer = (u32)sel;
+			xb_pad_refresh(dlg);
+			return TRUE;
+		}
+
 		case IDC_REFRESH:
 			xb_refresh(dlg);
 			return TRUE;

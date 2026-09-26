@@ -21,6 +21,7 @@
 #define IDC_LAYERLABEL          1007
 #define IDC_STICKS              1008
 #define IDC_REFRESH             1009
+#define IDC_TOGGLELAYER         1010
 
 /* Binding dialog. */
 #define IDC_CONTROL             1100
