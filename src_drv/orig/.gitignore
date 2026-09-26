@@ -1,0 +1,16 @@
+# XBCD 0.2.6 - A LOCAL REFERENCE, DELIBERATELY NOT IN THIS REPOSITORY.
+#
+# This folder holds the original XBCD source, kept on disk as the datasheet
+# for the pad's 20-byte packet format. It is copyright 2005 Helder Acevedo
+# under the GNU GPL, version 2 or later.
+#
+# It is never compiled, never linked and never shipped, and no XBCD code
+# appears in XBOXCTL - only facts taken from it: packet offsets, register
+# values and protocol constants.
+#
+# Everything here is ignored except this file, so the folder keeps its
+# explanation without its contents being committed. To read the reference,
+# fetch XBCD 0.2.6 yourself and unpack it here.
+
+*
+!.gitignore
