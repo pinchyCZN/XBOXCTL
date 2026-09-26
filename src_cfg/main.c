@@ -36,6 +36,20 @@ static char         g_ProfilePath[XB_MAX_PATH];
 static int          g_ProfileLoaded;    /* 0 while "standard" is up  */
 static u32          g_Layer;            /* which layer the pad edits */
 
+/* Laid out by xb_layout - see RESIZING below. */
+static int  g_BaseW;        /* client size at creation                */
+static int  g_BaseH;
+static int  g_PadX0;        /* the grid, in pixels                    */
+static int  g_PadY0;
+static int  g_PadW;
+static int  g_PadH;
+static int  g_PadDX;
+static int  g_PadDY;
+static RECT g_GroupBase;    /* client coordinates                     */
+static RECT g_StatusBase;
+static HWND g_Grip;
+
+
 /*
  * THE PAD, LAID OUT AS A PAD. Three columns: the D-pad and the face
  * buttons on the left, the left stick and the middle buttons next, the
@@ -306,6 +320,34 @@ static void xb_pad_create(HWND dlg)
 	HFONT     font = (HFONT)SendMessageA(dlg, WM_GETFONT, 0, 0);
 	u32       i;
 
+	/*
+	 * THE PIXEL METRICS ARE TAKEN ONCE, HERE. MapDialogRect is the only
+	 * thing that knows the font, and the resize path needs numbers it can
+	 * hand to MoveWindow.
+	 */
+	{
+		RECT one;
+		RECT step;
+
+		one.left   = X0;
+		one.top    = Y0;
+		one.right  = X0 + W;
+		one.bottom = Y0 + H;
+		MapDialogRect(dlg, &one);
+		g_PadX0 = one.left;
+		g_PadY0 = one.top;
+		g_PadW  = one.right - one.left;
+		g_PadH  = one.bottom - one.top;
+
+		step.left   = 0;
+		step.top    = 0;
+		step.right  = DX;
+		step.bottom = DY;
+		MapDialogRect(dlg, &step);
+		g_PadDX = step.right;
+		g_PadDY = step.bottom;
+	}
+
 	for (i = 0; i < XB_PAD_CELLS; i++) {
 		RECT r;
 		HWND b;
@@ -331,6 +373,128 @@ static void xb_pad_create(HWND dlg)
 			SendMessageA(b, WM_SETFONT, (WPARAM)font, TRUE);
 		}
 	}
+}
+
+/* ======================================================================
+ * RESIZING, WIDTH ONLY
+ *
+ * WHAT THE EXTRA WIDTH IS FOR: the grid captions are "control : what it
+ * does", and the long ones - a chord of three, or a binding carrying
+ * repeat and hard - do not fit however wide the dialog ships. Rather
+ * than pick one width for everybody, the buttons take whatever the
+ * window is given.
+ *
+ * HEIGHT IS PINNED. There are exactly ten rows and nothing below them
+ * that could use the room, so a taller window would only add grey.
+ * WM_GETMINMAXINFO does that by setting the min and max track height to
+ * the same number, which also stops the drag rather than letting it
+ * happen and snapping back.
+ *
+ * EVERYTHING IS IN PIXELS FROM HERE ON. Dialog units are what the
+ * resource is written in; MapDialogRect converts once at creation and
+ * the deltas afterwards are device units, because that is what
+ * MoveWindow speaks.
+ * ====================================================================== */
+
+/* A child's rectangle in its parent's client coordinates. */
+static void xb_child_rect(HWND dlg, int id, RECT *r)
+{
+	GetWindowRect(GetDlgItem(dlg, id), r);
+	MapWindowPoints(NULL, dlg, (POINT *)r, 2);
+}
+
+static void xb_layout(HWND dlg)
+{
+	RECT client;
+	int  extra;
+	int  w;
+	int  dx;
+	u32  i;
+
+	if (g_BaseW == 0) {
+		return;                 /* not built yet */
+	}
+
+	GetClientRect(dlg, &client);
+	extra = (client.right - client.left) - g_BaseW;
+	if (extra < 0) {
+		extra = 0;
+	}
+
+	/*
+	 * A THIRD OF THE EXTRA EACH, because there are three columns. The
+	 * GAP is what is left alone - widening it too would spend the room
+	 * on space between the buttons instead of inside them.
+	 */
+	w  = g_PadW + extra / 3;
+	dx = w + (g_PadDX - g_PadW);
+
+	for (i = 0; i < XB_PAD_CELLS; i++) {
+		HWND b = GetDlgItem(dlg, (int)(IDC_PAD_BASE + i));
+
+		if (b == NULL) {
+			continue;       /* an empty cell has no button */
+		}
+		MoveWindow(b, g_PadX0 + (int)(i % XB_PAD_COLS) * dx,
+		           g_PadY0 + (int)(i / XB_PAD_COLS) * g_PadDY,
+		           w, g_PadH, TRUE);
+	}
+
+	/* The box round them, and the status line under it. */
+	MoveWindow(GetDlgItem(dlg, IDC_PADGROUP),
+	           g_GroupBase.left, g_GroupBase.top,
+	           (g_GroupBase.right - g_GroupBase.left) + extra,
+	           g_GroupBase.bottom - g_GroupBase.top, TRUE);
+	MoveWindow(GetDlgItem(dlg, IDC_STATUS),
+	           g_StatusBase.left, g_StatusBase.top,
+	           (g_StatusBase.right - g_StatusBase.left) + extra,
+	           g_StatusBase.bottom - g_StatusBase.top, TRUE);
+
+	/*
+	 * THE CLOSE BUTTON DOES NOT MOVE. It is where it is on purpose, and
+	 * chasing the right edge would put it somewhere different every time
+	 * the window changed size.
+	 */
+
+	if (g_Grip != NULL) {
+		int gw = GetSystemMetrics(SM_CXVSCROLL);
+		int gh = GetSystemMetrics(SM_CYHSCROLL);
+
+		MoveWindow(g_Grip, client.right - gw, client.bottom - gh,
+		           gw, gh, TRUE);
+	}
+
+	/* The group box paints its frame; moving it leaves the old one. */
+	InvalidateRect(dlg, NULL, TRUE);
+}
+
+/*
+ * Record what the dialog looked like at creation, and put the grip in.
+ *
+ * THE GRIP IS BUILT HERE RATHER THAN IN THE RESOURCE because it has to
+ * follow the corner, and a control the layout code creates is a control
+ * the layout code can move without the two descriptions of where it
+ * lives disagreeing. It is a SCROLLBAR with SBS_SIZEGRIP - the same
+ * triangle a status bar draws.
+ */
+static void xb_resize_init(HWND dlg)
+{
+	RECT c;
+	int  gw = GetSystemMetrics(SM_CXVSCROLL);
+	int  gh = GetSystemMetrics(SM_CYHSCROLL);
+
+	GetClientRect(dlg, &c);
+	g_BaseW = c.right - c.left;
+	g_BaseH = c.bottom - c.top;
+
+	xb_child_rect(dlg, IDC_PADGROUP, &g_GroupBase);
+	xb_child_rect(dlg, IDC_STATUS, &g_StatusBase);
+
+	g_Grip = CreateWindowExA(0, "SCROLLBAR", NULL,
+	                         WS_CHILD | WS_VISIBLE | SBS_SIZEGRIP |
+	                         SBS_SIZEBOXBOTTOMRIGHTALIGN,
+	                         c.right - gw, c.bottom - gh, gw, gh,
+	                         dlg, NULL, g_Instance, NULL);
 }
 
 /* ======================================================================
@@ -555,6 +719,7 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 		g_Layer = 0;
 
 		xb_pad_create(dlg);
+		xb_resize_init(dlg);
 		{
 			char last[XB_MAX_NAME];
 
@@ -644,6 +809,42 @@ static INT_PTR CALLBACK xb_main_proc(HWND dlg, UINT msg, WPARAM wp,
 		}
 		break;
 	}
+
+	case WM_GETMINMAXINFO:
+	{
+		MINMAXINFO *mmi = (MINMAXINFO *)lp;
+		RECT        win;
+		RECT        cli;
+		int         frame_w;
+		int         frame_h;
+
+		/* This can arrive before the dialog is built. */
+		if (g_BaseW == 0) {
+			break;
+		}
+
+		/*
+		 * TRACK SIZE IS THE WINDOW, NOT THE CLIENT, so the frame and
+		 * caption have to be added back on or the clamp would be off by
+		 * however thick the border happens to be on this machine.
+		 */
+		GetWindowRect(dlg, &win);
+		GetClientRect(dlg, &cli);
+		frame_w = (win.right - win.left) - (cli.right - cli.left);
+		frame_h = (win.bottom - win.top) - (cli.bottom - cli.top);
+
+		mmi->ptMinTrackSize.x = g_BaseW + frame_w;
+		mmi->ptMaxTrackSize.x = g_BaseW * 2 + frame_w;
+
+		/* Min and max the same: the height cannot be dragged at all. */
+		mmi->ptMinTrackSize.y = g_BaseH + frame_h;
+		mmi->ptMaxTrackSize.y = g_BaseH + frame_h;
+		return TRUE;
+	}
+
+	case WM_SIZE:
+		xb_layout(dlg);
+		break;
 
 	case WM_CLOSE:
 		xb_window_save(dlg);
