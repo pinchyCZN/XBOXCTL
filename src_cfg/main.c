@@ -577,11 +577,44 @@ static void xb_profile_write(HWND dlg)
  * WINDOW POSITION
  * ====================================================================== */
 
+static void xb_width_limits(HWND dlg, int *lo, int *hi)
+{
+	RECT win;
+	RECT cli;
+	int  frame;
+
+	GetWindowRect(dlg, &win);
+	GetClientRect(dlg, &cli);
+	frame = (win.right - win.left) - (cli.right - cli.left);
+
+	*lo = g_BaseW + frame;
+	*hi = g_BaseW * 2 + frame;
+}
+
 static void xb_window_restore(HWND dlg)
 {
-	int x = GetPrivateProfileIntA("window", "x", -32000, g_IniPath);
-	int y = GetPrivateProfileIntA("window", "y", -32000, g_IniPath);
+	int  x = GetPrivateProfileIntA("window", "x", -32000, g_IniPath);
+	int  y = GetPrivateProfileIntA("window", "y", -32000, g_IniPath);
+	int  w = GetPrivateProfileIntA("window", "w", 0, g_IniPath);
 	RECT work;
+
+	if (w > 0 && g_BaseW > 0) {
+		RECT win;
+		int  lo;
+		int  hi;
+
+		xb_width_limits(dlg, &lo, &hi);
+
+		if (w < lo) {
+			w = lo;
+		}
+		if (w > hi) {
+			w = hi;
+		}
+		GetWindowRect(dlg, &win);
+		SetWindowPos(dlg, NULL, 0, 0, w, win.bottom - win.top,
+		             SWP_NOMOVE | SWP_NOZORDER);
+	}
 
 	if (x == -32000 || y == -32000) {
 		return;
@@ -607,6 +640,9 @@ static void xb_window_save(HWND dlg)
 	WritePrivateProfileStringA("window", "x", text, g_IniPath);
 	snprintf(text, sizeof(text), "%d", (int)r.top);
 	WritePrivateProfileStringA("window", "y", text, g_IniPath);
+
+	snprintf(text, sizeof(text), "%d", (int)(r.right - r.left));
+	WritePrivateProfileStringA("window", "w", text, g_IniPath);
 }
 
 /* ======================================================================
