@@ -365,6 +365,143 @@ static void xb_stick_read(HWND dlg, core_stick *out)
 	/* "(custom)" leaves the table alone - see WM_INITDIALOG. */
 }
 
+static const char XB_STICK_HELP[] =
+    "STICK SETTINGS\r\n"
+    "\r\n"
+    "Mode\r\n"
+    "    off     A plain gamepad axis. Directions can still be bound to keys,\r\n"
+    "            and the deadzone below is what those are tested against.\r\n"
+    "    mouse   Drives the pointer.\r\n"
+    "    joy     A gamepad axis, explicitly.\r\n"
+    "    wheel   Scrolls. Vertical only, and Max speed then means DETENTS per\r\n"
+    "            second - you want ten or twenty, not thousands.\r\n"
+    "\r\n"
+    "Deadzone\r\n"
+    "    How far the stick must move before anything happens, 0-35000. This is\r\n"
+    "    a measurement, not a taste: a stick at rest does not sit at centre,\r\n"
+    "    and this pad rests 1400-1900 units off it. Set it lower than the\r\n"
+    "    resting offset and the pointer drifts on its own.\r\n"
+    "\r\n"
+    "Outer\r\n"
+    "    Deflection treated as maximum, 0-35000. Beyond it is full speed.\r\n"
+    "    Lower it if the stick cannot physically reach its corners.\r\n"
+    "\r\n"
+    "Max speed\r\n"
+    "    Speed at full deflection: pixels per second in mouse mode, detents\r\n"
+    "    per second in wheel mode.\r\n"
+    "\r\n"
+    "Curve\r\n"
+    "    The shape between Deadzone and Outer, drawn in the graph. Linear is a\r\n"
+    "    straight line. quad and cubic start gently and finish fast, buying\r\n"
+    "    fine control near centre at the cost of top-end response.\r\n"
+    "\r\n"
+    "Gain X / Gain Y\r\n"
+    "    Per-axis scale in 128ths, 128 being 1.0. Y defaults to 54, about\r\n"
+    "    0.42, because a pointer wants less vertical travel than horizontal.\r\n"
+    "\r\n"
+    "Invert X / Invert Y\r\n"
+    "    Reverse a direction. A preference, not a fix - the pad's Y is already\r\n"
+    "    corrected before this point.\r\n"
+    "\r\n"
+    "Smooth\r\n"
+    "    Milliseconds of smoothing, applied ONLY while speed is rising. Takes\r\n"
+    "    the edge off stick noise without adding lag when you stop.\r\n"
+    "\r\n"
+    "\r\n"
+    "TURN ACCELERATION\r\n"
+    "\r\n"
+    "Everything above maps POSITION to speed: stick here, pointer moves that\r\n"
+    "fast, always. This maps TIME HELD to speed. Hold the stick at the edge\r\n"
+    "and the turn keeps building, so small corrections stay slow and precise\r\n"
+    "while a 180 takes a beat and then whips round. No curve of any shape can\r\n"
+    "do this, because it is a function of time, not of position.\r\n"
+    "\r\n"
+    "A hidden boost value builds while you hold past Threshold and bleeds away\r\n"
+    "when you do not:\r\n"
+    "\r\n"
+    "    past Threshold:   boost = boost + Rate  per second\r\n"
+    "    below it:         boost = boost - Decay per second\r\n"
+    "    boost is clamped to 0 .. Max\r\n"
+    "    speed = normal speed * (256 + boost) / 256\r\n"
+    "\r\n"
+    "Rate, Max and Decay are all in 256ths, where 256 means 1.0x.\r\n"
+    "\r\n"
+    "Rate\r\n"
+    "    Boost gained per second held. 256 adds +1.0x of speed every second.\r\n"
+    "    RATE 0 SWITCHES THE WHOLE BOX OFF - which is why the other three\r\n"
+    "    grey out.\r\n"
+    "\r\n"
+    "Max\r\n"
+    "    Ceiling on the boost. 512 is +2.0x, so 3.0x top speed. Time to reach\r\n"
+    "    it is Max / Rate seconds, so 512 at Rate 256 takes 2 seconds.\r\n"
+    "\r\n"
+    "Decay\r\n"
+    "    Boost lost per second while below Threshold. 1024 is 4.0x per second,\r\n"
+    "    so a full 512 bleeds off in half a second.\r\n"
+    "    BLEED IT OFF FAST. Slower than about half a second and your next\r\n"
+    "    small correction inherits the last turn's boost, which feels broken\r\n"
+    "    in a way that is very hard to diagnose.\r\n"
+    "\r\n"
+    "Threshold\r\n"
+    "    Where boost starts building - and this one is on a 0-65535 scale, NOT\r\n"
+    "    the 35000 scale Deadzone and Outer use. It is measured after the\r\n"
+    "    deadzone is removed and what is left restretched:\r\n"
+    "        0      = sitting exactly on the deadzone edge\r\n"
+    "        65535  = at Outer, full deflection\r\n"
+    "    The default 58000 is 88.5% of the way from the deadzone edge out to\r\n"
+    "    Outer, and it MOVES when you change Deadzone or Outer, because those\r\n"
+    "    two are its endpoints.\r\n"
+    "\r\n"
+    "Worth trying:   Rate 256   Max 512   Decay 1024   Threshold 58000\r\n"
+    "Builds to 3x over two seconds near full deflection and drops back within\r\n"
+    "half a second of easing off.\r\n"
+    "\r\n"
+    "Turn acceleration applies in mouse and wheel modes only.\r\n";
+
+static INT_PTR CALLBACK xb_stick_help_proc(HWND dlg, UINT msg, WPARAM wp,
+                                           LPARAM lp)
+{
+	static HFONT font;
+
+	(void)lp;
+
+	switch (msg) {
+	case WM_INITDIALOG:
+		font = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+		                   ANSI_CHARSET, OUT_DEFAULT_PRECIS,
+		                   CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+		                   FIXED_PITCH | FF_MODERN, "Consolas");
+		if (font != NULL) {
+			SendDlgItemMessageA(dlg, IDC_SH_TEXT, WM_SETFONT,
+			                    (WPARAM)font, TRUE);
+		}
+
+		SetDlgItemTextA(dlg, IDC_SH_TEXT, XB_STICK_HELP);
+		return TRUE;
+	case WM_SHOWWINDOW:
+		SendDlgItemMessageA(dlg, IDC_SH_TEXT, EM_SETSEL, 0, 0);
+		return TRUE;
+
+	case WM_COMMAND:
+		if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+			EndDialog(dlg, 0);
+			return TRUE;
+		}
+		break;
+
+	case WM_DESTROY:
+		if (font != NULL) {
+			DeleteObject(font);
+			font = NULL;
+		}
+		break;
+
+	default:
+		break;
+	}
+	return FALSE;
+}
+
 static INT_PTR CALLBACK xb_stick_proc(HWND dlg, UINT msg, WPARAM wp,
                                      LPARAM lp)
 {
@@ -435,6 +572,12 @@ static INT_PTR CALLBACK xb_stick_proc(HWND dlg, UINT msg, WPARAM wp,
 		g_StickPushed  = 0;
 		return TRUE;
 	}
+
+	case WM_HELP:
+		DialogBoxParamA(xb_instance(),
+		                MAKEINTRESOURCEA(IDD_STICKHELP), dlg,
+		                xb_stick_help_proc, 0);
+		return TRUE;
 
 	case WM_DRAWITEM:
 		if (wp == IDC_ST_GRAPH) {

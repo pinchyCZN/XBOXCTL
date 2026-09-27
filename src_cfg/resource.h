@@ -70,6 +70,8 @@
 #define IDC_ST_DEFAULT          1318
 #define IDC_ST_OFF              1319
 #define IDC_ST_TEST             1320
+#define IDD_STICKHELP           108
+#define IDC_SH_TEXT             1330
 
 /* Layer dialog. */
 #define IDD_LAYER               106
