@@ -530,6 +530,9 @@ static INT_PTR CALLBACK xb_stick_help_proc(HWND dlg, UINT msg, WPARAM wp,
 		return FALSE;
 	}
 
+	case WM_HELP:
+		return TRUE;
+
 	case WM_COMMAND:
 		if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
 			EndDialog(dlg, 0);
