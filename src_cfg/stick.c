@@ -488,7 +488,7 @@ static INT_PTR CALLBACK xb_stick_help_proc(HWND dlg, UINT msg, WPARAM wp,
                                            LPARAM lp)
 {
 	static HFONT font;
-
+	static int g_HelpTopLine;
 	(void)lp;
 
 	switch (msg) {
@@ -511,6 +511,22 @@ static INT_PTR CALLBACK xb_stick_help_proc(HWND dlg, UINT msg, WPARAM wp,
 
 		SetFocus(edit);
 		SendMessageA(edit, EM_SETSEL, 0, 0);
+
+		if (g_HelpTopLine > 0) {
+			LRESULT at = SendMessageA(edit, EM_LINEINDEX,
+				                      (WPARAM)g_HelpTopLine, 0);
+
+			/* -1 if the text no longer has that many lines. */
+			if (at >= 0) {
+				int now;
+				SendMessageA(edit, EM_SETSEL, (WPARAM)at,
+					         (LPARAM)at);
+				now = (int)SendMessageA(edit,
+					    EM_GETFIRSTVISIBLELINE, 0, 0);
+				SendMessageA(edit, EM_LINESCROLL, 0,
+					         (LPARAM)(g_HelpTopLine - now));
+			}
+		}
 		return FALSE;
 	}
 
@@ -522,6 +538,9 @@ static INT_PTR CALLBACK xb_stick_help_proc(HWND dlg, UINT msg, WPARAM wp,
 		break;
 
 	case WM_DESTROY:
+		g_HelpTopLine = (int)SendDlgItemMessageA(dlg, IDC_SH_TEXT,
+		                        EM_GETFIRSTVISIBLELINE, 0, 0);
+
 		if (g_HelpEditProc != NULL) {
 			SetWindowLongPtrA(GetDlgItem(dlg, IDC_SH_TEXT),
 			                  GWLP_WNDPROC,
