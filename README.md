@@ -164,9 +164,9 @@ Installing by hand instead is just
 collection, in descriptor order:
 
 ```
-HID\VID_045E&PID_0289&Col01    gamepad
+HID\VID_045E&PID_0289&Col01    mouse
 HID\VID_045E&PID_0289&Col02    keyboard
-HID\VID_045E&PID_0289&Col03    mouse
+HID\VID_045E&PID_0289&Col03    gamepad
 ```
 
 An *unsuffixed* node is what a single-collection device produces. If you see
