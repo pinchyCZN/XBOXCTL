@@ -458,6 +458,32 @@ static const char XB_STICK_HELP[] =
     "\r\n"
     "Turn acceleration applies in mouse and wheel modes only.\r\n";
 
+static WNDPROC g_HelpEditProc;
+
+static LRESULT CALLBACK xb_help_edit_proc(HWND w, UINT msg, WPARAM wp,
+                                          LPARAM lp)
+{
+	switch (msg) {
+	case WM_KEYDOWN:
+		if (wp == 'A' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+			/* 0 to -1 is the whole buffer. */
+			SendMessageA(w, EM_SETSEL, 0, -1);
+			return 0;
+		}
+		break;
+
+	case WM_CHAR:
+		if (wp == 1) {
+			return 0;
+		}
+		break;
+
+	default:
+		break;
+	}
+	return CallWindowProcA(g_HelpEditProc, w, msg, wp, lp);
+}
+
 static INT_PTR CALLBACK xb_stick_help_proc(HWND dlg, UINT msg, WPARAM wp,
                                            LPARAM lp)
 {
@@ -467,20 +493,26 @@ static INT_PTR CALLBACK xb_stick_help_proc(HWND dlg, UINT msg, WPARAM wp,
 
 	switch (msg) {
 	case WM_INITDIALOG:
+	{
+		HWND edit = GetDlgItem(dlg, IDC_SH_TEXT);
+
 		font = CreateFontA(-12, 0, 0, 0, FW_NORMAL, 0, 0, 0,
-		                   ANSI_CHARSET, OUT_DEFAULT_PRECIS,
-		                   CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
-		                   FIXED_PITCH | FF_MODERN, "Consolas");
+			               ANSI_CHARSET, OUT_DEFAULT_PRECIS,
+			               CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY,
+			               FIXED_PITCH | FF_MODERN, "Consolas");
 		if (font != NULL) {
-			SendDlgItemMessageA(dlg, IDC_SH_TEXT, WM_SETFONT,
-			                    (WPARAM)font, TRUE);
+			SendMessageA(edit, WM_SETFONT, (WPARAM)font, TRUE);
 		}
 
-		SetDlgItemTextA(dlg, IDC_SH_TEXT, XB_STICK_HELP);
-		return TRUE;
-	case WM_SHOWWINDOW:
-		SendDlgItemMessageA(dlg, IDC_SH_TEXT, EM_SETSEL, 0, 0);
-		return TRUE;
+		SetWindowTextA(edit, XB_STICK_HELP);
+
+		g_HelpEditProc = (WNDPROC)(LONG_PTR)SetWindowLongPtrA(
+			    edit, GWLP_WNDPROC, (LONG_PTR)xb_help_edit_proc);
+
+		SetFocus(edit);
+		SendMessageA(edit, EM_SETSEL, 0, 0);
+		return FALSE;
+	}
 
 	case WM_COMMAND:
 		if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
@@ -490,6 +522,12 @@ static INT_PTR CALLBACK xb_stick_help_proc(HWND dlg, UINT msg, WPARAM wp,
 		break;
 
 	case WM_DESTROY:
+		if (g_HelpEditProc != NULL) {
+			SetWindowLongPtrA(GetDlgItem(dlg, IDC_SH_TEXT),
+			                  GWLP_WNDPROC,
+			                  (LONG_PTR)g_HelpEditProc);
+			g_HelpEditProc = NULL;
+		}
 		if (font != NULL) {
 			DeleteObject(font);
 			font = NULL;
